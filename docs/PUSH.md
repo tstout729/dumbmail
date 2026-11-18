@@ -9,29 +9,44 @@ Push campaigns and flow push steps work like email and SMS ones: audiences, A/B 
 
 ## Who gets push
 
-A person can get push when:
+A push goes to a device when:
 
-1. a device of theirs allowed notifications (the browser's or the phone's own prompt), **and**
-2. that device is linked to them (see "Linking devices to people"), **and**
-3. they haven't turned push off (`set_push_opt_out`, or `PUT /api/push/profiles/{id}/opt-out`).
+1. the device allowed notifications (the browser's or the phone's own prompt; for apps, the permission the app reports: granted, or provisional on iOS), **and**
+2. its platform is set up and on in Settings → Push, **and**
+3. the person it belongs to hasn't turned push off (`set_push_opt_out`, or `PUT /api/push/profiles/{id}/opt-out`).
 
-Taking back permission in the browser or phone stops push on that device: the push service tells DumbMail the device is gone and it's removed. Turning push off for a person stops it on every device, also for messages already queued: every hand-off checks it right before the push service call.
+Every device belongs to a person. A device whose site or app said who's signed in (see "Linking devices to people") belongs to that person; any other device gets an anonymous profile of its own. Anonymous profiles can be messaged by segments like any other (`{"type": "can_receive", "channel": "push"}`), and they never take over someone else's profile.
 
-Segments: `{"type": "can_receive", "channel": "push"}` matches people a push would reach now. Push has no consent status, so `consent` conditions don't take `push`.
+All of these are checked again right before every hand-off to a push service, retries included: the device still belongs to the same person and registration it did when the message was made, it still allows notifications, its platform is still on, the person hasn't opted out, the campaign or flow is still live, it isn't their quiet hours, and smart sending (not counting this message) still allows it. Anything that no longer passes is skipped with the reason.
 
-Quiet hours: push follows the same hours as texts (Settings → Send times), in each person's time zone. A profile's time zone can only narrow them, together with the account's. A push outside the hours waits until they open.
+Taking back permission in the browser or phone stops push there: the browser or app tells DumbMail, or the push service says the device is gone and it's removed.
+
+Quiet hours: push follows the same hours as texts (Settings → Send times), in each person's time zone, and the send-time preview shows that. A profile's time zone can only narrow them, together with the account's.
+
+The marketing hold (people imported without a marketing opt-in) is about email. It doesn't stop push: a push only reaches a device whose owner allowed notifications there.
 
 ## Web push setup
 
-Browsers only show notifications from a **service worker on your site's own domain**. That's a small JavaScript file at your site's root. DumbMail can't host it for you on your domain, so you put it there once:
+Browsers only show notifications from a **service worker on your site's own domain**. DumbMail can't put a file on your domain, so you do it once:
 
-1. In **Settings → Push**, download the service worker file (`GET /push/sw.js?k=YOUR_PUBLIC_KEY`). It already has your site key in it.
-2. Put it on your site so it opens at `https://yoursite.com/dumbmail-sw.js` (or the path you set in `sw_path`):
+1. In **Settings → Push**, download the service worker (`GET /push/sw.js?k=YOUR_SITE_KEY`). It already has your site key in it.
+2. Put it on your site so it opens at `https://yoursite.com/dumbmail-sw.js` (or the path you set as `sw_path`):
    - **Any site on your own server**: copy the file into the folder your site's root is served from.
    - **Next.js, Vite, Create React App, Astro, Gatsby**: put it in the `public/` folder and deploy.
    - **WordPress**: upload it with your host's file manager or SFTP into the WordPress folder (the one with `wp-config.php`).
-   - **Shopify, Wix, Squarespace, Webflow, Framer**: these builders don't let you put a file at your site's root, so web push can't be added there. Email, texts and mobile push still work.
+   - **Shopify, Wix, Squarespace, Webflow, Framer**: these builders don't let you put a file at your site's root, so web push can't be added there. Email, texts and app push still work.
 3. Turn web push on. The website snippet then loads the push add-on on every page.
+
+The snippet registers the worker with a scope of its own (`/dumbmail-push/` by default, `sw_scope`). It controls none of your pages, so it never replaces a service worker your site already has, and it only handles notifications DumbMail sent and only opens DumbMail's signed tap links.
+
+**Already have a service worker at your site's root?** Add DumbMail's handlers to it instead of hosting a second file:
+
+```js
+// In your existing service worker:
+importScripts("https://dumbmail.ai/push/handler.js?k=YOUR_SITE_KEY");
+```
+
+Then set `sw_path` to your worker's path and `sw_scope` to its scope (for example `/sw.js` and `/`). DumbMail's handlers ignore pushes that aren't DumbMail's, so your own notifications keep working.
 
 Check it works with **Send me a test** in Settings → Push: it adds the browser you're using to your own test devices (never part of an audience) and sends it a notification.
 
@@ -55,61 +70,133 @@ Your own button can ask too (it must run from a click):
 <button onclick="dumbmail.notifications.prompt()">Get notified</button>
 ```
 
-`dumbmail.notifications` also has `status()` (`granted`, `denied`, `default` or `unsupported`), `unsubscribe()` and `identify()` (below).
+`dumbmail.notifications` also has `status()` (`granted`, `denied`, `default` or `unsupported`), `unsubscribe()`, `identify()` and `signOut()` (below). After `unsubscribe()` the browser stays off until the person clicks Allow again; it's never subscribed again on a later page by itself. If the removal can't reach DumbMail (offline), the snippet keeps proof of it and sends it again on the next page until DumbMail confirms.
 
 ## Linking devices to people
 
-A device is linked to a person only with an identity DumbMail can trust. A browser or app holding just your public site key can't name someone, because anyone can copy that key:
+A device is linked to a person only with an **enrollment grant** that your own server makes for the person signed in. Anyone can copy your site key, so a browser or app can't just say who it belongs to, and a link from one of your emails (which can be forwarded) doesn't link a device either.
 
-- **From a tracked link**: someone who opens a link in one of your emails, texts or push notifications is recognized by the snippet, and their browser is linked when it subscribes. This needs nothing from you.
-- **Verified identity**: your own server signs who is signed in. Make an identity secret in Settings → Push (`rotate_push_identity_secret`; shown once). For each signed-in customer, compute `user_hash = hex(HMAC-SHA256(identity_secret, external_id))` on your server (or use their lowercased email instead of `external_id`) and pass both to the page or app. A verified identity creates the profile when it doesn't exist yet. It never changes email or SMS consent.
+1. Make an enrollment secret in Settings → Push (`rotate_push_identity_secret`; shown once). Keep it on your server only.
+2. For a signed-in customer, your server makes a grant valid for at most 24 hours:
+
+   ```
+   grant = "v1." + expires + "." + hex(HMAC-SHA256(secret, "v1|push-enroll|" + ACCOUNT_ID + "|" + type + "|" + value + "|" + expires))
+   ```
+
+   `ACCOUNT_ID` is your DumbMail account id (shown in Settings → Push, and as `account_id` in `get_push_settings`). `type` is `external_id` (your customer id) or `email` (lowercased and trimmed); `value` is that id or email. `expires` is a Unix time in seconds, at most a day ahead. A grant for an email never names a profile whose external id is the same text.
+3. Pass `{type, value, grant}` to the page or app. The snippet keeps it in memory only, never in the browser's storage; pass it again on each page.
 
 ```js
-// On your site, after sign-in (user_hash computed on your server):
-dumbmail.notifications.identify({ external_id: "cust_123", user_hash: "9f2c…" });
+// On your site, after sign-in (grant made on your server):
+dumbmail.notifications.identify({ type: "external_id", value: "cust_123", grant: "v1.1795000000.9f2c…" });
+// On sign-out: this browser goes back to an anonymous profile of its own.
+dumbmail.notifications.signOut();
 ```
+
+**Node.js**
 
 ```js
-// Node.js, on your server:
-const userHash = require("crypto").createHmac("sha256", process.env.DUMBMAIL_PUSH_IDENTITY_SECRET).update(customer.id).digest("hex");
+const crypto = require("crypto");
+function pushGrant(type, value) {
+  const expires = Math.floor(Date.now() / 1000) + 3600;
+  const mac = crypto.createHmac("sha256", process.env.DUMBMAIL_PUSH_SECRET)
+    .update(`v1|push-enroll|${process.env.DUMBMAIL_ACCOUNT_ID}|${type}|${value}|${expires}`).digest("hex");
+  return { type, value, grant: `v1.${expires}.${mac}` };
+}
 ```
 
-Until one of these arrives, a device is kept but not linked, and no campaign reaches it. Settings → Push shows how many are waiting.
+**Python**
+
+```python
+import hashlib, hmac, os, time
+def push_grant(type_, value):
+    expires = int(time.time()) + 3600
+    msg = f"v1|push-enroll|{os.environ['DUMBMAIL_ACCOUNT_ID']}|{type_}|{value}|{expires}"
+    mac = hmac.new(os.environ["DUMBMAIL_PUSH_SECRET"].encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {"type": type_, "value": value, "grant": f"v1.{expires}.{mac}"}
+```
+
+**PHP**
+
+```php
+function push_grant(string $type, string $value): array {
+    $expires = time() + 3600;
+    $msg = "v1|push-enroll|" . getenv("DUMBMAIL_ACCOUNT_ID") . "|$type|$value|$expires";
+    $mac = hash_hmac("sha256", $msg, getenv("DUMBMAIL_PUSH_SECRET"));
+    return ["type" => $type, "value" => $value, "grant" => "v1.$expires.$mac"];
+}
+```
+
+**Ruby**
+
+```ruby
+require "openssl"
+def push_grant(type, value)
+  expires = Time.now.to_i + 3600
+  msg = "v1|push-enroll|#{ENV['DUMBMAIL_ACCOUNT_ID']}|#{type}|#{value}|#{expires}"
+  mac = OpenSSL::HMAC.hexdigest("SHA256", ENV["DUMBMAIL_PUSH_SECRET"], msg)
+  { type: type, value: value, grant: "v1.#{expires}.#{mac}" }
+end
+```
+
+A verified grant creates the profile when the account has nobody with that identifier yet. It never changes email or SMS consent. When a device that belonged to someone else is enrolled for a new person (a shared computer), anything still waiting for the old owner on that device is dropped.
 
 ## Mobile push setup
 
-DumbMail doesn't ship a native SDK. Your app registers its device token with one HTTP call and reports opens with another. The code below is the whole integration.
+DumbMail doesn't ship a native SDK. Your app asks for permission, registers its device token (with the permission it got) in one HTTP call, and reports opens in another. The code below is the whole integration.
 
 ### Credentials
 
 - **Apple**: in your Apple developer account, create an APNs auth key (Certificates, Identifiers & Profiles → Keys, with Apple Push Notifications service). Enter its key ID, your team ID, your app's bundle ID and the `.p8` file. Turn **production** off for development builds (they use the APNs sandbox).
 - **Android**: in Firebase, Project settings → Service accounts → Generate new private key. Paste the whole JSON file. DumbMail uses FCM HTTP v1 and keeps the OAuth token cached.
 
-Secrets are stored encrypted and never shown again. A credential problem Apple or Google reports shows in Settings → Push as a short reason.
+Secrets are stored encrypted and never shown again. When Apple or Google says the account's setup is wrong (credentials, project, topic, or a sandbox token sent to production), Settings → Push shows the reason and no device is deleted. A device is removed only when Apple or Google says that device is gone (APNs `Unregistered` or `ExpiredToken`, `BadDeviceToken` once the environment has accepted other notifications; FCM `UNREGISTERED`).
 
 ### Registering a device
 
-`POST {base}/client/push/devices?k=YOUR_PUBLIC_KEY` with JSON:
+`POST {base}/client/push/devices?k=YOUR_SITE_KEY` with JSON:
 
 ```json
-{"platform": "ios", "token": "<APNs device token as hex, or FCM registration token>", "app_version": "2.4.0",
- "identity": {"external_id": "cust_123", "user_hash": "…"}}
+{"platform": "ios", "token": "<APNs device token as hex, or FCM registration token>", "permission": "granted",
+ "app_version": "2.4.0", "identity": {"type": "external_id", "value": "cust_123", "grant": "v1.…"}}
 ```
 
-Call it on every launch and after sign-in (`identity` is optional before sign-in). On sign-out, `POST {base}/client/push/devices/remove?k=…` with `{"platform", "token"}`.
+`permission` is required: `granted`, `provisional` (iOS), `denied` or `not_determined`. Only `granted` and `provisional` are sent to; provisional devices are marked as such. Call it on every launch, after asking for permission, after sign-in (with a grant), and whenever the permission changes. On sign-out, `POST {base}/client/push/devices/sign-out?k=…` with `{"platform", "token"}` (the device goes back to an anonymous profile); to forget a device entirely, `POST {base}/client/push/devices/remove?k=…`.
 
-When someone opens a notification, read `dumbmail.t` (iOS) or `dumbmail_t` (Android data) from it and `POST {base}/client/push/opened?k=…` with `{"t": "<that value>"}`. The tap's link is `dumbmail.url` / `dumbmail_url`: opening it records the tap too.
+When someone opens a notification, read `dumbmail.t` (iOS) or `dumbmail_t` (Android data) and `POST {base}/client/push/opened?k=…` with `{"t": "<that value>"}`. The tap's link is `dumbmail.url` / `dumbmail_url`: opening it records the tap too.
 
 **Swift (iOS)**
 
 ```swift
-// AppDelegate: after UNUserNotificationCenter.current().requestAuthorization(...) is granted,
-// call UIApplication.shared.registerForRemoteNotifications().
+func registerForPush() {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in
+        DispatchQueue.main.async { UIApplication.shared.registerForRemoteNotifications() }
+    }
+}
+
 func application(_ app: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-    let token = deviceToken.map { String(format: "%02x", $0) }.joined()
-    var body: [String: Any] = ["platform": "ios", "token": token]
-    if let id = Session.customerId, let hash = Session.pushUserHash { body["identity"] = ["external_id": id, "user_hash": hash] }
-    post("/client/push/devices", body)
+    Push.token = deviceToken.map { String(format: "%02x", $0) }.joined()
+    Push.report()
+}
+
+// Call on launch and whenever the app comes to the foreground (the person may have changed it in Settings).
+enum Push {
+    static var token: String?
+    static func report() {
+        guard let token else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let permission: String
+            switch s.authorizationStatus {
+            case .authorized: permission = "granted"
+            case .provisional, .ephemeral: permission = "provisional"
+            case .denied: permission = "denied"
+            default: permission = "not_determined"
+            }
+            var body: [String: Any] = ["platform": "ios", "token": token, "permission": permission]
+            if let grant = Session.pushGrant { body["identity"] = grant }   // {type, value, grant} from your server
+            post("/client/push/devices", body)
+        }
+    }
 }
 
 // UNUserNotificationCenterDelegate
@@ -121,7 +208,7 @@ func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive respo
 }
 
 func post(_ path: String, _ body: [String: Any]) {
-    var req = URLRequest(url: URL(string: "https://dumbmail.ai\(path)?k=YOUR_PUBLIC_KEY")!)
+    var req = URLRequest(url: URL(string: "https://dumbmail.ai\(path)?k=YOUR_SITE_KEY")!)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -132,21 +219,31 @@ func post(_ path: String, _ body: [String: Any]) {
 **Kotlin (Android, Firebase Messaging)**
 
 ```kotlin
-class PushService : FirebaseMessagingService() {
-    override fun onNewToken(token: String) = register(token)
+// Android 13+: ask first (from an Activity).
+val ask = registerForActivityResult(ActivityResultContracts.RequestPermission()) { Push.report(this) }
+if (Build.VERSION.SDK_INT >= 33) ask.launch(Manifest.permission.POST_NOTIFICATIONS) else Push.report(this)
 
-    fun register(token: String) {
-        val body = JSONObject().put("platform", "android").put("token", token)
-        Session.customerId?.let { body.put("identity", JSONObject().put("external_id", it).put("user_hash", Session.pushUserHash)) }
-        post("/client/push/devices", body)
+object Push {
+    // Call after asking, on every start (onResume), and from onNewToken.
+    fun report(context: Context) {
+        FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+            val permission = if (NotificationManagerCompat.from(context).areNotificationsEnabled()) "granted" else "denied"
+            val body = JSONObject().put("platform", "android").put("token", token).put("permission", permission)
+            Session.pushGrant?.let { body.put("identity", it) }   // {type, value, grant} from your server
+            post("/client/push/devices", body)
+        }
     }
+}
+
+class PushService : FirebaseMessagingService() {
+    override fun onNewToken(token: String) = Push.report(this)
 }
 
 // In the activity the notification opens (FCM puts the data keys in the intent's extras):
 intent.extras?.getString("dumbmail_t")?.let { post("/client/push/opened", JSONObject().put("t", it)) }
 
 fun post(path: String, body: JSONObject) = thread {
-    val c = URL("https://dumbmail.ai$path?k=YOUR_PUBLIC_KEY").openConnection() as HttpURLConnection
+    val c = URL("https://dumbmail.ai$path?k=YOUR_SITE_KEY").openConnection() as HttpURLConnection
     c.requestMethod = "POST"; c.doOutput = true
     c.setRequestProperty("Content-Type", "application/json")
     c.outputStream.use { it.write(body.toString().toByteArray()) }
@@ -157,17 +254,30 @@ fun post(path: String, body: JSONObject) = thread {
 **React Native (`@react-native-firebase/messaging`)**
 
 ```js
-import messaging from "@react-native-firebase/messaging";
-import { Platform } from "react-native";
+import messaging, { AuthorizationStatus } from "@react-native-firebase/messaging";
+import { AppState, Platform } from "react-native";
 
-const post = (path, body) => fetch(`https://dumbmail.ai${path}?k=YOUR_PUBLIC_KEY`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+const post = (path, body) => fetch(`https://dumbmail.ai${path}?k=YOUR_SITE_KEY`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
+function permissionOf(status) {
+  if (status === AuthorizationStatus.AUTHORIZED) return "granted";
+  if (status === AuthorizationStatus.PROVISIONAL || status === AuthorizationStatus.EPHEMERAL) return "provisional";
+  if (status === AuthorizationStatus.DENIED) return "denied";
+  return "not_determined";
+}
+
+// Call after sign-in (identity = {type, value, grant} from your server) and on every start.
 export async function registerPush(identity) {
-  await messaging().requestPermission();
+  const status = await messaging().requestPermission();
+  await messaging().registerDeviceForRemoteMessages();
   // iOS sends to APNs directly, so register the APNs token there; Android uses the FCM token.
   const token = Platform.OS === "ios" ? await messaging().getAPNSToken() : await messaging().getToken();
-  if (token) await post("/client/push/devices", { platform: Platform.OS, token, identity });
+  if (token) await post("/client/push/devices", { platform: Platform.OS, token, permission: permissionOf(status), identity });
 }
+
+// Report changes made in the phone's settings when the app comes back.
+AppState.addEventListener("change", (s) => { if (s === "active") registerPush(currentGrant()); });
+messaging().onTokenRefresh(() => registerPush(currentGrant()));
 
 messaging().onNotificationOpenedApp((m) => {
   const t = m.data?.dumbmail_t ?? m.data?.dumbmail?.t;
@@ -186,7 +296,7 @@ A push campaign's `content` (and a flow `push` step's) is:
 | `icon` | Web only. Default: your logo. |
 | `image` | A large picture (Chrome, Edge, Android; iOS apps with a notification service extension). |
 | `actions` | Up to two buttons `{title, url}` (Chrome and Edge; apps that register them). |
-| `platforms` | `["web", "ios", "android"]`, or empty for all. |
+| `platforms` | `["web", "ios", "android"]`, or empty for all. Audience counts include only devices on these. |
 | `ttl_seconds` | How long an offline device's push service keeps it (default 1 day, at most 28 days). |
 | `urgency` | `very_low`, `low`, `normal` (default) or `high`. |
 | `topic` | A newer push with the same topic replaces an older one that wasn't delivered yet. |
@@ -194,19 +304,20 @@ A push campaign's `content` (and a flow `push` step's) is:
 
 Coupon codes aren't supported in push: a code would show on the lock screen and couldn't be kept per person. Content with a coupon tag is refused when it's saved. Send codes by email or text.
 
-Every link is tracked: a tap goes through DumbMail (recording the click) and on to the link. Links to your own site recognize the person there, as email links do.
+Every link is tracked: a tap goes through DumbMail (recording the click) and on to the link. Links to your own site recognize the person there, as email links do. A tap link stops working 35 days after the notification was made.
 
 ## Sending
 
-- Each person gets one message, sent to up to 10 of their most recent devices.
-- The person's message and its devices are fixed when it's claimed. A second check runs right before each device's push service is called: the device is still active and the person hasn't opted out.
-- A device the push service says is gone (web push 404 or 410, APNs `Unregistered` or `BadDeviceToken`, FCM `UNREGISTERED`) is removed. A device that keeps failing for other reasons is turned off after 5 failures in a row.
-- When a push service is busy or down (HTTP 429 or 5xx), that device is retried in the background after 1, 5 and 30 minutes (or the wait the service asks for), then given up.
-- A delivery is handed over at most once. If DumbMail stops mid-send, it's marked failed, never sent twice.
+- Each person gets one message, sent to up to 10 of their most recent devices. A flow's push step keeps its message id with the person's run, so a step that runs again never sends a second message.
+- Each device is handed over at most once. If a push service doesn't answer after the request went out (a timeout, a dropped connection), that device is **unconfirmed**: it may have arrived, so it's never sent again. If DumbMail stops mid-send, the same happens.
+- Only when a push service certainly didn't take it (it refused the connection, or said 429 or 5xx) is that device retried, in the background, after 1, 5 and 30 minutes (or the wait the service asks for), then given up. Until a device accepts it, the message is **retrying**, not sent.
+- A device that keeps failing for its own reasons is turned off after 5 failures in a row; turned-off devices are deleted after 30 days.
+- The first device that accepts a message marks it sent; that same write charges it and records "Received Push", once.
+- Every call to a push service goes through one limiter: at most 8 at once per account and 64 overall per server.
 
 ## Reports
 
-`get_push_report` (`GET /api/push/report?campaign_id=…` or `flow_id=…`) shows people sent, clicked, failed and skipped, and per platform: devices sent, delivered, clicked, failed, removed and retrying. **Delivered** is known for web push only (the browser reports showing it). Apple and Google don't tell senders, so mobile shows sent and clicked. Attribution counts a push click like a text click (Settings → Attribution's SMS window).
+`get_push_report` (`GET /api/push/report?campaign_id=…` or `flow_id=…`) shows people sent, clicked, failed, skipped, retrying and unconfirmed, and per platform: devices sent, delivered, clicked, failed, removed, retrying and unconfirmed. **Delivered** is known for web push only (the browser reports showing it; a report that arrives before the push service's answer is saved still counts). Apple and Google don't tell senders, so mobile shows sent and clicked. A person who taps on two devices counts as one click. Attribution counts a push click like a text click (Settings → Attribution's SMS window) and shows push revenue on its own line.
 
 Events: `Received Push` and `Clicked Push` (flows, segments and webhooks use them; browsers can't send them).
 
@@ -218,19 +329,21 @@ On the hosted service push is free unless the operator sets `PRICE_PUSH`. A non-
 
 | | |
 | --- | --- |
-| `GET /api/push/settings` | Settings, device counts, the service worker URL and the device registration URL. |
-| `PATCH /api/push/settings` | `web_enabled`, `sw_path`, `prompt`, `apns` (`{key_id, team_id, bundle_id, production, key_p8}` or `null`), `fcm` (`{service_account_json}` or `null`). |
-| `POST /api/push/identity-secret` | A new identity secret (returned once). |
+| `GET /api/push/settings` | Settings, device counts (including anonymous ones), the service worker and handler URLs and the device registration URL. |
+| `PATCH /api/push/settings` | `web_enabled`, `sw_path`, `sw_scope`, `prompt`, `apns` (`{key_id, team_id, bundle_id, production, key_p8}` or `null`), `fcm` (`{service_account_json}` or `null`). |
+| `POST /api/push/identity-secret` | A new enrollment secret (returned once). |
 | `POST /api/push/test-devices` | Add this browser's subscription as your own test device. |
-| `POST /api/push/test` | `{content?, to?: "me" or an email, profile_id?, device_id?}`. Sending to anyone but your own test devices needs permission to send campaigns. |
-| `GET /api/push/profiles/{id}` | A person's devices and whether they opted out. |
+| `POST /api/push/test` | `{content?, to?: "me" or an email, profile_id?, device_id?}`. Sending to anyone but your own test devices needs permission to send campaigns; a person's push opt-out still applies. |
+| `GET /api/push/profiles/{id}` | A person's devices (with their permission) and whether they opted out. |
 | `PUT /api/push/profiles/{id}/opt-out` | `{opted_out: true|false}`. |
 | `GET /api/push/report` | See Reports. |
+
+Public (site key): `/client/push/subscribe`, `/client/push/unsubscribe`, `/client/push/sign-out`, `/client/push/devices`, `/client/push/devices/sign-out`, `/client/push/devices/remove`, `/client/push/delivered`, `/client/push/opened`.
 
 Campaigns take `channel: "push"`; flows take `{"type": "push", "content": {...}, "next": …}` steps. MCP tools: `get_push_settings`, `update_push_settings`, `rotate_push_identity_secret`, `send_test_push`, `get_profile_push`, `set_push_opt_out`, `get_push_report`.
 
 ## Limits
 
-- 30 device registrations an hour from one address, per account. 10 linked devices per person (registering an 11th turns off their least recent). 200,000 unlinked devices per account; unlinked devices unused for 180 days are removed.
+- 30 device registrations an hour from one address, per account. 10 active devices per person (registering an 11th turns off their least recent). 200,000 anonymous devices per account; anonymous devices unused for 180 days are removed.
 - 50 test sends an hour per account.
 - Web push only goes to the browsers' own push services (Google, Mozilla, Microsoft and Apple).

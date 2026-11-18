@@ -447,6 +447,7 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
             "error": row.fcm_error,
         },
         "identity": {"configured": row.identity_secret_enc.is_some(), "hint": row.identity_secret_hint},
+        "account_id": account_id,
         "public_key": key,
         "register_url": format!("{base}/client/push/devices?k={key}"),
         "devices": {"web": counts.0, "ios": counts.1, "android": counts.2, "anonymous": counts.3, "permission_denied": counts.4},
