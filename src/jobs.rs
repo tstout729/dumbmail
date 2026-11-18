@@ -142,7 +142,8 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     // (`shopify_work`), which for a closed account only does privacy requests and opt-out
     // write-backs (see `features::shopify`).
     ("shopify_setup", "account_id", "SELECT $1::uuid"),
-    ("shopify_rebaseline_segments", "account_id", "SELECT $1::uuid"),
+    // push_retry isn't here: its final claim settles a closed account's deliveries as skipped.
+    // push_event isn't either: it records what already happened (a push the device accepted).
 ];
 
 /// Whether this job is for a closed account (one indexed lookup).

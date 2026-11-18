@@ -14,6 +14,14 @@
   function attr(n) { try { return ME && ME.getAttribute(n); } catch (e) { return null; } }
   var AUTO = !ONLY_FORM && CFG.autoTrack !== false && attr("data-auto-track") !== "false";
   var CAPTURE = !ONLY_FORM && CFG.captureEmails !== false && attr("data-capture-emails") !== "false";
+  // The visitor's consent as the page knows it (a consent banner, Shopify's Customer Privacy API):
+  // `window.dumbmailConsent = {analytics, marketing, withdrawn}`. Read when the script starts, so a
+  // withdrawal between the script being added and it running isn't missed. Without marketing
+  // consent the script never recognises the visitor (no identify, nothing tracked against a stored
+  // profile); without analytics consent, or once consent was withdrawn, it stops (see stop()).
+  var CONSENT = window.dumbmailConsent || null;
+  var NO_IDENTITY = !!(CONSENT && CONSENT.marketing === false);
+  if (NO_IDENTITY) CAPTURE = false;
   var noop = function () {};
   var now = function () { return Date.now(); };
 
@@ -23,10 +31,12 @@
     del: function (k, s) { try { (s ? sessionStorage : localStorage).removeItem(k); } catch (e) {} }
   };
   var PROFILE = "pl_profile";
-  function profile() { return store.get(PROFILE) || {}; }
+  function profile() { return NO_IDENTITY ? {} : store.get(PROFILE) || {}; }
   // The visitor's browser language, sent with their events: only a hint for which language version
   // of a message they get (it never overwrites a language set another way).
   function withLocale(p) {
+    // A visitor who declined marketing has no identity here, and gets no hint either.
+    if (NO_IDENTITY) return p;
     var q = {};
     for (var k in p) if (Object.prototype.hasOwnProperty.call(p, k)) q[k] = p[k];
     try { if (!q.locale && navigator.language) q.locale = navigator.language; } catch (e) {}
@@ -91,7 +101,7 @@
   var EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[a-z]{2,}$/i;
   var api = {
     identify: function (props, how) {
-      if (STOPPED || !props || typeof props !== "object") return api;
+      if (STOPPED || NO_IDENTITY || !props || typeof props !== "object") return api;
       var p = profile(), before = identified(p);
       var em = props.email && String(props.email).trim().toLowerCase();
       // A different email is a different person: start a fresh profile instead of merging into theirs.
@@ -129,6 +139,8 @@
 
   // Events from visitors the browser doesn't know yet wait here (for up to 3 days) and are sent once they're recognized.
   var BUFFER = "pl_buffer";
+  // Consent withdrawn (or never given for analytics) before the script started: stop now.
+  if (CONSENT && (CONSENT.analytics === false || CONSENT.withdrawn)) api.stop();
   function buffer(ev) {
     if (STOPPED) return;
     var b = (store.get(BUFFER) || []).filter(function (e) { return e && now() - e.time < 3 * 86400000; });
@@ -1072,8 +1084,21 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  // Web push (when the account turned it on) lives in its own small script; browsers that can't
+  // show notifications never load it.
+  function loadPush() {
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || !window.isSecureContext) return;
+      var s = document.createElement("script");
+      s.async = true;
+      s.src = BASE + "/client/push.js?k=" + encodeURIComponent(KEY);
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+  }
+
   function start() {
     if (!ONLY_FORM) {
+      if (!TEST) loadPush();
       PLATFORM = platform();
       if (TEST) { test.draw(); test.check("loaded", { platform: PLATFORM, version: VERSION, auto_track: AUTO, capture_emails: CAPTURE, identified: identified(), summary: "On " + location.host + (PLATFORM !== "custom" ? " · " + PLATFORM : "") }); }
       hookPage();

@@ -385,8 +385,15 @@ struct MockGuesty {
     seen: Mutex<Vec<(String, String, String)>>,
 }
 
+/// The mock's change times: an hour before the test run started, one second apart, so they stay
+/// inside the pull's 24-hour look-back whatever day the tests run (a fixed date ran out of it).
 fn mock_updated_at(i: usize) -> String {
-    format!("2026-11-17T10:{:02}:{:02}.000Z", i / 60, i % 60)
+    static BASE: std::sync::OnceLock<chrono::DateTime<chrono::Utc>> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        use chrono::Timelike;
+        (chrono::Utc::now() - chrono::Duration::hours(1)).with_nanosecond(0).unwrap()
+    });
+    (base + chrono::Duration::seconds(i as i64)).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// A stand-in for Guesty's Open API: OAuth tokens, `GET /v1/reservations-v3/search` (changed
@@ -2107,6 +2114,10 @@ async fn guesty_door_codes_never_reach_stored_or_shown_data() {
     }
     let everything = format!("{stored:?} {shown:?}");
     assert!(everything.contains("reservations-v3") && everything.contains("66f1c4a1246e7d9f0f8da88a"), "the deliveries are there");
+    // Times and ids DumbMail writes (`…T15:11:27.015512Z`, uuids) can contain the codes' digits by
+    // chance; take them out so only data that came from Guesty is searched.
+    let noise = regex::Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}(:?\d{2})?)?|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
+    let everything = noise.replace_all(&everything, "_").into_owned();
     for code in ["5512", "1234", "9876", "keyCode", "Lockbox", "guestContact"] {
         assert!(!everything.contains(code), "{code:?} survived: {everything}");
     }

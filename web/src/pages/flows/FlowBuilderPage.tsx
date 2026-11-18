@@ -300,7 +300,7 @@ function NodeIcon({ node }: { node: FlowNode }) {
 function NodeStats({ node, report }: { node: FlowNode; report: ReturnType<typeof useFlowReport>["data"] }) {
   const n = report?.nodes.find((x) => x.node_id === node.id);
   if (!n) return null;
-  const isMessage = node.type === "email" || node.type === "sms";
+  const isMessage = node.type === "email" || node.type === "sms" || node.type === "push";
   const cells: [string, string][] = isMessage
     ? [
         ["Entered", formatNumber(n.entered)],

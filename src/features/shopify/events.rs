@@ -139,73 +139,92 @@ pub async fn put(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, ev: Serve
     Ok(Put::Unchanged)
 }
 
-// ---------- The history window ----------
+/// Record new server events that belong together (an order and its lines) all at once or not at
+/// all: through `audience::record_events_from` (live) or one transaction of `record_history`
+/// (history), replacing browser copies as `put` does. `false`: one of them was already there as a
+/// server event (another writer got there first); use `put` for each instead.
+pub async fn create_together(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, evs: Vec<ServerEvent<'_>>, quiet: bool) -> anyhow::Result<bool> {
+    let Some(first) = evs.first() else { return Ok(true) };
+    let live = !quiet && first.at > Utc::now() - Duration::hours(LIVE_WINDOW_HOURS);
+    let mut ids = Vec::with_capacity(evs.len());
+    for ev in &evs {
+        ids.push(metrics.id(db, account_id, ev.metric).await?);
+    }
+    let mut tx = db.begin().await?;
+    let uniques: Vec<String> = evs.iter().map(|e| e.unique_id.clone()).collect();
+    // Lock-free check inside the transaction; the inserts below are ON CONFLICT DO NOTHING anyway.
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM events WHERE account_id = $1 AND metric_id = ANY($2) AND unique_id = ANY($3) AND from_browser = false)")
+        .bind(account_id)
+        .bind(&ids)
+        .bind(&uniques)
+        .fetch_one(&mut *tx)
+        .await?;
+    if taken {
+        return Ok(false);
+    }
+    if live {
+        drop(tx);
+        let news: Vec<NewEvent<'_>> = evs
+            .iter()
+            .map(|ev| NewEvent { account_id, profile_id: ev.profile_id, metric: ev.metric, properties: ev.properties.clone(), value: ev.value, occurred_at: Some(ev.at), unique_id: Some(ev.unique_id.clone()), message_id: None })
+            .collect();
+        let made = audience::record_events_from(db, news, EventSource::Integration).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        return Ok(made.iter().all(|m| m.is_some()));
+    }
+    for (ev, mid) in evs.iter().zip(&ids) {
+        sqlx::query("DELETE FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser").bind(account_id).bind(mid).bind(&ev.unique_id).execute(&mut *tx).await?;
+    }
+    let history: Vec<HistoryEvent> = evs
+        .iter()
+        .zip(&ids)
+        .map(|(ev, mid)| HistoryEvent { profile_id: ev.profile_id, metric_id: *mid, properties: ev.properties.clone(), value: ev.value, occurred_at: ev.at, unique_id: ev.unique_id.clone() })
+        .collect();
+    let n = audience::record_history(&mut *tx, account_id, &history).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    tx.commit().await?;
+    Ok(n as usize == history.len())
+}
+
+// ---------- History and segment-triggered flows ----------
 //
 // Imported orders and customers can move people into segments; those entries mustn't start
-// segment-triggered flows. The same mechanism as the Klaviyo import (`segments.absorb_entries`): the
-// window opens while a page of this store's history is being written and closes as soon as the
-// import pauses, finishes, fails or is cancelled; then each marked segment is refreshed once more
-// (quietly: its new baseline includes everyone history moved in) and unmarked. Live webhooks
-// written while no history page is being written start segment flows as usual.
+// segment-triggered flows. Each person a history import writes about is recorded first
+// (`shopify_history_touched`, committed before their history is), and `flows::refresh_segment`
+// leaves them out of the people it starts flows for, checked after the membership refresh: so it
+// holds however the refresh and the import interleave. Nobody else is affected: a real entry while
+// an import runs, is paused, or just finished starts flows as usual (no window, no re-baseline).
+// An account that never ran a Shopify history import runs exactly the statements it always did.
 
-pub const JOB_REBASELINE: &str = "shopify_rebaseline_segments";
-const REBASELINE_BATCH: i64 = 25;
-
-/// Open the window for this history import (or keep it open), and mark segments made since.
-pub async fn open_history(db: &PgPool, import_id: Uuid, account_id: Uuid) -> sqlx::Result<()> {
+/// Record that a history import is about to write about these people.
+pub async fn touch_history(db: &PgPool, account_id: Uuid, profile_ids: &[Uuid]) -> sqlx::Result<()> {
     sqlx::query(
-        "WITH i AS (UPDATE shopify_imports SET history_open = true WHERE id = $1 AND kind = 'history' AND NOT history_open RETURNING 1)
-         UPDATE segments SET absorb_entries = true WHERE account_id = $2 AND NOT absorb_entries AND EXISTS (SELECT 1 FROM shopify_imports WHERE id = $1 AND kind = 'history')",
+        "INSERT INTO shopify_history_touched (account_id, profile_id) SELECT $1, p FROM unnest($2::uuid[]) AS p
+         ON CONFLICT (account_id, profile_id) DO UPDATE SET touched_at = now()",
     )
-    .bind(import_id)
     .bind(account_id)
+    .bind(profile_ids)
     .execute(db)
     .await?;
     Ok(())
 }
 
-/// Close the window of every import of the account that isn't running any more (paused, done,
-/// failed, cancelled), in the caller's transaction, and queue the re-baseline with it.
-pub async fn close_history(conn: &mut sqlx::PgConnection, account_id: Uuid) -> sqlx::Result<()> {
-    let closed: Vec<Uuid> = sqlx::query_scalar("UPDATE shopify_imports SET history_open = false WHERE account_id = $1 AND history_open AND status <> 'running' RETURNING id")
+/// `entered` without the people history moved in (for `flows::refresh_segment`).
+pub async fn without_history(db: &PgPool, account_id: Uuid, entered: Vec<Uuid>) -> sqlx::Result<Vec<Uuid>> {
+    let touched: Vec<Uuid> = sqlx::query_scalar("SELECT profile_id FROM shopify_history_touched WHERE account_id = $1 AND profile_id = ANY($2)")
         .bind(account_id)
-        .fetch_all(&mut *conn)
+        .bind(&entered)
+        .fetch_all(db)
         .await?;
-    if !closed.is_empty() {
-        crate::jobs::enqueue_background(&mut *conn, JOB_REBASELINE, serde_json::json!({"account_id": account_id}), None).await?;
-    }
-    Ok(())
+    Ok(entered.into_iter().filter(|p| !touched.contains(p)).collect())
 }
 
-/// [`close_history`] in its own transaction.
-pub async fn close_history_now(db: &PgPool, account_id: Uuid) -> sqlx::Result<()> {
-    let mut tx = db.begin().await?;
-    close_history(&mut tx, account_id).await?;
-    tx.commit().await
-}
-
-/// Is a page of this account's Shopify history being written now? `flows::refresh_segment` checks
-/// the same thing in its first statement (with `absorb_entries`), so another import's re-baseline
-/// can't let entries through early.
-pub async fn history_open(db: &PgPool, account_id: Uuid) -> sqlx::Result<bool> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_imports WHERE account_id = $1 AND history_open)").bind(account_id).fetch_one(db).await
-}
-
-/// Job: refresh the account's marked segments once more, quietly, then unmark them, a batch at a time.
-/// If a window (this store's or a Klaviyo import's) opened again meanwhile, its own close does this.
-pub async fn rebaseline(state: &crate::state::AppState, account_id: Uuid) -> anyhow::Result<()> {
-    const ANY_OPEN: &str = "(EXISTS (SELECT 1 FROM shopify_imports WHERE account_id = $1 AND history_open) OR EXISTS (SELECT 1 FROM klaviyo_imports WHERE account_id = $1 AND history_open))";
-    let open: bool = sqlx::query_scalar(&format!("SELECT {ANY_OPEN}")).bind(account_id).fetch_one(&state.db).await?;
-    if open {
-        return Ok(());
-    }
-    let segs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM segments WHERE account_id = $1 AND absorb_entries ORDER BY id LIMIT $2").bind(account_id).bind(REBASELINE_BATCH).fetch_all(&state.db).await?;
-    for sid in &segs {
-        crate::flows::refresh_segment(state, *sid).await?;
-        sqlx::query(&format!("UPDATE segments SET absorb_entries = false WHERE id = $2 AND NOT {ANY_OPEN}")).bind(account_id).bind(sid).execute(&state.db).await?;
-    }
-    if segs.len() as i64 == REBASELINE_BATCH {
-        crate::jobs::enqueue_background(&state.db, JOB_REBASELINE, serde_json::json!({"account_id": account_id}), None).await?;
-    }
+/// Forget history marks every segment of the account has been refreshed past (with an hour's
+/// margin for a refresh that was running when the history was written).
+pub async fn prune_history(db: &PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "DELETE FROM shopify_history_touched t
+         WHERE t.touched_at < COALESCE((SELECT min(s.refreshed_at) FROM segments s WHERE s.account_id = t.account_id), now()) - interval '1 hour'",
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }

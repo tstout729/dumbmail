@@ -19,12 +19,14 @@ pub mod coupons;
 pub mod customers;
 pub mod discounts;
 pub mod events;
+pub mod fence;
 pub mod import;
 pub mod oauth;
 pub mod orders;
 pub mod privacy;
 pub mod products;
 pub mod shop;
+pub mod starters;
 pub mod webhooks;
 
 use async_trait::async_trait;
@@ -82,8 +84,10 @@ pub struct Module;
 /// most urgent first, so one busy queue can't starve the others: privacy requests, then
 /// unsubscribes to write back, then webhook deliveries (and the items they ask to read again), then
 /// the import. Then it hands back to the queue.
-async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
-    let Some(lease) = shop::acquire(state, account_id).await? else { return Ok(()) };
+async fn work(state: &AppState, account_id: Uuid, generation: Option<i32>) -> anyhow::Result<()> {
+    // A job without an install (queued before jobs carried one) or for an earlier install does nothing.
+    let Some(generation) = generation else { return Ok(()) };
+    let Some(lease) = shop::acquire(state, account_id, generation).await? else { return Ok(()) };
     let (more, delay) = match work_inner(state, account_id, &lease).await {
         Ok(x) => x,
         Err(e) => {
@@ -95,10 +99,13 @@ async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
     shop::release(state, &lease, more, delay).await
 }
 
-/// Seconds of each slice for each kind of work (what one leaves unused, the later ones get).
+/// Seconds of each slice for each kind of work (what one leaves unused, the later ones get). Each
+/// kind's end is fixed once per run, so a steady backlog of one kind can't eat the next kind's share.
 const PRIVACY_SECS: u64 = 3;
 const WRITEBACK_SECS: u64 = 3;
 const WEBHOOK_SECS: u64 = 6;
+/// The import's share at the end of every slice: webhooks and reads stop this long before the end.
+const IMPORT_SECS: u64 = 3;
 
 async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> anyhow::Result<(bool, Option<chrono::Duration>)> {
     let Some(s) = shop::load(&state.db, account_id).await? else { return Ok((false, None)) };
@@ -141,11 +148,14 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
         });
     }
 
-    // 3. Webhook deliveries, then the items they asked to read again.
-    let hooks_until = until(WEBHOOK_SECS);
-    let mut cx = orders::Ctx { state, account_id, shop: &s.shop_domain, metrics: &mut metrics, quiet: false };
+    // 3. Webhook deliveries, then the items they asked to read again: both end, at the latest, the
+    // import's share before the slice does. Fixed here, once.
+    let import_from = deadline - std::time::Duration::from_secs(IMPORT_SECS);
+    let hooks_until = until(WEBHOOK_SECS).min(import_from);
+    let reads_until = hooks_until.max(until(2)).min(import_from);
+    let mut cx = orders::Ctx { state, account_id, shop: &s.shop_domain, generation: lease.generation, metrics: &mut metrics, quiet: false };
     more |= webhooks::drain(state, &mut cx, lease, hooks_until).await?;
-    while wait.is_none() && std::time::Instant::now() < hooks_until.max(until(2)) {
+    while wait.is_none() && std::time::Instant::now() < reads_until {
         if !shop::renew(state, lease).await? {
             return Ok((false, None));
         }
@@ -161,15 +171,19 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
         let kind = batch[0].0.clone();
         let per = match kind.as_str() {
             "product" => products::PER_QUERY,
-            "order" => orders::REFUNDS_PER_QUERY,
+            orders::REFUNDS_LIVE | orders::REFUNDS_HISTORY | orders::FULL_HISTORY => orders::REFUNDS_PER_QUERY,
             _ => 50,
         };
         let ids: Vec<i64> = batch.iter().filter(|(k, _)| *k == kind).map(|(_, i)| *i).take(per).collect();
+        // What the history import queued is history: recorded quietly (no flows start).
+        cx.quiet = kind == orders::REFUNDS_HISTORY || kind == orders::FULL_HISTORY;
         let r = match kind.as_str() {
             "product" => products::refresh(state, &s, &ids).await,
-            "order" => orders::refresh_refunds(&mut cx, &s, &ids).await,
+            orders::REFUNDS_LIVE | orders::REFUNDS_HISTORY => orders::refresh_refunds(&mut cx, &s, &ids).await,
+            orders::FULL_HISTORY => orders::refresh_full(&mut cx, &s, &ids).await,
             _ => customers::refresh(state, &s, &ids).await,
         };
+        cx.quiet = false;
         match r {
             Ok(()) => {
                 sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
@@ -208,6 +222,7 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
 async fn cleanup(state: &AppState) -> anyhow::Result<()> {
     webhooks::prune(&state.db).await?;
     privacy::prune(&state.db).await?;
+    events::prune_history(&state.db).await?;
     Ok(())
 }
 
@@ -249,7 +264,7 @@ impl Feature for Module {
         let account = || payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).ok_or_else(|| anyhow::anyhow!("job payload missing account_id"));
         Some(match kind {
             "shopify_work" => match account() {
-                Ok(a) => work(state, a).await,
+                Ok(a) => work(state, a, payload["generation"].as_i64().map(|g| g as i32)).await,
                 Err(e) => Err(e),
             },
             "shopify_setup" => match account() {
@@ -258,10 +273,6 @@ impl Feature for Module {
             },
             "shopify_privacy" => match account() {
                 Ok(a) => privacy::run(state, a).await,
-                Err(e) => Err(e),
-            },
-            events::JOB_REBASELINE => match account() {
-                Ok(a) => events::rebaseline(state, a).await,
                 Err(e) => Err(e),
             },
             "shopify_cleanup" => cleanup(state).await,

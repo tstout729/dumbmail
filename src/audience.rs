@@ -304,7 +304,7 @@ pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Su
 pub const BROWSER_RESERVED_METRICS: &[&str] = &[
     "Subscribed to List", "Unsubscribed from List", "Unsubscribed", "Subscribed to SMS", "Unsubscribed from SMS",
     "Received Email", "Opened Email", "Clicked Email", "Bounced Email", "Marked Email as Spam",
-    "Received SMS", "Clicked SMS", "Received SMS Reply",
+    "Received SMS", "Clicked SMS", "Received SMS Reply", "Received Push", "Clicked Push",
 ];
 
 fn named(list: &[&str], name: &str) -> bool {
@@ -375,15 +375,42 @@ pub async fn record_browser_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Op
     insert_event(db, ev, EventSource::Browser).await
 }
 
+/// Record several trusted events (not from a browser) in one transaction: all of them, with their
+/// profiles' last activity and flow jobs, or none (an order and its lines, say).
+pub async fn record_events_from(db: &PgPool, evs: Vec<NewEvent<'_>>, source: EventSource) -> AppResult<Vec<Option<Uuid>>> {
+    if source == EventSource::Browser {
+        return Err(AppError::bad("browser events are recorded one at a time"));
+    }
+    let mut ids = Vec::with_capacity(evs.len());
+    for ev in &evs {
+        ids.push(metric_id(db, ev.account_id, ev.metric).await?);
+    }
+    let mut tx = db.begin().await?;
+    let mut out = Vec::with_capacity(evs.len());
+    for (ev, mid) in evs.into_iter().zip(ids) {
+        out.push(insert_event_in(&mut tx, db, ev, source, mid).await?);
+    }
+    tx.commit().await?;
+    Ok(out)
+}
+
 async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;
-    let metric = ev.metric.trim();
-    let id = Uuid::now_v7();
-    let value = ev.value.or_else(|| ev.properties.get("$value").and_then(|v| v.as_f64()));
     // The event, the profile's last activity and the job that wakes flows commit together: an
     // event a flow wants is never recorded without its job. If anything fails nothing is kept, the
     // caller gets the error, and a retry with the same unique_id records it afresh.
     let mut tx = db.begin().await?;
+    let r = insert_event_in(&mut tx, db, ev, source, metric_id).await?;
+    if r.is_some() {
+        tx.commit().await?;
+    }
+    Ok(r)
+}
+
+async fn insert_event_in(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, db: &PgPool, ev: NewEvent<'_>, source: EventSource, metric_id: Uuid) -> AppResult<Option<Uuid>> {
+    let metric = ev.metric.trim();
+    let id = Uuid::now_v7();
+    let value = ev.value.or_else(|| ev.properties.get("$value").and_then(|v| v.as_f64()));
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
          VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
@@ -400,7 +427,7 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
     .bind(&ev.unique_id)
     .bind(ev.message_id)
     .bind(source == EventSource::Browser)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let inserted = match (inserted, &ev.unique_id) {
         (Some(id), _) => Some(id),
@@ -412,7 +439,7 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
                 .bind(ev.account_id)
                 .bind(metric_id)
                 .bind(unique_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?
                 .rows_affected();
             if replaced == 0 {
@@ -433,7 +460,7 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
                 .bind(ev.occurred_at)
                 .bind(unique_id)
                 .bind(ev.message_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?
             }
         }
@@ -443,7 +470,7 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
     sqlx::query("UPDATE profiles SET last_event_at = GREATEST(COALESCE(last_event_at, 'epoch'), COALESCE($2, now())) WHERE id = $1")
         .bind(ev.profile_id)
         .bind(ev.occurred_at)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let has_flow: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND trigger->>'metric' = $2
@@ -451,14 +478,13 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
     )
     .bind(ev.account_id)
     .bind(metric)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     // Webhooks and exports: nothing at all unless the account has one; never fails or stalls this.
-    crate::features::event_recorded_in(&mut tx, db, ev.account_id, event_id, ev.profile_id, metric, source, ev.message_id, &ev.properties).await;
+    crate::features::event_recorded_in(tx, db, ev.account_id, event_id, ev.profile_id, metric, source, ev.message_id, &ev.properties).await;
     if has_flow || crate::features::wants_event(db, ev.account_id, metric).await {
-        crate::jobs::enqueue(&mut *tx, "flow_event", json!({"event_id": event_id}), None).await?;
+        crate::jobs::enqueue(&mut **tx, "flow_event", json!({"event_id": event_id}), None).await?;
     }
-    tx.commit().await?;
     Ok(Some(event_id))
 }
 

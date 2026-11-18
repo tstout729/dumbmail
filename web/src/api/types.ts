@@ -1,3 +1,5 @@
+import type { PushContent } from "../features/push/types";
+
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
@@ -190,7 +192,7 @@ export type EventTimeCondition = {
 export type ListCondition = { type: "list"; list_id: string; op: "in" | "not_in" };
 export type SegmentRefCondition = { type: "segment"; segment_id: string; op: "in" | "not_in" };
 export type ConsentCondition = { type: "consent"; channel: "email" | "sms"; status: Consent };
-export type CanReceiveCondition = { type: "can_receive"; channel: "email" | "sms"; value: boolean };
+export type CanReceiveCondition = { type: "can_receive"; channel: "email" | "sms" | "push"; value: boolean };
 export type SuppressedCondition = { type: "suppressed"; value: boolean };
 export type FormCondition = { type: "form"; form_id?: string; op: HasOp } & EventWindow;
 export type EngagementCondition = { type: "engagement"; channel: "email" | "sms" | "any"; engaged: boolean; within_days: number };
@@ -276,7 +278,7 @@ export type EmailContent = {
 
 export type SmsContent = { body: string; media_url?: string };
 
-export type Channel = "email" | "sms";
+export type Channel = "email" | "sms" | "push";
 
 export type MessageStats = {
   recipients: number;
@@ -302,7 +304,7 @@ export type VersionId = "a" | "b" | "c" | "d";
 export type AbMetric = "open_rate" | "click_rate" | "revenue";
 
 export type AbTest = {
-  variants: { id: Exclude<VersionId, "a">; content: EmailContent | SmsContent }[];
+  variants: { id: Exclude<VersionId, "a">; content: EmailContent | SmsContent | PushContent }[];
   /** Share of the audience that gets the test, split evenly across versions (5-100, default 20). */
   test_percent?: number;
   /** Hours to wait before picking the winner (1-168, default 4). */
@@ -319,7 +321,7 @@ export type Campaign = {
   channel: Channel;
   status: CampaignStatus;
   audience: Audience;
-  content: EmailContent | SmsContent;
+  content: EmailContent | SmsContent | PushContent;
   send_at: string | null;
   sent_at: string | null;
   created_at: string;
@@ -372,6 +374,7 @@ export type DelayUnit = "minutes" | "hours" | "days";
 export type DelayNode = { id: string; type: "delay"; amount: number; unit: DelayUnit; next: string | null } & DelayOptions;
 export type EmailNode = { id: string; type: "email"; name?: string; content: EmailContent; next: string | null };
 export type SmsNode = { id: string; type: "sms"; name?: string; content: SmsContent; next: string | null };
+export type PushNode = { id: string; type: "push"; name?: string; content: PushContent; next: string | null };
 export type ConditionNode = {
   id: string;
   type: "condition";
@@ -423,6 +426,7 @@ export type FlowNode =
   | DelayNode
   | EmailNode
   | SmsNode
+  | PushNode
   | ConditionNode
   | RandomSplitNode
   | WaitForReplyNode

@@ -120,17 +120,23 @@ pub const SLICE_SECS: u64 = 15;
 
 /// Ask for the account's worker to run soon. Safe to call often and inside a transaction: at most one
 /// job is queued per account until it starts.
+/// The job carries the install it's for: one queued for an earlier install does nothing.
 pub async fn kick(conn: &mut sqlx::PgConnection, account_id: Uuid) -> sqlx::Result<()> {
-    let marked: Option<Uuid> = sqlx::query_scalar(
-        "UPDATE shopify_shops SET work_queued_at = now() WHERE account_id = $1 AND work_queued_at IS NULL AND status <> 'disconnected' RETURNING account_id",
+    let marked: Option<i32> = sqlx::query_scalar(
+        "UPDATE shopify_shops SET work_queued_at = now() WHERE account_id = $1 AND work_queued_at IS NULL AND status <> 'disconnected' RETURNING generation",
     )
     .bind(account_id)
     .fetch_optional(&mut *conn)
     .await?;
-    if marked.is_some() {
-        crate::jobs::enqueue_background(&mut *conn, "shopify_work", json!({"account_id": account_id}), None).await?;
+    if let Some(generation) = marked {
+        crate::jobs::enqueue_background(&mut *conn, "shopify_work", work_payload(account_id, generation), None).await?;
     }
     Ok(())
+}
+
+/// A worker job's payload: the account and the install (generation) it works for.
+pub fn work_payload(account_id: Uuid, generation: i32) -> Value {
+    json!({"account_id": account_id, "generation": generation})
 }
 
 /// [`kick`] outside a transaction.
@@ -163,17 +169,19 @@ pub async fn still_mine(db: &PgPool, lease: &Lease) -> sqlx::Result<bool> {
 /// by this run for this install and the store is connected.
 pub const LEASE_GUARD: &str = "EXISTS (SELECT 1 FROM shopify_shops WHERE account_id = $1 AND lease_token = $2 AND generation = $3 AND status = 'connected' AND lease_until > now())";
 
-/// Take the account's lease. `Ok(None)`: someone else holds it (they will see the queued flag when
-/// they finish).
-pub async fn acquire(state: &AppState, account_id: Uuid) -> anyhow::Result<Option<Lease>> {
+/// Take the account's lease for the install the job was queued for. `Ok(None)`: someone else holds
+/// it (they will see the queued flag when they finish), or the job is for an earlier install (it
+/// can't pick up the new one; the new install queues its own).
+pub async fn acquire(state: &AppState, account_id: Uuid, generation: i32) -> anyhow::Result<Option<Lease>> {
     let token = Uuid::now_v7();
     let got: Option<i32> = sqlx::query_scalar(
         "UPDATE shopify_shops SET lease_until = now() + make_interval(secs => $2), lease_token = $3, work_queued_at = NULL
-         WHERE account_id = $1 AND (lease_until IS NULL OR lease_until < now()) RETURNING generation",
+         WHERE account_id = $1 AND generation = $4 AND (lease_until IS NULL OR lease_until < now()) RETURNING generation",
     )
     .bind(account_id)
     .bind(LEASE_SECS as f64)
     .bind(token)
+    .bind(generation)
     .fetch_optional(&state.db)
     .await?;
     let Some(generation) = got else { return Ok(None) };
@@ -196,16 +204,18 @@ pub async fn release(state: &AppState, lease: &Lease, more: bool, delay: Option<
         let mut tx = state.db.begin().await?;
         sqlx::query("UPDATE shopify_shops SET work_queued_at = now() WHERE account_id = $1").bind(lease.account_id).execute(&mut *tx).await?;
         let at = if asked { None } else { delay.map(|d| Utc::now() + d) };
-        crate::jobs::enqueue_background(&mut *tx, "shopify_work", json!({"account_id": lease.account_id}), at).await?;
+        crate::jobs::enqueue_background(&mut *tx, "shopify_work", work_payload(lease.account_id, lease.generation), at).await?;
         tx.commit().await?;
     }
     Ok(())
 }
 
 /// Keep the lease while a run is still inside its slice. False: the lease or the install is gone
-/// (a reinstall, a disconnect, or the run outlived its lease); stop without writing more.
+/// (a reinstall, a disconnect, or the run outlived its lease); stop without writing more. A lease
+/// that has already expired is never renewed, even if nobody took it meanwhile: the run must stop
+/// and the next job take it afresh.
 pub async fn renew(state: &AppState, lease: &Lease) -> anyhow::Result<bool> {
-    let n = sqlx::query("UPDATE shopify_shops SET lease_until = now() + make_interval(secs => $3) WHERE account_id = $1 AND lease_token = $2 AND generation = $4 AND status = 'connected'")
+    let n = sqlx::query("UPDATE shopify_shops SET lease_until = now() + make_interval(secs => $3) WHERE account_id = $1 AND lease_token = $2 AND generation = $4 AND status = 'connected' AND lease_until > now()")
         .bind(lease.account_id)
         .bind(lease.token)
         .bind(LEASE_SECS as f64)
@@ -219,8 +229,8 @@ pub async fn renew(state: &AppState, lease: &Lease) -> anyhow::Result<bool> {
 /// Safety net for the scheduler: workers that should be running but aren't (a crash between
 /// claiming and finishing, or a lost job).
 pub async fn requeue_stuck(db: &PgPool) -> sqlx::Result<()> {
-    let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT s.account_id FROM shopify_shops s
+    let ids: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT s.account_id, s.generation FROM shopify_shops s
          WHERE s.status <> 'disconnected' AND (s.lease_until IS NULL OR s.lease_until < now())
            AND ((s.work_queued_at IS NOT NULL AND s.work_queued_at < now() - interval '3 minutes')
              OR (s.work_queued_at IS NULL AND (
@@ -231,10 +241,10 @@ pub async fn requeue_stuck(db: &PgPool) -> sqlx::Result<()> {
     )
     .fetch_all(db)
     .await?;
-    for id in ids {
+    for (id, generation) in ids {
         let mut tx = db.begin().await?;
         sqlx::query("UPDATE shopify_shops SET work_queued_at = now() WHERE account_id = $1").bind(id).execute(&mut *tx).await?;
-        crate::jobs::enqueue_background(&mut *tx, "shopify_work", json!({"account_id": id}), None).await?;
+        crate::jobs::enqueue_background(&mut *tx, "shopify_work", work_payload(id, generation), None).await?;
         tx.commit().await?;
     }
     Ok(())
