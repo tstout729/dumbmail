@@ -42,7 +42,8 @@
       "Product Viewed",
       "Signed Up"
     ],
-    "allow_client_sources": false
+    "allow_client_sources": false,
+    "copy_properties": []
   },
   "pull": null,
   "redact": [

@@ -13,16 +13,21 @@
 var CLIENT_LIBRARIES = ["analytics.js", "analytics-next", "analytics-ios", "analytics-android", "analytics-react-native", "analytics-kotlin", "analytics-swift", "analytics-flutter"];
 // See README.md for the Segment page behind each assumption.
 
-function plain(o) {
+// Properties of Segment's ecommerce spec (v2) that are copied onto events; free-text ones (review
+// bodies, share messages, search queries, recipients) aren't. Add others in
+// settings.copy_properties.
+var SPEC = ["affiliation", "brand", "cart_id", "category", "checkout_id", "coupon", "coupon_id", "coupon_name", "creative", "currency", "discount", "image_url", "list_id", "name", "order_id", "payment_method", "position", "price", "product_id", "products", "promotion_id", "quantity", "rating", "reason", "revenue", "review_id", "shipping", "shipping_method", "sku", "step", "subtotal", "tax", "total", "url", "value", "variant", "wishlist_id", "wishlist_name"];
+var PRODUCT = ["product_id", "sku", "category", "name", "brand", "variant", "price", "quantity", "coupon", "position", "url", "image_url"];
+
+function pick(o, keys) {
   var out = {};
-  var n = 0;
-  for (var k in o || {}) {
-    var v = o[k];
-    if (n >= 100 || v === null || v === undefined) continue;
-    if (typeof v === "object") v = JSON.stringify(v).slice(0, 2000);
+  keys.forEach(function (k) {
+    var v = (o || {})[k];
+    if (v === null || v === undefined) return;
+    if (k === "products" && Array.isArray(v)) v = v.slice(0, 50).map(function (p) { return pick(p, PRODUCT); });
+    else if (typeof v === "object") return;
     out[k] = v;
-    n++;
-  }
+  });
   return out;
 }
 
@@ -43,8 +48,8 @@ function handle(input) {
     if (events.indexOf(c.event) < 0) return [{ type: "log", message: "track " + c.event + " isn't in settings.events (add it there and to the integration's metrics to record it)" }];
     if (!c.userId) return [{ type: "log", message: "track " + c.event + " has no userId" }];
     var who = { property: "segment_user_id", value: String(c.userId), if_missing: "retry" };
-    var props = plain(c.properties);
-    delete props.email;
+    var extra = Array.isArray(settings.copy_properties) ? settings.copy_properties.filter(function (k) { return typeof k === "string" && k !== "email"; }).slice(0, 50) : [];
+    var props = pick(c.properties, SPEC.concat(extra));
     var value = parseFloat((c.properties || {}).revenue !== undefined ? c.properties.revenue : (c.properties || {}).value);
     var ev = { type: "track_event", metric: c.event, profile: who, time: c.timestamp || c.sentAt, properties: props };
     if (isFinite(value)) ev.value = value;

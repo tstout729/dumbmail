@@ -7,7 +7,8 @@ Checked against Typeform's documentation on 2026-11-17; not yet run against a li
 - **Resends.** `event_id` is the message id; the event's `unique_id` is the form id and response `token`, so a response is recorded once.
 - **Who.** The first `email` answer (or the one whose ref is `settings.email_field`). `hidden` fields come from the form's link and aren't trusted for identity. Respondents are anonymous web visitors, so the recipe only sets the email: it never changes an existing profile's name.
 - **Consent.** A response isn't an opt-in, so nobody is subscribed. With `settings.consent_field` set to a yes/no or legal question's ref, its answer is recorded as `marketing_consent` on the event. Subscribing someone from it needs a confirmation (double opt-in) DumbMail can't yet start from an integration.
-- **Answers.** Choice (the form's own labels, never an "other" answer someone typed), yes/no, number and date answers are copied onto the event by ref. Free-text answers aren't copied (people type anything into them) and are removed from the stored payload, with payment, file upload, signature and recording answers.
+- **Answers.** Only the answers whose refs are in `settings.copy_fields` are copied onto the event (a choice's own label, never an "other" answer someone typed).
+- **What's stored.** Keep-only: the event id and type, the form id and title, the response token and time, email answers, the consent answer and the `copy_fields` answers. Hidden fields, every other answer, typed "Other" choices and payment, file, signature and recording answers are dropped before anything is stored.
 
 ## What a live check should look at first
 

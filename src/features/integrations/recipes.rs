@@ -201,7 +201,7 @@ mod tests {
                 // A webhook's (or fetch's) script runs on the stored payload, which has the redact
                 // list applied: removing those fields must not change what the script does.
                 if !pull {
-                    let paths = super::super::redact::paths(&strings(&r.manifest["redact"]));
+                    let paths = super::super::redact::paths_with(&strings(&r.manifest["redact"]), input["settings"].as_object().unwrap_or(&serde_json::Map::new()));
                     let body = input["payload"].to_string();
                     if let Some(kept) = super::super::redact::body(Some("application/json"), &body, &paths) {
                         let mut redacted = input.clone();

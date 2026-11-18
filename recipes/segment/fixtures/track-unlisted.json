@@ -1,24 +1,24 @@
 {
   "description": "a track event not in settings.events is logged, not recorded",
   "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
-  "input": {
-    "payload": {
-      "version": 1,
-      "type": "track",
-      "userId": "019mr8mf4r",
-      "messageId": "ajs-track-0002",
-      "event": "Purchased an Item",
-      "properties": {
-        "revenue": "39.95",
-        "shippingMethod": "2-day"
-      },
-      "timestamp": "2012-12-02T00:30:08.276Z"
-    }
-  },
   "expect": [
     {
       "message": "track Purchased an Item isn't in settings.events (add it there and to the integration's metrics to record it)",
       "type": "log"
     }
-  ]
+  ],
+  "input": {
+    "payload": {
+      "event": "Purchased an Item",
+      "messageId": "ajs-track-0002",
+      "properties": {
+        "revenue": "39.95",
+        "shippingMethod": "2-day"
+      },
+      "timestamp": "2012-12-02T00:30:08.276Z",
+      "type": "track",
+      "userId": "019mr8mf4r",
+      "version": 1
+    }
+  }
 }

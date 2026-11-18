@@ -807,6 +807,9 @@ async fn form_submissions_never_subscribe_and_never_rename_anyone() {
     // The marketing flow on Form Submitted reached the existing (unheld) person, not the held one.
     assert_eq!(sent_to(&h, "We got your form"), vec!["lane.example@example.com"]);
     never_stored(&mut h, &t, &sensitive("typeform", &["form-response.json"]), &["form-response.json"]).await;
+    // Webflow: only the mapped fields and the ids are kept; the visitor's message and name aren't
+    // in the stored body, the delivery log or a dry run.
+    never_stored(&mut h, &w, &sensitive("webflow", &["form-submission.json"]), &["form-submission.json"]).await;
     h.cleanup().await;
 }
 

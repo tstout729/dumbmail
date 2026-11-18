@@ -418,7 +418,9 @@ fn checked_lookup(integ: &Integration, rules: &pull::FetchRules, n: &NextRequest
     let vars = Vars { secrets: &none, state: &st, settings: &settings, now, since: now, redact: true };
     let mut ok = rules.allow(n, &vars)?;
     if let Some(c) = ok.context.take() {
-        let kept = super::redact::body(Some("application/json"), &c.to_string(), &super::redact::paths(&integ.redact)).and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        // The redact list's removals apply to the context (a keep list describes the payload).
+        let removals: Vec<_> = super::redact::paths_with(&integ.redact, &settings).into_iter().filter(|p| !p.is_keep()).collect();
+        let kept = super::redact::body(Some("application/json"), &c.to_string(), &removals).and_then(|t| serde_json::from_str::<Value>(&t).ok());
         if kept.as_ref().is_some_and(|k| k.to_string().len() > actions::MAX_CONTEXT_BYTES) {
             return Err("the fetch's context is over 16 KB".into());
         }
@@ -504,7 +506,7 @@ impl From<sqlx::Error> for Refused {
 /// against it isn't kept at all), then every secret masked.
 fn kept_body(integ: &Integration, scrub: &Scrub, content_type: Option<&str>, body: Option<&str>) -> (Option<String>, bool) {
     let Some(b) = body else { return (None, false) };
-    match super::redact::body(content_type, b, &super::redact::paths(&integ.redact)) {
+    match super::redact::body(content_type, b, &super::redact::paths_with(&integ.redact, &integ.settings_map())) {
         Some(kept) => (Some(scrub.text(&kept)), false),
         None => (None, true),
     }

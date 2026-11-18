@@ -1,12 +1,14 @@
 // Webflow forms → DumbMail
 //
 // Each form_submission webhook becomes Form Submitted on the visitor's profile, found by the
-// submission's email field (settings.email_field, or the first field named like "email"). A form
+// submission's email field (settings.email_field, "Email" by default). A form
 // submission isn't an opt-in: nobody is subscribed, and people this adds are held back from
 // marketing. If the form has a consent checkbox and its field name is set as
 // settings.consent_field, whether it was ticked is recorded on the event as marketing_consent.
 // Visitors are anonymous, so a submission never changes an existing profile's name.
-// Only the fields named in settings.copy_fields are copied onto the event.
+// Only the fields named in settings.copy_fields are copied onto the event, and only those, the
+// email field and the consent field are kept with the delivery: every other field is dropped
+// before anything is stored.
 // See README.md for the Webflow page behind each assumption.
 
 function ticked(v) {
@@ -21,13 +23,9 @@ function handle(input) {
   var f = p.payload;
   var data = f.data || {};
   var s = input.settings || {};
-  var email = s.email_field ? data[s.email_field] : undefined;
-  if (!email) {
-    for (var k in data) {
-      if (/e-?mail/i.test(k) && /@/.test(String(data[k]))) { email = data[k]; break; }
-    }
-  }
-  if (!email) return [{ type: "log", message: "submission " + f.id + " has no email field" }];
+  var field = s.email_field || "Email";
+  var email = data[field];
+  if (!email || !/@/.test(String(email))) return [{ type: "log", message: "submission " + f.id + " has no email in the field " + field + " (set email_field to the form's email field name)" }];
   var props = { form_id: f.formId, form_name: f.name, site_id: f.siteId, submission_id: f.id };
   if (s.consent_field) props.marketing_consent = ticked(data[s.consent_field]);
   var copy = Array.isArray(s.copy_fields) ? s.copy_fields.slice(0, 50) : [];

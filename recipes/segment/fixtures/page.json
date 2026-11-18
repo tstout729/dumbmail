@@ -1,22 +1,22 @@
 {
   "description": "page calls are ignored",
   "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
-  "input": {
-    "payload": {
-      "version": 1,
-      "type": "page",
-      "userId": "019mr8mf4r",
-      "properties": {
-        "path": "/pricing",
-        "url": "https://segment.com/pricing"
-      },
-      "timestamp": "2012-12-02T00:30:08.276Z"
-    }
-  },
   "expect": [
     {
       "message": "ignored Segment page",
       "type": "log"
     }
-  ]
+  ],
+  "input": {
+    "payload": {
+      "properties": {
+        "path": "/pricing",
+        "url": "https://segment.com/pricing"
+      },
+      "timestamp": "2012-12-02T00:30:08.276Z",
+      "type": "page",
+      "userId": "019mr8mf4r",
+      "version": 1
+    }
+  }
 }

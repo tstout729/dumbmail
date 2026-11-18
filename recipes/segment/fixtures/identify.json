@@ -1,24 +1,6 @@
 {
   "description": "identify with traits.email: a held profile, the Segment userId kept as a key",
   "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
-  "input": {
-    "payload": {
-      "version": 1,
-      "type": "identify",
-      "userId": "019mr8mf4r",
-      "messageId": "ajs-identify-0001",
-      "traits": {
-        "email": "achilles.example@example.com",
-        "name": "Achilles Example",
-        "subscriptionPlan": "Premium",
-        "friendCount": 29
-      },
-      "context": {
-        "ip": "198.51.100.88"
-      },
-      "timestamp": "2012-12-02T00:30:08.276Z"
-    }
-  },
   "expect": [
     {
       "email": "achilles.example@example.com",
@@ -28,6 +10,24 @@
       "type": "upsert_profile"
     }
   ],
+  "input": {
+    "payload": {
+      "context": {
+        "ip": "198.51.100.88"
+      },
+      "messageId": "ajs-identify-0001",
+      "timestamp": "2012-12-02T00:30:08.276Z",
+      "traits": {
+        "email": "achilles.example@example.com",
+        "friendCount": 29,
+        "name": "Achilles Example",
+        "subscriptionPlan": "Premium"
+      },
+      "type": "identify",
+      "userId": "019mr8mf4r",
+      "version": 1
+    }
+  },
   "sensitive": [
     "198.51.100.88"
   ]
