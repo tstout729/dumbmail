@@ -41,7 +41,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn check_channel(c: &str) -> AppResult<()> {
-    if matches!(c, "email" | "sms" | "push") { Ok(()) } else { Err(AppError::bad("channel must be email, sms or push")) }
+    if matches!(c, "email" | "sms" | "push" | "whatsapp") { Ok(()) } else { Err(AppError::bad("channel must be email, sms, push or whatsapp")) }
 }
 
 // ---------- Templates ----------
@@ -157,6 +157,9 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
     if b.channel == "push" {
         return crate::features::push::preview(&account, &b.content, &ctx);
     }
+    if b.channel == "whatsapp" {
+        return crate::features::whatsapp::preview(state, &account, &b.content, &ctx).await;
+    }
     // Saved blocks and display rules (see features::content); email without them goes on untouched.
     let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
     let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
@@ -252,7 +255,9 @@ fn checked_ab_test(channel: &str, v: Option<&Value>) -> AppResult<Option<Value>>
                         _ => Err(AppError::bad(format!("version {label} {k} must be text"))),
                     }
                 };
-                if channel == "push" {
+                if channel == "whatsapp" {
+                    crate::features::whatsapp::content::parse(&var.content).map_err(|e| AppError::bad(format!("version {label}: {}", e.public_message())))?;
+                } else if channel == "push" {
                     o.entry("title").or_insert(json!(""));
                     text(o, "title", true)?;
                     crate::features::push::content::parse(&var.content).map_err(|e| AppError::bad(format!("version {label}: {}", e.public_message())))?;
@@ -291,6 +296,7 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     let label = match channel.as_str() {
         "sms" => "SMS",
         "push" => "Push",
+        "whatsapp" => "WhatsApp",
         _ => "Email",
     };
     let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{label} campaign {}", Utc::now().format("%b %-d")));
@@ -298,10 +304,14 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     let mut content = b.content.unwrap_or_else(|| match channel.as_str() {
         "sms" => json!({"body": ""}),
         "push" => crate::features::push::content::starter(),
+        "whatsapp" => crate::features::whatsapp::content::starter(),
         _ => json!({"subject": "", "blocks": []}),
     });
     if channel == "push" {
         crate::features::push::content::parse(&content)?;
+    }
+    if channel == "whatsapp" {
+        crate::features::whatsapp::content::parse(&content)?;
     }
     let mut ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
     // Blocks get their stable keys (see features::translations::fields).
@@ -377,6 +387,9 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, mu
     crate::features::coupons::template::check_campaign(channel, b.content.as_ref().unwrap_or(&c.content), ab_test.as_ref())?;
     if channel == "push" {
         crate::features::push::content::parse(b.content.as_ref().unwrap_or(&c.content))?;
+    }
+    if channel == "whatsapp" {
+        crate::features::whatsapp::content::parse(b.content.as_ref().unwrap_or(&c.content))?;
     }
     let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
     let set_send_options = b.send_options.is_some();
@@ -513,6 +526,12 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         let ab = campaigns::ab_test(&c);
         contents.extend(ab.iter().flat_map(|t| t.variants.iter().map(|v| &v.content)));
         problems.extend(crate::features::push::setup_problems(state, account_id, &contents).await?);
+    }
+    if c.channel == "whatsapp" {
+        let mut contents = vec![&c.content];
+        let ab = campaigns::ab_test(&c);
+        contents.extend(ab.iter().flat_map(|t| t.variants.iter().map(|v| &v.content)));
+        problems.extend(crate::features::whatsapp::setup_problems(state, account_id, &contents).await?);
     }
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
@@ -811,6 +830,9 @@ async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value)
         if n.kind == "push" {
             crate::features::push::content::parse(n.data.get("content").unwrap_or(&Value::Null)).map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
         }
+        if n.kind == "whatsapp" {
+            crate::features::whatsapp::content::parse(n.data.get("content").unwrap_or(&Value::Null)).map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
+        }
         if n.kind == "webhook" {
             crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
         }
@@ -949,6 +971,12 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         if !pushes.is_empty() {
             if let Some(p) = crate::features::push::setup_problems(state, account_id, &pushes).await?.into_iter().next() {
                 return Err(AppError::bad(format!("push step: {p}")));
+            }
+        }
+        let whatsapps: Vec<&Value> = def.nodes.iter().filter(|n| n.kind == "whatsapp").filter_map(|n| n.data.get("content")).collect();
+        if !whatsapps.is_empty() {
+            if let Some(p) = crate::features::whatsapp::setup_problems(state, account_id, &whatsapps).await?.into_iter().next() {
+                return Err(AppError::bad(format!("WhatsApp step: {p}")));
             }
         }
         for n in &def.nodes {

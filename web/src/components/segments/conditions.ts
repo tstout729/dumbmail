@@ -306,7 +306,7 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
     case "consent":
       return `${c.channel} consent is ${c.status.replace("_", " ")}`;
     case "can_receive":
-      return `${c.value ? "can" : "can't"} receive ${c.channel === "sms" ? "SMS" : c.channel === "push" ? "push" : "email"}`;
+      return `${c.value ? "can" : "can't"} receive ${c.channel === "sms" ? "SMS" : c.channel === "push" ? "push" : c.channel === "whatsapp" ? "WhatsApp" : "email"}`;
     case "suppressed":
       return c.value ? "email suppressed" : "email not suppressed";
     case "language":
