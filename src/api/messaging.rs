@@ -974,12 +974,17 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             crate::flows::refresh_segment(state, segment_id).await.map_err(|e| AppError::bad(format!("couldn't refresh the trigger segment: {e}")))?;
         }
     }
-    // Turning live was checked against this version of the flow (review included); an edit meanwhile means check again.
-    let row: Option<FlowRow> = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *")
+    // Turning live was checked against this version of the flow (review and sender screening
+    // included): the statement compares the definition itself too, so anything that changed it
+    // meanwhile, by any path, means check again.
+    let row: Option<FlowRow> = sqlx::query_as(
+        "UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND md5(definition::text) = md5($5::jsonb::text) AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *",
+    )
         .bind(id)
         .bind(status)
         .bind(account_id)
         .bind(f.updated_at)
+        .bind(&f.definition)
         .fetch_optional(&state.db)
         .await?;
     let Some(row) = row else {

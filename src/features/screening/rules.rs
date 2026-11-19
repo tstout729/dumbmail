@@ -18,6 +18,8 @@ pub const IMPORT_NO_MX_BLOCK: f64 = 0.10;
 pub const IMPORT_ROLE_REVIEW: f64 = 0.05;
 pub const IMPORT_NO_MX_REVIEW: f64 = 0.03;
 pub const IMPORT_TYPO_REVIEW: f64 = 0.03;
+/// A block on mail servers needs at least this share of the file's addresses checked.
+pub const IMPORT_MX_COVERAGE_FOR_BLOCK: f64 = 0.80;
 /// Shares are judged only once a file has this many addresses (one bad row in a file of ten means nothing).
 pub const IMPORT_MIN_ROWS: u64 = 20;
 
@@ -152,12 +154,16 @@ pub fn judge_import(file_name: Option<&str>, headers: &[String], s: &ImportStats
         } else if role > IMPORT_ROLE_REVIEW {
             review.push(format!("{} of the addresses are shared inboxes like info@ or sales@.", pct(role)));
         }
+        // Over the addresses whose domain was actually checked (a lookup that failed or timed out is
+        // unknown, never "no mail server"); a block needs most of the file checked.
         if s.mx_checked >= IMPORT_MIN_ROWS {
             let no_mx = share(s.no_mx, s.mx_checked);
-            if no_mx > IMPORT_NO_MX_BLOCK {
-                block.push(format!("{} of the addresses are on domains that can't receive email.", pct(no_mx)));
+            let coverage = share(s.mx_checked, s.with_address);
+            let said = format!("{} of the addresses we could check ({} of the file) are on domains that can't receive email.", pct(no_mx), pct(coverage));
+            if no_mx > IMPORT_NO_MX_BLOCK && coverage >= IMPORT_MX_COVERAGE_FOR_BLOCK {
+                block.push(said);
             } else if no_mx > IMPORT_NO_MX_REVIEW {
-                review.push(format!("{} of the addresses are on domains that can't receive email.", pct(no_mx)));
+                review.push(said);
             }
         }
         let typo = share(s.typo, s.with_address);
@@ -261,17 +267,13 @@ fn unconfuse(s: &str) -> String {
     }).collect()
 }
 
-/// The registrable part of a host (`shop.acme.co.uk` → `acme.co.uk`), roughly.
+/// The registrable part of a host (`shop.acme.co.uk` → `acme.co.uk`), by the public suffix list.
 pub fn registrable(host: &str) -> String {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() <= 2 {
-        return labels.join(".");
+    match psl::domain_str(&host) {
+        Some(d) => d.to_string(),
+        None => host,
     }
-    let n = labels.len();
-    let second = labels[n - 2];
-    let take = if labels[n - 1].len() == 2 && matches!(second, "co" | "com" | "org" | "net" | "ac" | "gov" | "edu" | "ltd" | "plc") { 3 } else { 2 };
-    labels[n - take..].join(".")
 }
 
 /// The main name of a domain, without its suffix (`shop.acme.co.uk` → `acme`).
@@ -283,9 +285,24 @@ fn on_domain(host: &str, owned: &str) -> bool {
     host == owned || host.ends_with(&format!(".{owned}"))
 }
 
-/// The brand a domain name impersonates, if it does. `website`: the account's own website host
-/// (a brand's real owner may use its name).
-pub fn impersonated_brand(domain: &str, website: Option<&str>) -> Option<&'static str> {
+/// What proves an account belongs to a brand: a verified sending domain on the brand's own
+/// domain, or an operator's confirmation. A website the customer typed proves nothing.
+#[derive(Debug, Default, Clone)]
+pub struct Affiliation<'a> {
+    pub verified_domains: &'a [String],
+    /// Brand names an operator confirmed (`accounts.sending_review_brands`).
+    pub brands: &'a [String],
+}
+
+impl Affiliation<'_> {
+    fn covers(&self, brand: &Brand) -> bool {
+        self.brands.iter().any(|b| b.eq_ignore_ascii_case(brand.name))
+            || self.verified_domains.iter().any(|v| brand.domains.iter().any(|d| registrable(v) == registrable(d)))
+    }
+}
+
+/// The brand a domain name impersonates, if it does, unless the account proved it belongs to it.
+pub fn impersonated_brand(domain: &str, proof: &Affiliation<'_>) -> Option<&'static str> {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     let suffix_len = registrable(&domain).split('.').skip(1).map(|l| l.len() + 1).sum::<usize>();
     let name_part = &domain[..domain.len().saturating_sub(suffix_len)];
@@ -293,7 +310,7 @@ pub fn impersonated_brand(domain: &str, website: Option<&str>) -> Option<&'stati
     let tokens: Vec<String> = raw_tokens.iter().map(|t| unconfuse(t)).collect();
     let phishy = tokens.iter().any(|t| PHISH_WORDS.contains(&t.as_str()));
     for brand in BRANDS {
-        if brand.domains.iter().any(|d| on_domain(&domain, d)) || website.is_some_and(|w| brand.domains.iter().any(|d| on_domain(&w.to_ascii_lowercase(), d))) {
+        if brand.domains.iter().any(|d| on_domain(&domain, d)) || proof.covers(brand) {
             continue;
         }
         let hit = raw_tokens.iter().zip(&tokens).any(|(raw, t)| {
@@ -439,25 +456,54 @@ mod tests {
 
     #[test]
     fn brand_lookalikes() {
-        assert_eq!(impersonated_brand("paypal-secure-login.com", None), Some("paypal"));
-        assert_eq!(impersonated_brand("paypa1.com", None), Some("paypal"));
-        assert_eq!(impersonated_brand("rnicrosoft.net", None), Some("microsoft"));
-        assert_eq!(impersonated_brand("mail.netflix-billing.co", None), Some("netflix"));
-        assert_eq!(impersonated_brand("applesupport.help", None), Some("apple"));
-        assert_eq!(impersonated_brand("apple-verify.com", None), Some("apple"));
-        assert_eq!(impersonated_brand("app1e.com", None), Some("apple"), "a lookalike spelling of a common word");
-        assert_eq!(impersonated_brand("wellsfargo.info", None), Some("wellsfargo"));
-        assert_eq!(impersonated_brand("secure-chase.com", None), Some("chase"));
+        assert_eq!(impersonated_brand("paypal-secure-login.com", &Affiliation::default()), Some("paypal"));
+        assert_eq!(impersonated_brand("paypa1.com", &Affiliation::default()), Some("paypal"));
+        assert_eq!(impersonated_brand("rnicrosoft.net", &Affiliation::default()), Some("microsoft"));
+        assert_eq!(impersonated_brand("mail.netflix-billing.co", &Affiliation::default()), Some("netflix"));
+        assert_eq!(impersonated_brand("applesupport.help", &Affiliation::default()), Some("apple"));
+        assert_eq!(impersonated_brand("apple-verify.com", &Affiliation::default()), Some("apple"));
+        assert_eq!(impersonated_brand("app1e.com", &Affiliation::default()), Some("apple"), "a lookalike spelling of a common word");
+        assert_eq!(impersonated_brand("wellsfargo.info", &Affiliation::default()), Some("wellsfargo"));
+        assert_eq!(impersonated_brand("secure-chase.com", &Affiliation::default()), Some("chase"));
         // Ordinary words and real owners are fine.
-        assert_eq!(impersonated_brand("apple-orchard-farm.com", None), None);
-        assert_eq!(impersonated_brand("bigappletours.com", None), None);
-        assert_eq!(impersonated_brand("amazon-river-tours.com", None), None);
-        assert_eq!(impersonated_brand("pop-ups.com", None), None);
-        assert_eq!(impersonated_brand("chasefarms.com", None), None);
-        assert_eq!(impersonated_brand("news.paypal.com", None), None);
-        assert_eq!(impersonated_brand("paypal-news.com", Some("www.paypal.com")), None, "the brand's own account");
-        assert_eq!(impersonated_brand("acme.test", None), None);
-        assert_eq!(impersonated_brand("mail.acmegoods.com", None), None);
+        assert_eq!(impersonated_brand("apple-orchard-farm.com", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("bigappletours.com", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("amazon-river-tours.com", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("pop-ups.com", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("chasefarms.com", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("news.paypal.com", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("paypal-news.com", &Affiliation { verified_domains: &["mail.paypal.com".to_string()], brands: &[] }), None, "a verified domain on the brand proves it");
+        assert_eq!(impersonated_brand("paypal-news.com", &Affiliation { verified_domains: &[], brands: &["paypal".to_string()] }), None, "an operator confirmed it");
+        assert_eq!(impersonated_brand("acme.test", &Affiliation::default()), None);
+        assert_eq!(impersonated_brand("mail.acmegoods.com", &Affiliation::default()), None);
+    }
+
+    #[test]
+    fn a_website_proves_nothing_about_a_brand() {
+        // The account typed paypal.com as its website: still a lookalike.
+        assert_eq!(impersonated_brand("paypal-secure-login.com", &Affiliation::default()), Some("paypal"));
+        // A verified sending domain on another brand doesn't help either.
+        assert_eq!(impersonated_brand("paypal-secure-login.com", &Affiliation { verified_domains: &["mail.netflix.com".to_string()], brands: &[] }), Some("paypal"));
+    }
+
+    #[test]
+    fn mail_server_shares_count_only_what_was_checked() {
+        let s = |with: u64, checked: u64, no_mx: u64| ImportStats { rows: with, with_address: with, no_mx, mx_checked: checked, ..Default::default() };
+        // 20 of the 50 addresses checked have no mail server (40%), but only half the file was checked.
+        let (v, why) = judge_import(None, &[], &s(100, 50, 20));
+        assert_eq!(v, Verdict::Review, "no block without 80% coverage");
+        assert!(why[0].contains("50.0% of the file"), "{why:?}");
+        assert_eq!(judge_import(None, &[], &s(100, 80, 20)).0, Verdict::Block);
+        assert_eq!(judge_import(None, &[], &s(100, 10, 10)).0, Verdict::Pass, "too few checked to judge");
+    }
+
+    #[test]
+    fn registrable_names_follow_the_public_suffix_list() {
+        assert_eq!(registrable("shop.acme.co.uk"), "acme.co.uk");
+        assert_eq!(registrable("evil.github.io"), "evil.github.io", "github.io is a public suffix: each site is its own");
+        assert_ne!(registrable("www.acme.github.io"), registrable("evil.github.io"));
+        assert_eq!(registrable("a.b.example.com.au"), "example.com.au");
+        assert_eq!(registrable("mail.acme.test"), "acme.test");
     }
 
     #[test]

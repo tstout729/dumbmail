@@ -568,7 +568,7 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         return Ok(());
     }
     // An account that isn't approved to send stops here (see features::screening).
-    if crate::features::screening::stop_if_held(state, &account, &c).await? {
+    if crate::features::screening::stop_if_held(state, &account, &c, ids).await? {
         return Ok(());
     }
     let ab = ab_test(&c);

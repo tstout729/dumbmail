@@ -66,8 +66,12 @@ pub fn account_verdict(r: &Reactions) -> Option<String> {
     (open < ACCOUNT_MIN_OPEN_RATE).then(|| format!("unopened rate {:.1}% ({} of {} delivered emails not opened)", (1.0 - open) * 100.0, r.delivered - r.opened, r.delivered))
 }
 
-const REACTIONS: &str = "count(*) FILTER (WHERE m.status IN ('sent','delivered','complained') OR m.opened_at IS NOT NULL)::bigint,
-    count(m.opened_at)::bigint, count(m.unsubscribed_at)::bigint, count(*) FILTER (WHERE m.status = 'complained')::bigint";
+/// Over `messages m`: delivered (a delivery event arrived; the provider taking it isn't enough),
+/// opened, unsubscribed and complained, among the delivered.
+const REACTIONS: &str = "count(*) FILTER (WHERE m.delivered_at IS NOT NULL OR m.status IN ('delivered', 'complained'))::bigint,
+    count(m.opened_at) FILTER (WHERE m.delivered_at IS NOT NULL OR m.status IN ('delivered', 'complained'))::bigint,
+    count(m.unsubscribed_at) FILTER (WHERE m.delivered_at IS NOT NULL OR m.status IN ('delivered', 'complained'))::bigint,
+    count(*) FILTER (WHERE m.status = 'complained')::bigint";
 
 pub async fn run_job(state: &AppState) -> anyhow::Result<()> {
     if !super::on(state) {
@@ -76,7 +80,7 @@ pub async fn run_job(state: &AppState) -> anyhow::Result<()> {
     let accounts: Vec<Uuid> = sqlx::query_scalar(
         "SELECT a.id FROM accounts a
          WHERE a.sending_review = 'approved' AND a.sending_paused_at IS NULL AND a.closed_at IS NULL
-           AND EXISTS (SELECT 1 FROM campaigns c WHERE c.account_id = a.id AND c.channel = 'email' AND c.send_at > now() - make_interval(days => $1) AND c.send_at < now() - interval '24 hours')
+           AND EXISTS (SELECT 1 FROM campaigns c WHERE c.account_id = a.id AND c.channel = 'email' AND c.send_at > now() - make_interval(days => $1))
            AND NOT EXISTS (SELECT 1 FROM screening_engagement_checks e WHERE e.account_id = a.id AND e.checked_at > now() - interval '55 minutes')
          LIMIT $2",
     )
@@ -104,15 +108,19 @@ pub async fn check_account(state: &AppState, account_id: Uuid) -> anyhow::Result
     if claimed.is_none() {
         return Ok(());
     }
-    // Campaigns first sent 24 hours to 14 days ago, not already judged, counting only email sent
-    // since the pause was last lifted.
+    // Campaigns whose first email really went out 24 hours to 14 days ago (each message's own send
+    // time), not already judged, counting the email sent more than 24 hours ago and since the pause
+    // was last lifted.
     type Row = (Uuid, String, i64, i64, i64, i64);
     let campaigns: Vec<Row> = sqlx::query_as(&format!(
         "SELECT c.id, c.name, {REACTIONS} FROM campaigns c JOIN accounts a ON a.id = c.account_id
-           JOIN messages m ON m.campaign_id = c.id AND NOT m.is_test AND m.channel = 'email' AND m.sent_at > COALESCE(a.sending_window_start, '-infinity')
-         WHERE c.account_id = $1 AND c.channel = 'email' AND c.send_at > now() - make_interval(days => $2) AND c.send_at < now() - interval '24 hours'
+           JOIN messages m ON m.campaign_id = c.id AND NOT m.is_test AND m.channel = 'email' AND m.sent_at IS NOT NULL
+             AND m.sent_at > COALESCE(a.sending_window_start, '-infinity') AND m.sent_at < now() - interval '24 hours'
+         WHERE c.account_id = $1 AND c.channel = 'email'
            AND NOT EXISTS (SELECT 1 FROM screenings s WHERE s.account_id = $1 AND s.kind = 'engagement' AND s.subject_id = c.id)
-         GROUP BY c.id, c.name ORDER BY min(c.send_at) LIMIT 50"
+         GROUP BY c.id, c.name
+         HAVING min(m.sent_at) > now() - make_interval(days => $2)
+         ORDER BY min(m.sent_at) LIMIT 50"
     ))
     .bind(account_id)
     .bind(LOOKBACK_DAYS)

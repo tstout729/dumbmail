@@ -47,7 +47,7 @@ pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
     };
     // The same column the import reads: of the email columns, the last one filled in on each row.
     let cols: Vec<usize> = full.iter().enumerate().filter(|(_, h)| email_column(h)).map(|(i, _)| i).collect();
-    let mut s = ImportStats { consent_columns: full.iter().filter(|h| consent_column(h)).take(10).map(|h| h.chars().take(80).collect()).collect(), ..Default::default() };
+    let mut s = ImportStats { consent_columns: full.iter().filter(|h| consent_column(h)).take(10).map(|h| super::redact::text(&h.chars().take(80).collect::<String>())).collect(), ..Default::default() };
     let mut domains: HashMap<String, u64> = HashMap::new();
     for rec in rdr.records() {
         let Ok(rec) = rec else { continue };
@@ -127,7 +127,12 @@ pub async fn check_import(state: &AppState, account_id: Uuid, csv_text: &str, fi
     let verdict = if rules_verdict == Verdict::Block {
         Verdict::Block
     } else {
-        let material = json!({"file_name": file_name, "column_names": headers, "statistics": s});
+        // Only the file name, the column names (both with addresses and numbers replaced) and counts.
+        let material = json!({
+            "file_name": file_name.as_deref().map(super::redact::text),
+            "column_names": headers.iter().map(|h| super::redact::text(h)).collect::<Vec<_>>(),
+            "statistics": s,
+        });
         let task = "Task: decide whether this contact file, which the customer is importing to send marketing email to, looks like people who signed up with this business. \
                     You get only the file name, the column names and statistics over the addresses (shares of shared inboxes, throwaway and misspelled addresses, \
                     domains without mail servers, the most common address domains, and whether there's a consent or sign-up column); you never see a person's details. \

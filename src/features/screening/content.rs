@@ -1,11 +1,24 @@
-//! What a campaign or flow sends, checked when a campaign launches or is scheduled, when a flow is
-//! turned on, and when a live flow gets new email or text content: rules first, then one Claude
-//! call against the acceptable use rules. The same content (by the hash of what went to the model)
-//! is judged once per account.
+//! What a campaign or flow sends: rules first, then one Claude call against the acceptable use
+//! rules.
+//!
+//! What's judged is the content exactly as committed, every way it can go out: each A/B version,
+//! each language version, every block whatever its display rules, both sides of every template
+//! condition (the text is read as written, not one sample person's render), the saved blocks it
+//! uses, and review-request steps. Each message variant gets its own fingerprint (`part_hashes` on
+//! the screening), and sending checks the message it's about to send against those: a campaign in
+//! its batch job, a flow message in the send path (see `gate`). Content that changed since its
+//! check (an edit while scheduled or as a draft, a saved block, a translation) waits for a check on
+//! the background lane; the sending lane never calls Claude. More than the check can cover is held
+//! for a person, never cut short.
+//!
+//! The same content (the hash of what was judged) is judged once per account, except a pass the
+//! rules gave alone while Claude was unavailable, which is judged again next time.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -14,6 +27,7 @@ use uuid::Uuid;
 
 use super::ai::{self, NoJudgment};
 use super::fetch;
+use super::redact;
 use super::rules;
 use super::standing::{self, New, Standing};
 use super::Verdict;
@@ -21,13 +35,17 @@ use crate::error::{AppError, AppResult};
 use crate::models::{Account, CampaignRow, FlowRow};
 use crate::state::AppState;
 
-/// How long a launch (or turning a flow on) waits for the checks.
+/// How long a launch (or turning a flow on, or saving) may take with its checks, all of it:
+/// rendering, the model, the quota and the notices.
 pub const DEADLINE: Duration = Duration::from_secs(45);
-/// The most visible text per message that goes into a check.
-const TEXT_CHARS: usize = 6000;
-/// The most messages in one check (a flow's steps, a campaign's versions).
-const MAX_MESSAGES: usize = 25;
-const MAX_LINKS: usize = 40;
+/// The most text in one message variant.
+pub const TEXT_CHARS: usize = 20_000;
+/// The most message variants (versions × languages × steps) one check covers.
+pub const MAX_MESSAGES: usize = 60;
+/// The most links in one message variant.
+pub const MAX_LINKS: usize = 80;
+/// The most a check may send to the model.
+pub const MAX_MATERIAL_BYTES: usize = 200 * 1024;
 /// The most live flows one saved block edit checks (more: the edit is refused).
 const MAX_FLOWS_PER_BLOCK: i64 = 10;
 /// Established accounts (rules decide when the model can't be reached): approved, this many real
@@ -35,18 +53,26 @@ const MAX_FLOWS_PER_BLOCK: i64 = 10;
 pub const ESTABLISHED_EMAILS: i64 = 1000;
 pub const ESTABLISHED_DAYS: i32 = 14;
 pub const ESTABLISHED_NO_PAUSE_DAYS: i32 = 30;
+/// A campaign whose content can't get a verdict in this long after it was due is held for a person.
+const SEND_CHECK_WAIT: chrono::Duration = chrono::Duration::minutes(30);
 
 pub const HELD_MESSAGE: &str = "A person is checking this before it goes out. We'll email you when it's done, usually within a day.";
+pub const TOO_BIG: &str = "This is too large for our automatic check (too many versions, languages or steps, or too much text), so a person will look at it.";
+pub const JOB: &str = "screening_content_check";
 
 static ANCHOR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?is)<a\s[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap());
 static BARE_URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>"')]+"#).unwrap());
+
+/// Fields whose words people read, and fields that hold where a link goes.
+const TEXT_KEYS: &[&str] = &["text", "html", "heading", "title", "subtitle", "alt", "button_text", "author", "caption", "label", "quote", "description"];
+const LINK_KEYS: &[&str] = &["href", "url", "button_href", "logo_href", "link"];
 
 fn host(u: &str) -> Option<String> {
     url::Url::parse(u.trim()).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
 }
 
 /// Where a link goes, as judged: scheme, host, path and query, without link tags (`utm_…`, added
-/// at send time) or the fragment, so any other change to a destination is checked again.
+/// at send time) or the fragment, so any other change to a destination is judged again.
 fn destination(href: &str) -> String {
     let Ok(mut u) = url::Url::parse(href.trim()) else { return href.chars().take(300).collect() };
     let kept: Vec<(String, String)> = u.query_pairs().filter(|(k, _)| !k.to_ascii_lowercase().starts_with("utm_")).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
@@ -59,43 +85,134 @@ fn destination(href: &str) -> String {
     u.to_string().chars().take(300).collect()
 }
 
-/// One rendered message, reduced to what a check looks at.
-fn message(channel: &str, rendered: &Value) -> Value {
-    if channel == "sms" {
-        let body: String = rendered["body"].as_str().unwrap_or("").chars().take(TEXT_CHARS).collect();
-        let links: Vec<Value> = BARE_URL.find_iter(&body).take(MAX_LINKS).filter_map(|m| host(m.as_str())).map(|d| json!({"text": "", "domain": d})).collect();
-        return json!({"channel": "sms", "body": body, "links": links});
-    }
-    let html = rendered["html"].as_str().unwrap_or("");
-    let links: Vec<Value> = ANCHOR
-        .captures_iter(html)
-        .take(MAX_LINKS)
-        .filter_map(|c| {
-            let href = c[1].replace("&amp;", "&");
-            let d = host(&href)?;
-            Some(json!({"text": fetch::visible_text(&c[2], 120), "to": destination(&href), "domain": d}))
-        })
-        .collect();
-    json!({
-        "channel": "email",
-        "subject": rendered["subject"].as_str().unwrap_or("").chars().take(300).collect::<String>(),
-        "preview_text": rendered["preheader"].as_str().unwrap_or("").chars().take(300).collect::<String>(),
-        "text": fetch::visible_text(html, TEXT_CHARS),
-        "links": links,
-    })
+#[derive(Default)]
+struct Collected {
+    text: Vec<String>,
+    /// (link text, href)
+    links: Vec<(String, String)>,
 }
 
-async fn render(state: &AppState, account_id: Uuid, channel: &str, content: &Value, flow: bool) -> AppResult<Value> {
-    let event = flow.then(|| json!({"properties": {}}));
-    let r = crate::api::messaging::render_preview(state, account_id, crate::api::messaging::RenderBody { channel: channel.to_string(), content: content.clone(), profile_id: None, event }).await?;
-    let mut m = message(channel, &r);
-    if channel == "sms" {
-        // A text's preview shows sample short links (features::short_links): judge where the links
-        // really go, from the text as written.
-        let raw = content["body"].as_str().unwrap_or("");
-        m["links"] = json!(BARE_URL.find_iter(raw).take(MAX_LINKS).filter_map(|u| host(u.as_str()).map(|d| json!({"text": "", "to": destination(u.as_str()), "domain": d}))).collect::<Vec<_>>());
+impl Collected {
+    fn html(&mut self, html: &str) {
+        for c in ANCHOR.captures_iter(html) {
+            self.links.push((fetch::visible_text(&c[2], 120), c[1].replace("&amp;", "&")));
+        }
+        self.text.push(fetch::visible_text(html, usize::MAX));
     }
-    Ok(m)
+
+    /// Every block's words and links, whatever its display rules, template conditions included.
+    fn walk(&mut self, v: &Value) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|x| self.walk(x)),
+            Value::Object(o) => {
+                let link_text = o.get("text").or_else(|| o.get("button_text")).or_else(|| o.get("title")).and_then(|t| t.as_str()).unwrap_or("");
+                for (k, x) in o {
+                    if k.starts_with('_') || k == "i18n" || k == "translations" {
+                        continue;
+                    }
+                    match (k.as_str(), x) {
+                        (k, Value::String(s)) if TEXT_KEYS.contains(&k) => self.html(s),
+                        (k, Value::String(s)) if LINK_KEYS.contains(&k) && !s.trim().is_empty() => self.links.push((fetch::visible_text(link_text, 120), s.clone())),
+                        (_, Value::Array(_) | Value::Object(_)) => self.walk(x),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One message variant as judged (the full form: rules and fingerprints use it; the model gets
+/// [`for_model`]). Over-long text is marked, not cut.
+fn variant(channel: &str, c: &Value, label: &str, language: &str) -> (Value, bool) {
+    let mut col = Collected::default();
+    let (subject, preview) = if channel == "sms" {
+        let body = c["body"].as_str().unwrap_or("");
+        col.text.push(body.to_string());
+        for m in BARE_URL.find_iter(body) {
+            col.links.push((String::new(), m.as_str().to_string()));
+        }
+        if let Some(m) = c["media_url"].as_str().filter(|m| !m.is_empty()) {
+            col.links.push((String::new(), m.to_string()));
+        }
+        (String::new(), String::new())
+    } else {
+        if let Some(h) = c["html"].as_str() {
+            col.html(h);
+        }
+        if let Some(b) = c.get("blocks") {
+            col.walk(b);
+        }
+        (c["subject"].as_str().unwrap_or("").to_string(), c["preheader"].as_str().unwrap_or("").to_string())
+    };
+    let text = col.text.iter().filter(|t| !t.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n");
+    let mut too_big = text.chars().count() > TEXT_CHARS || subject.chars().count() > 1000 || col.links.len() > MAX_LINKS;
+    let mut seen = HashSet::new();
+    let links: Vec<Value> = col
+        .links
+        .iter()
+        .filter_map(|(t, h)| {
+            let d = host(h)?;
+            let to = destination(h);
+            seen.insert((t.clone(), to.clone())).then(|| json!({"text": t, "to": to, "domain": d}))
+        })
+        .collect();
+    too_big |= links.len() > MAX_LINKS;
+    (json!({"channel": channel, "label": label, "language": language, "subject": subject, "preview_text": preview, "text": text, "links": links}), too_big)
+}
+
+/// A variant's fingerprint: what people get, not where it sits.
+fn part_hash(v: &Value) -> String {
+    let core = json!([v["channel"], v["subject"], v["preview_text"], v["text"], v["links"]]);
+    hex::encode(Sha256::digest(serde_json::to_vec(&core).unwrap_or_default()))
+}
+
+/// `content` with every saved block it uses swapped for that block's current content.
+async fn with_saved_blocks(state: &AppState, account_id: Uuid, content: &Value) -> AppResult<Value> {
+    let mut ids = BTreeSet::new();
+    fn find(v: &Value, out: &mut BTreeSet<String>) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|x| find(x, out)),
+            Value::Object(o) => {
+                if o.get("type").and_then(|t| t.as_str()) == Some("saved") {
+                    if let Some(id) = o.get("saved_block_id").and_then(|i| i.as_str()) {
+                        out.insert(id.to_string());
+                    }
+                }
+                o.values().for_each(|x| find(x, out));
+            }
+            _ => {}
+        }
+    }
+    find(content, &mut ids);
+    if ids.is_empty() {
+        return Ok(content.clone());
+    }
+    let uuids: Vec<Uuid> = ids.iter().filter_map(|i| i.parse().ok()).collect();
+    let rows: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, blocks FROM saved_blocks WHERE account_id = $1 AND id = ANY($2) AND deleted_at IS NULL").bind(account_id).bind(&uuids).fetch_all(&state.db).await?;
+    let mut out = content.clone();
+    for (id, blocks) in rows {
+        out = with_saved(&out, &id.to_string(), &blocks);
+    }
+    Ok(out)
+}
+
+/// Every variant of one message: its default text and each language version.
+async fn variants(state: &AppState, account: &Account, channel: &str, content: &Value, label: &str) -> AppResult<Vec<(Value, bool)>> {
+    let content = with_saved_blocks(state, account.id, content).await?;
+    let (_, mut langs) = crate::features::translations::fields::languages(&content);
+    if let Some(b) = content.get("blocks") {
+        crate::features::translations::fields::blocks_languages(b, &mut langs);
+    }
+    langs.sort();
+    langs.dedup();
+    let own = crate::features::translations::own_hosts(state, Some(account));
+    let mut out = vec![variant(channel, &content, label, "")];
+    for l in langs {
+        out.push(variant(channel, &crate::features::translations::fields::localize(&content, &l, &own), label, &l));
+    }
+    Ok(out)
 }
 
 /// What a check is about.
@@ -105,57 +222,112 @@ pub struct Material {
     pub name: String,
     pub first_campaign: bool,
     pub messages: Vec<Value>,
+    pub parts: Vec<String>,
+    /// More than a check can cover: a person decides.
+    pub too_big: bool,
 }
 
-pub async fn campaign_material(state: &AppState, c: &CampaignRow) -> AppResult<Material> {
-    let mut versions = vec![c.content.clone()];
-    versions.extend(crate::campaigns::ab_test(c).into_iter().flat_map(|t| t.variants).map(|v| v.content));
-    let mut messages = Vec::new();
-    for v in versions.iter().take(MAX_MESSAGES) {
-        messages.push(render(state, c.account_id, &c.channel, v, false).await?);
+impl Material {
+    fn new(subject: &'static str, subject_id: Uuid, name: &str, first_campaign: bool, all: Vec<(Value, bool)>) -> Self {
+        let too_big = all.len() > MAX_MESSAGES || all.iter().any(|(_, b)| *b);
+        let messages: Vec<Value> = all.into_iter().map(|(v, _)| v).collect();
+        let mut parts: Vec<String> = messages.iter().map(part_hash).collect();
+        parts.sort();
+        parts.dedup();
+        Self { subject, subject_id, name: name.to_string(), first_campaign, messages, parts, too_big }
+    }
+}
+
+pub async fn campaign_material(state: &AppState, account: &Account, c: &CampaignRow) -> AppResult<Material> {
+    let mut versions = vec![("version a".to_string(), c.content.clone())];
+    versions.extend(crate::campaigns::ab_test(c).into_iter().flat_map(|t| t.variants).map(|v| (format!("version {}", v.id), v.content)));
+    let mut all = Vec::new();
+    for (label, v) in &versions {
+        all.extend(variants(state, account, &c.channel, v, label).await?);
     }
     let earlier: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaigns WHERE account_id = $1 AND id <> $2 AND status IN ('sending', 'sent', 'testing'))")
         .bind(c.account_id)
         .bind(c.id)
         .fetch_one(&state.db)
         .await?;
-    Ok(Material { subject: "campaign", subject_id: c.id, name: c.name.clone(), first_campaign: !earlier, messages })
+    Ok(Material::new("campaign", c.id, &c.name, !earlier, all))
 }
 
-/// The email and text steps of a flow definition, by step id.
+/// The steps of a flow definition that send email or texts (review requests included), by id:
+/// (channel, content).
 fn steps(def: &Value) -> BTreeMap<String, (String, Value)> {
     let Ok(d) = crate::flows::parse_definition(def) else { return BTreeMap::new() };
-    d.nodes.into_iter().filter(|n| matches!(n.kind.as_str(), "email" | "sms")).map(|n| (n.id.clone(), (n.kind.clone(), n.data.get("content").cloned().unwrap_or(json!({}))))).collect()
+    d.nodes
+        .into_iter()
+        .filter_map(|n| {
+            let channel = match n.kind.as_str() {
+                "email" | "sms" => n.kind.clone(),
+                "review_request" => n.data.get("channel").and_then(|c| c.as_str()).unwrap_or("email").to_string(),
+                _ => return None,
+            };
+            Some((n.id.clone(), (channel, n.data.get("content").cloned().unwrap_or(json!({})))))
+        })
+        .collect()
 }
 
-async fn flow_material(state: &AppState, f: &FlowRow, only: &BTreeMap<String, (String, Value)>) -> AppResult<Material> {
-    let mut messages = Vec::new();
-    for (_, (channel, content)) in only.iter().take(MAX_MESSAGES) {
-        messages.push(render(state, f.account_id, channel, content, true).await?);
+async fn flow_material(state: &AppState, account: &Account, f: &FlowRow, only: &BTreeMap<String, (String, Value)>) -> AppResult<Material> {
+    let mut all = Vec::new();
+    for (id, (channel, content)) in only {
+        all.extend(variants(state, account, channel, content, &format!("step {id}")).await?);
     }
-    Ok(Material { subject: "flow", subject_id: f.id, name: f.name.clone(), first_campaign: false, messages })
+    Ok(Material::new("flow", f.id, &f.name, false, all))
 }
 
-/// The newest campaign's or flow's messages, for an account check with no send in hand.
+/// The messages as the model sees them: free text with addresses and phone numbers replaced, links
+/// as domain and path with anything identifying replaced.
+fn for_model(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let links: Vec<Value> = m["links"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|l| json!({"text": redact::text(l["text"].as_str().unwrap_or("")), "to": redact::link(l["to"].as_str().unwrap_or("")), "domain": l["domain"]}))
+                .collect();
+            json!({
+                "channel": m["channel"], "label": m["label"], "language": m["language"],
+                "subject": redact::text(m["subject"].as_str().unwrap_or("")),
+                "preview_text": redact::text(m["preview_text"].as_str().unwrap_or("")),
+                "text": redact::text(m["text"].as_str().unwrap_or("")),
+                "links": links,
+            })
+        })
+        .collect()
+}
+
+/// The newest campaign's or flow's messages (as the model may see them), for an account check
+/// with no send in hand.
 pub async fn latest_material(state: &AppState, account_id: Uuid) -> anyhow::Result<Option<Value>> {
+    let account = crate::campaigns::load_account(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let c: Option<CampaignRow> = sqlx::query_as("SELECT * FROM campaigns WHERE account_id = $1 AND channel IN ('email', 'sms') ORDER BY updated_at DESC LIMIT 1")
         .bind(account_id)
         .fetch_optional(&state.db)
         .await?;
     if let Some(c) = c {
-        if let Ok(m) = campaign_material(state, &c).await {
-            return Ok(Some(json!(m.messages)));
+        if let Ok(m) = campaign_material(state, &account, &c).await {
+            return Ok(Some(json!(for_model(&m.messages[..m.messages.len().min(MAX_MESSAGES)]))));
         }
     }
     let f: Option<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 ORDER BY updated_at DESC LIMIT 1").bind(account_id).fetch_optional(&state.db).await?;
     if let Some(f) = f {
-        if let Ok(m) = flow_material(state, &f, &steps(&f.definition)).await {
+        if let Ok(m) = flow_material(state, &account, &f, &steps(&f.definition)).await {
             if !m.messages.is_empty() {
-                return Ok(Some(json!(m.messages)));
+                return Ok(Some(json!(for_model(&m.messages[..m.messages.len().min(MAX_MESSAGES)]))));
             }
         }
     }
     Ok(None)
+}
+
+/// The messages for the account's first check (as the model may see them).
+pub fn model_messages(m: &Material) -> Value {
+    json!(for_model(&m.messages[..m.messages.len().min(MAX_MESSAGES)]))
 }
 
 /// The account's own domains (registrable): its website, sending and link domains, its sender
@@ -179,7 +351,7 @@ fn judge_rules(m: &Material, own: &HashSet<String>) -> (Verdict, Vec<String>) {
     let mut foreign = false;
     let mut shorteners = HashSet::new();
     for msg in &m.messages {
-        for k in ["subject", "preview_text", "text", "body"] {
+        for k in ["subject", "preview_text", "text"] {
             texts.push_str(msg[k].as_str().unwrap_or(""));
             texts.push('\n');
         }
@@ -251,43 +423,51 @@ pub struct Checked {
 /// Check the messages (rules, then the model), or reuse the verdict on the same content.
 pub async fn check(state: &AppState, account: &Account, m: &Material, deadline: Duration) -> AppResult<Checked> {
     let own = own_domains(state, account).await?;
-    let material = json!({
-        "account_name": crate::deliverability::plain(&account.name, 200),
-        "website": account.website.as_deref().and_then(fetch::website_host),
-        "own_domains": own.iter().collect::<std::collections::BTreeSet<_>>(),
-        "kind": m.subject,
-        "name": crate::deliverability::plain(&m.name, 200),
-        "first_campaign": m.first_campaign,
-        "messages": m.messages,
-    });
-    let hash = hex::encode(Sha256::digest(serde_json::to_vec(&material).unwrap_or_default()));
-    let earlier: Option<(Uuid, String, Value, String)> = sqlx::query_as(
-        "SELECT id, verdict, reasons, source FROM screenings WHERE account_id = $1 AND kind = 'content' AND content_hash = $2
-           AND (source IN ('ai', 'operator') OR verdict = 'block' OR (source = 'rules' AND verdict = 'pass'))
+    let own_sorted: BTreeSet<&String> = own.iter().collect();
+    let judged = json!({"account": account.id, "own_domains": own_sorted, "kind": m.subject, "first_campaign": m.first_campaign, "messages": m.messages});
+    let hash = hex::encode(Sha256::digest(serde_json::to_vec(&judged).unwrap_or_default()));
+    // A pass the rules gave alone (Claude unavailable) isn't reused: it's judged again.
+    let earlier: Option<(Uuid, String, Value)> = sqlx::query_as(
+        "SELECT id, verdict, reasons FROM screenings WHERE account_id = $1 AND kind = 'content' AND content_hash = $2 AND (source IN ('ai', 'operator') OR verdict = 'block')
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(account.id)
     .bind(&hash)
     .fetch_optional(&state.db)
     .await?;
-    if let Some((id, verdict, reasons, _)) = earlier {
+    if let Some((id, verdict, reasons)) = earlier {
         return Ok(Checked { verdict: Verdict::parse(&verdict).unwrap_or(Verdict::Review), reasons: serde_json::from_value(reasons).unwrap_or_default(), screening_id: id, reused: true });
     }
     let (rules_verdict, mut reasons) = judge_rules(m, &own);
-    let mut signals = json!({"rules": rules_verdict.as_str(), "messages": m.messages.len(), "link_domains": m.messages.iter().flat_map(|x| x["links"].as_array().cloned().unwrap_or_default()).filter_map(|l| l["domain"].as_str().map(str::to_string)).collect::<std::collections::BTreeSet<_>>()});
-    let mut judged = None;
+    let link_domains: BTreeSet<String> = m.messages.iter().flat_map(|x| x["links"].as_array().cloned().unwrap_or_default()).filter_map(|l| l["domain"].as_str().map(str::to_string)).collect();
+    let mut signals = json!({"rules": rules_verdict.as_str(), "messages": m.messages.len(), "link_domains": link_domains});
+    let mut judged_by = None;
+    let model_material = json!({
+        "account_name": redact::text(&crate::deliverability::plain(&account.name, 200)),
+        "website": account.website.as_deref().and_then(fetch::website_host),
+        "own_domains": own_sorted,
+        "kind": m.subject,
+        "name": redact::text(&crate::deliverability::plain(&m.name, 200)),
+        "first_campaign": m.first_campaign,
+        "messages": for_model(&m.messages),
+    });
+    let too_big = m.too_big || serde_json::to_vec(&model_material).map_or(true, |b| b.len() > MAX_MATERIAL_BYTES);
     let verdict = if rules_verdict == Verdict::Block {
         Verdict::Block
+    } else if too_big {
+        signals["too_big"] = json!(true);
+        reasons.push(TOO_BIG.into());
+        Verdict::Review
     } else {
-        let task = "Task: judge this email or text content (a campaign or the steps of an automated flow) against DumbMail's acceptable use rules. \
-                    You get the business's name, website and own domains, and each message's subject, preview text, visible text and links. \
+        let task = "Task: judge this email or text content (a campaign with all its versions and languages, or the steps of an automated flow) against DumbMail's acceptable use rules. \
+                    You get the business's name, website and own domains, and each message's subject, preview text, text as written (template conditions and all blocks included) and links. \
                     Pass ordinary marketing from a business to its subscribers. Review anything unclear or borderline. Block clear cold outreach, phishing, impersonation, deception or a prohibited category.";
-        match ai::judge(state, account.id, task, &material, deadline).await {
+        match ai::judge(state, account.id, task, &model_material, deadline).await {
             Ok(j) => {
-                signals["model"] = json!({"verdict": j.verdict.as_str(), "notes": j.notes});
+                signals["model"] = json!({"verdict": j.verdict.as_str(), "codes": j.codes, "notes": j.notes});
                 reasons.extend(j.reasons.iter().cloned());
                 let v = j.verdict.max(rules_verdict);
-                judged = Some(j);
+                judged_by = Some(j);
                 v
             }
             Err(e) => {
@@ -312,12 +492,14 @@ pub async fn check(state: &AppState, account: &Account, m: &Material, deadline: 
             }
         }
     };
+    reasons.dedup();
     let mut row = New::rules("content", verdict, &reasons, signals);
     row.subject = Some(m.subject);
     row.subject_id = Some(m.subject_id);
     row.subject_name = Some(m.name.clone());
     row.content_hash = Some(hash);
-    if let Some(j) = &judged {
+    row.part_hashes = m.parts.clone();
+    if let Some(j) = &judged_by {
         row = row.judged(j);
     }
     let id = standing::record(&state.db, account.id, row).await?;
@@ -364,10 +546,39 @@ async fn pending_message(state: &AppState, account_id: Uuid, now: Standing) -> A
     Ok(standing::hold_message(now).to_string())
 }
 
-/// Run the account's first check (when pending) and the content check together, within
-/// [`DEADLINE`]. The account's standing comes first: content is judged only for an approved one.
-async fn with_account_check(state: &AppState, account: &Account, m: &Material, block_unless_approved: bool) -> AppResult<()> {
-    let start = Instant::now();
+/// For tests: a shorter deadline than [`DEADLINE`] for one account.
+#[doc(hidden)]
+pub mod testing {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
+    use uuid::Uuid;
+
+    pub(super) static DEADLINES: Lazy<Mutex<HashMap<Uuid, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    pub fn deadline(account_id: Uuid, ms: u64) {
+        if let Ok(mut d) = DEADLINES.lock() {
+            d.insert(account_id, ms);
+        }
+    }
+}
+
+/// The deadline for this account's checks ([`DEADLINE`], unless a test set its own).
+pub fn deadline(account_id: Uuid) -> Duration {
+    testing::DEADLINES.lock().ok().and_then(|d| d.get(&account_id).copied()).map(Duration::from_millis).unwrap_or(DEADLINE)
+}
+
+/// All of `f` within the deadline (rendering, the checks, the quota, the notices).
+async fn within<T>(account_id: Uuid, f: impl std::future::Future<Output = AppResult<T>>) -> AppResult<T> {
+    tokio::time::timeout(deadline(account_id), f).await.map_err(|_| AppError::Busy("Checking this took too long. Try again in a minute.".into()))?
+}
+
+/// Run the account's first check (when pending) and the content check side by side. One decision
+/// about the account is written once both are done: a content block keeps a pending account from
+/// being approved, and nothing is published in between.
+async fn with_account_check(state: &AppState, account: &Account, m: &Material, block_unless_approved: bool, start: Instant) -> AppResult<()> {
+    let left = || deadline(account.id).saturating_sub(start.elapsed());
     let st = standing::of(state, account);
     match st {
         Standing::Blocked => return Err(AppError::Conflict(standing::BLOCKED_MESSAGE.into())),
@@ -378,18 +589,35 @@ async fn with_account_check(state: &AppState, account: &Account, m: &Material, b
     if st == Standing::Pending && block_unless_approved && account.verified_domains.is_empty() {
         // The check waits for a verified sending domain, and a campaign can't go before it: no
         // content call yet.
-        let now = super::account::run(state, account.id, None, DEADLINE).await.map_err(AppError::Internal)?;
+        let now = super::account::run(state, account.id, None, left()).await.map_err(AppError::Internal)?;
         return Err(AppError::Conflict(pending_message(state, account.id, now).await?));
     }
     if st == Standing::Pending {
-        let (now, content) = tokio::join!(super::account::run(state, account.id, Some(json!(m.messages)), DEADLINE), check(state, account, m, DEADLINE));
-        let now = now.map_err(AppError::Internal)?;
+        let Some(claim) = super::account::claim(state, account.id).await.map_err(AppError::Internal)? else {
+            return Err(AppError::Conflict(standing::PENDING_MESSAGE.into()));
+        };
+        let (assessed, content) = tokio::join!(super::account::assess(state, account.id, Some(model_messages(m)), left(), start), check(state, account, m, left()));
+        let decided = async {
+            let content = content?;
+            if let Some(mut d) = assessed.map_err(AppError::Internal)? {
+                if content.verdict == Verdict::Block && d.verdict == Verdict::Pass {
+                    d.verdict = Verdict::Review;
+                    d.reasons.push("Something you tried to send needs a person's check.".into());
+                }
+                super::account::decide(state, account.id, d).await.map_err(AppError::Internal)?;
+            }
+            Ok::<_, AppError>(content)
+        }
+        .await;
+        super::account::release(state, claim).await.map_err(AppError::Internal)?;
+        let content = decided?;
+        let now = standing::read(state, account.id).await?;
         if now != Standing::Approved && (block_unless_approved || now == Standing::Blocked) {
             return Err(AppError::Conflict(pending_message(state, account.id, now).await?));
         }
-        return apply(state, account.id, m, &content?).await;
+        return apply(state, account.id, m, &content).await;
     }
-    let r = check(state, account, m, DEADLINE.saturating_sub(start.elapsed())).await?;
+    let r = check(state, account, m, left()).await?;
     apply(state, account.id, m, &r).await
 }
 
@@ -402,8 +630,12 @@ pub async fn before_launch(state: &AppState, account: &Account, c: &CampaignRow)
     if st != Standing::Approved && st != Standing::Pending {
         return Err(AppError::Conflict(standing::hold_message(st).into()));
     }
-    let m = campaign_material(state, c).await?;
-    with_account_check(state, account, &m, true).await
+    let start = Instant::now();
+    within(account.id, async {
+        let m = campaign_material(state, account, c).await?;
+        with_account_check(state, account, &m, true, start).await
+    })
+    .await
 }
 
 /// Before a flow is turned on (`api::messaging::set_flow_status`). A flow can go live while the
@@ -416,12 +648,16 @@ pub async fn before_flow_live(state: &AppState, account: &Account, f: &FlowRow) 
     if all.is_empty() {
         return Ok(());
     }
-    let m = flow_material(state, f, &all).await?;
-    with_account_check(state, account, &m, false).await
+    let start = Instant::now();
+    within(account.id, async {
+        let m = flow_material(state, account, f, &all).await?;
+        with_account_check(state, account, &m, false, start).await
+    })
+    .await
 }
 
 /// Before a live flow's definition is replaced (`api::messaging::update_flow`): its new or changed
-/// email and text steps are checked.
+/// sending steps are checked.
 pub async fn before_flow_edit(state: &AppState, account_id: Uuid, cur: &FlowRow, new_def: Option<&Value>) -> AppResult<()> {
     let Some(new_def) = new_def else { return Ok(()) };
     if !super::on(state) || cur.status != "live" {
@@ -436,39 +672,12 @@ pub async fn before_flow_edit(state: &AppState, account_id: Uuid, cur: &FlowRow,
     if standing::of(state, &account) == Standing::Blocked {
         return Err(AppError::Conflict(standing::BLOCKED_MESSAGE.into()));
     }
-    let m = flow_material(state, cur, &changed).await?;
-    let r = check(state, &account, &m, DEADLINE).await?;
-    apply(state, account_id, &m, &r).await
-}
-
-static VERIFIED: Lazy<std::sync::Mutex<HashSet<(Uuid, String)>>> = Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
-
-/// A campaign about to send (its batch job), from an approved account: what it sends now must be
-/// content that passed. A scheduled campaign can be edited after it was checked, and saved blocks
-/// can change; then it's checked again here (the same content is never judged twice). Some((the
-/// customer's message, the skip reason)): don't send it.
-pub async fn verify_at_send(state: &AppState, account: &Account, c: &CampaignRow) -> anyhow::Result<Option<(String, &'static str)>> {
-    let key = (c.id, hex::encode(Sha256::digest(serde_json::to_vec(&json!([c.content, c.ab_test])).unwrap_or_default())));
-    if VERIFIED.lock().is_ok_and(|v| v.contains(&key)) {
-        return Ok(None);
-    }
-    let m = campaign_material(state, c).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let r = check(state, account, &m, DEADLINE).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    if r.verdict == Verdict::Pass {
-        if let Ok(mut v) = VERIFIED.lock() {
-            if v.len() > 10_000 {
-                v.clear();
-            }
-            v.insert(key);
-        }
-        return Ok(None);
-    }
-    // Stopped with its own reason first, then the account's standing follows (a block puts it in review).
-    let reason = if r.verdict == Verdict::Block { "content refused" } else { "content held for review" };
-    let msg = refusal(r.verdict, &r.reasons);
-    standing::stop_campaign(&state.db, c.id, &msg, reason).await?;
-    let _ = apply(state, account.id, &m, &r).await;
-    Ok(Some((msg, reason)))
+    within(account_id, async {
+        let m = flow_material(state, &account, cur, &changed).await?;
+        let r = check(state, &account, &m, deadline(account_id)).await?;
+        apply(state, account_id, &m, &r).await
+    })
+    .await
 }
 
 fn refusal(verdict: Verdict, reasons: &[String]) -> String {
@@ -501,11 +710,12 @@ fn with_saved(content: &Value, id: &str, blocks: &Value) -> Value {
 
 /// Before saved block `id` changes to `blocks` (`content::saved::update`): live flows that use it
 /// would send the new version with nobody launching anything, so their steps are checked with it
-/// first. (Scheduled campaigns are checked again when they send: see [`verify_at_send`].)
+/// first. (Campaigns, and anything that changes a block another way, are checked when they send.)
 pub async fn before_saved_block_edit(state: &AppState, account_id: Uuid, id: Uuid, blocks: &Value) -> AppResult<()> {
     if !super::on(state) {
         return Ok(());
     }
+    content_changed(account_id);
     // Every live flow that uses it is checked; past the cap the edit is refused rather than any skipped.
     let flows: Vec<FlowRow> = sqlx::query_as(
         "SELECT * FROM flows WHERE account_id = $1 AND status = 'live' AND jsonb_path_exists(definition, '$.** ? (@.type == \"saved\" && @.saved_block_id == $id)'::jsonpath, jsonb_build_object('id', $2::text)) ORDER BY id LIMIT $3",
@@ -524,37 +734,223 @@ pub async fn before_saved_block_edit(state: &AppState, account_id: Uuid, id: Uui
         )));
     }
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
-    let mut materials = Vec::new();
-    for f in flows {
-        let uses: BTreeMap<String, (String, Value)> = steps(&f.definition)
-            .into_iter()
-            .filter(|(_, (_, c))| c.to_string().contains(&id.to_string()))
-            .map(|(k, (ch, c))| (k, (ch, with_saved(&c, &id.to_string(), blocks))))
-            .collect();
-        if !uses.is_empty() {
-            materials.push(flow_material(state, &f, &uses).await?);
+    within(account_id, async {
+        let mut materials = Vec::new();
+        for f in flows {
+            let uses: BTreeMap<String, (String, Value)> = steps(&f.definition)
+                .into_iter()
+                .filter(|(_, (_, c))| c.to_string().contains(&id.to_string()))
+                .map(|(k, (ch, c))| (k, (ch, with_saved(&c, &id.to_string(), blocks))))
+                .collect();
+            if !uses.is_empty() {
+                materials.push(flow_material(state, &account, &f, &uses).await?);
+            }
+        }
+        // Checked side by side (the model calls are limited server-wide).
+        let results = futures_util::future::join_all(materials.iter().map(|m| check(state, &account, m, deadline(account_id)))).await;
+        // Every result takes effect (a block's standing change first); the most severe one is answered.
+        let mut done: Vec<(&Material, Checked)> = Vec::new();
+        for (m, r) in materials.iter().zip(results) {
+            done.push((m, r?));
+        }
+        done.sort_by_key(|d| std::cmp::Reverse(d.1.verdict));
+        let mut first = None;
+        for (m, r) in &done {
+            if let Err(e) = apply(state, account_id, m, r).await {
+                first.get_or_insert(e);
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
+    .await
+}
+
+// ---------- At send time ----------
+
+/// What sending does with a message whose content was (or wasn't) checked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AtSend {
+    Go,
+    /// Not checked yet (a check is on its way) or held for a person: try again then.
+    Wait(chrono::DateTime<Utc>, &'static str),
+    /// Refused (`content refused`) or, for a campaign, held: don't send it. With the customer's message.
+    Stop(&'static str, String),
+}
+
+/// Per account: bumped when content may have changed outside a check (a saved block, a
+/// translation), so remembered verdicts are looked up again.
+static EPOCH: Lazy<Mutex<HashMap<Uuid, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// (account, the content as sent) → (epoch, when) for content found to have passed.
+static PASSED: Lazy<Mutex<HashMap<(Uuid, String), (u64, Instant)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+const PASSED_FOR: Duration = Duration::from_secs(600);
+
+/// Content of this account may have changed outside a check (`translations::store`, saved blocks).
+pub fn content_changed(account_id: Uuid) {
+    if let Ok(mut e) = EPOCH.lock() {
+        *e.entry(account_id).or_default() += 1;
+    }
+}
+
+fn epoch(account_id: Uuid) -> u64 {
+    EPOCH.lock().ok().and_then(|e| e.get(&account_id).copied()).unwrap_or(0)
+}
+
+fn remembered(account_id: Uuid, key: &str) -> bool {
+    let ep = epoch(account_id);
+    PASSED.lock().is_ok_and(|p| p.get(&(account_id, key.to_string())).is_some_and(|(e, t)| *e == ep && t.elapsed() < PASSED_FOR))
+}
+
+fn remember(account_id: Uuid, key: String) {
+    let ep = epoch(account_id);
+    if let Ok(mut p) = PASSED.lock() {
+        if p.len() > 20_000 {
+            p.clear();
+        }
+        p.insert((account_id, key), (ep, Instant::now()));
+    }
+}
+
+/// The latest verdict for every part; None when any part has none.
+async fn verdict_for(state: &AppState, account_id: Uuid, parts: &[String]) -> sqlx::Result<Option<Verdict>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT ON (p) p, s.verdict FROM screenings s, unnest(s.part_hashes) p
+         WHERE s.account_id = $1 AND s.kind = 'content' AND s.part_hashes && $2 AND p = ANY($2)
+         ORDER BY p, s.created_at DESC",
+    )
+    .bind(account_id)
+    .bind(parts)
+    .fetch_all(&state.db)
+    .await?;
+    if rows.len() < parts.len() {
+        return Ok(None);
+    }
+    Ok(rows.iter().filter_map(|(_, v)| Verdict::parse(v)).max())
+}
+
+static KICKED: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Queue a content check on the background lane (at most once a minute per subject per server).
+async fn kick(state: &AppState, payload: Value) -> sqlx::Result<()> {
+    let key = payload.to_string();
+    let due = KICKED.lock().is_ok_and(|mut m| {
+        m.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+        match m.get(&key) {
+            Some(t) if t.elapsed() < Duration::from_secs(60) => false,
+            _ => {
+                m.insert(key.clone(), Instant::now());
+                true
+            }
+        }
+    });
+    if due {
+        crate::jobs::enqueue_background(&state.db, JOB, payload, None).await?;
+    }
+    Ok(())
+}
+
+/// A flow message about to send (`gate`): its content, exactly as it will go out, must have passed.
+pub async fn flow_at_send(state: &AppState, account: &Account, flow_id: Uuid, channel: &str, content: &Value) -> AppResult<AtSend> {
+    let key = hex::encode(Sha256::digest(serde_json::to_vec(&json!([channel, content])).unwrap_or_default()));
+    if remembered(account.id, &key) {
+        return Ok(AtSend::Go);
+    }
+    let all = variants(state, account, channel, content, "").await?;
+    let mut parts: Vec<String> = all.iter().map(|(v, _)| part_hash(v)).collect();
+    parts.sort();
+    parts.dedup();
+    let soon = Utc::now() + chrono::Duration::minutes(2);
+    match verdict_for(state, account.id, &parts).await? {
+        Some(Verdict::Pass) => {
+            remember(account.id, key);
+            Ok(AtSend::Go)
+        }
+        Some(Verdict::Block) => Ok(AtSend::Stop("content refused", refusal(Verdict::Block, &[]))),
+        Some(Verdict::Review) => Ok(AtSend::Wait(Utc::now() + chrono::Duration::minutes(15), "content held for review")),
+        None => {
+            kick(state, json!({"account_id": account.id, "flow_id": flow_id})).await?;
+            Ok(AtSend::Wait(soon, "content not checked"))
         }
     }
-    // Checked side by side (the model calls are limited server-wide), all within the deadline.
-    let checks = futures_util::future::join_all(materials.iter().map(|m| check(state, &account, m, DEADLINE)));
-    let results = tokio::time::timeout(DEADLINE + Duration::from_secs(5), checks)
-        .await
-        .map_err(|_| AppError::Busy("Checking the live flows that use this block took too long. Try saving again in a minute.".into()))?;
-    // Every result takes effect (a block's standing change first); the most severe one is answered.
-    let mut done: Vec<(&Material, Checked)> = Vec::new();
-    for (m, r) in materials.iter().zip(results) {
-        done.push((m, r?));
+}
+
+/// A campaign batch about to send, from an approved account: what it sends now must have passed
+/// (it may have changed since it was scheduled). Unchecked content is checked on the background
+/// lane while the batch waits; held or refused content stops the campaign.
+pub async fn campaign_at_send(state: &AppState, account: &Account, c: &CampaignRow) -> anyhow::Result<AtSend> {
+    let key = hex::encode(Sha256::digest(serde_json::to_vec(&json!(["campaign", c.content, c.ab_test])).unwrap_or_default()));
+    if remembered(account.id, &key) {
+        return Ok(AtSend::Go);
     }
-    done.sort_by_key(|d| std::cmp::Reverse(d.1.verdict));
-    let mut first = None;
-    for (m, r) in &done {
-        if let Err(e) = apply(state, account_id, m, r).await {
-            first.get_or_insert(e);
+    let m = campaign_material(state, account, c).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let stop = |v: Verdict, reasons: &[String]| -> AtSend {
+        let reason = if v == Verdict::Block { "content refused" } else { "content held for review" };
+        AtSend::Stop(reason, refusal(v, reasons))
+    };
+    match verdict_for(state, account.id, &m.parts).await? {
+        Some(Verdict::Pass) => {
+            remember(account.id, key);
+            Ok(AtSend::Go)
+        }
+        Some(v) => {
+            let reasons: Option<Value> = sqlx::query_scalar("SELECT reasons FROM screenings WHERE account_id = $1 AND kind = 'content' AND part_hashes && $2 AND verdict = $3 ORDER BY created_at DESC LIMIT 1")
+                .bind(account.id)
+                .bind(&m.parts)
+                .bind(v.as_str())
+                .fetch_optional(&state.db)
+                .await?;
+            let reasons: Vec<String> = reasons.and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+            Ok(stop(v, &reasons))
+        }
+        None if c.send_at.is_some_and(|t| t < Utc::now() - SEND_CHECK_WAIT) => {
+            // No verdict in all this time: a person decides.
+            let why = [TOO_BIG_WAIT.to_string()];
+            let id = standing::record(&state.db, account.id, {
+                let mut s = New::rules("content", Verdict::Review, &why, json!({"waited": true}));
+                s.subject = Some("campaign");
+                s.subject_id = Some(c.id);
+                s.subject_name = Some(c.name.clone());
+                s.part_hashes = m.parts.clone();
+                s
+            })
+            .await?;
+            standing::alert_held(state, account.id, &format!("campaign \"{}\"", crate::deliverability::plain(&c.name, 80)), id, TOO_BIG_WAIT).await;
+            Ok(stop(Verdict::Review, &[TOO_BIG_WAIT.to_string()]))
+        }
+        None => {
+            kick(state, json!({"account_id": account.id, "campaign_id": c.id})).await?;
+            Ok(AtSend::Wait(Utc::now() + chrono::Duration::seconds(60), "content not checked"))
         }
     }
-    if let Some(e) = first {
-        return Err(e);
+}
+
+const TOO_BIG_WAIT: &str = "Our automatic check couldn't finish in time, so a person will look at this.";
+
+/// Job (background lane): check a flow's or campaign's content as it is now.
+pub async fn run_job(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    let id = |k: &str| payload[k].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    let Some(account_id) = id("account_id") else { return Ok(()) };
+    let account = crate::campaigns::load_account(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let m = if let Some(fid) = id("flow_id") {
+        let Some(f) = sqlx::query_as::<_, FlowRow>("SELECT * FROM flows WHERE id = $1 AND account_id = $2").bind(fid).bind(account_id).fetch_optional(&state.db).await? else { return Ok(()) };
+        flow_material(state, &account, &f, &steps(&f.definition)).await
+    } else if let Some(cid) = id("campaign_id") {
+        let Some(c) = sqlx::query_as::<_, CampaignRow>("SELECT * FROM campaigns WHERE id = $1 AND account_id = $2").bind(cid).bind(account_id).fetch_optional(&state.db).await? else { return Ok(()) };
+        campaign_material(state, &account, &c).await
+    } else {
+        return Ok(());
     }
+    .map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let r = check(state, &account, &m, DEADLINE).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    // A campaign that didn't pass stops with its own reason first; then the effects (an alert, the
+    // account's review). A flow message waits or stops when it next tries to send.
+    if m.subject == "campaign" && r.verdict != Verdict::Pass {
+        let reason = if r.verdict == Verdict::Block { "content refused" } else { "content held for review" };
+        standing::stop_campaign(&state.db, m.subject_id, &refusal(r.verdict, &r.reasons), reason).await?;
+    }
+    let _ = apply(state, account_id, &m, &r).await;
     Ok(())
 }
 
@@ -563,13 +959,8 @@ mod tests {
     use super::*;
 
     fn mat(subject: &str, html: &str, first: bool) -> Material {
-        Material {
-            subject: "campaign",
-            subject_id: Uuid::nil(),
-            name: "x".into(),
-            first_campaign: first,
-            messages: vec![message("email", &json!({"subject": subject, "preheader": "", "html": html}))],
-        }
+        let c = json!({"subject": subject, "preheader": "", "blocks": [{"type": "text", "html": html}]});
+        Material::new("campaign", Uuid::nil(), "x", first, vec![variant("email", &c, "", "")])
     }
 
     #[test]
@@ -577,6 +968,36 @@ mod tests {
         assert_eq!(destination("https://acme.test/fall?utm_source=dm&utm_campaign=x#top"), "https://acme.test/fall");
         assert_eq!(destination("https://acme.test/p?id=7&utm_medium=email"), "https://acme.test/p?id=7");
         assert_ne!(destination("https://acme.test/a"), destination("https://acme.test/b"));
+    }
+
+    #[test]
+    fn every_block_and_both_sides_of_a_condition_are_read() {
+        let c = json!({"subject": "Hi", "blocks": [
+            {"type": "text", "html": "<p>{% if person.vip %}VIP deal{% else %}Plain deal{% endif %}</p>", "display": {"rules": [{"field": "x"}]}},
+            {"type": "button", "text": "Go", "href": "https://acme.test/a?utm_source=x"},
+            {"type": "columns", "columns": [[{"type": "text", "html": "<p>Hidden <a href=\"https://evil.test/z\">here</a></p>"}]]},
+            {"type": "text", "html": "x", "i18n": {"fr": {"html": {"text": "<p>SECRET FR</p>"}}}}
+        ]});
+        let (v, too_big) = variant("email", &c, "", "");
+        assert!(!too_big);
+        let text = v["text"].as_str().unwrap();
+        assert!(text.contains("VIP deal") && text.contains("Plain deal") && text.contains("Hidden"), "{text}");
+        assert!(!text.contains("SECRET FR"), "language versions are their own variants");
+        let to: Vec<&str> = v["links"].as_array().unwrap().iter().map(|l| l["to"].as_str().unwrap()).collect();
+        assert!(to.contains(&"https://acme.test/a") && to.contains(&"https://evil.test/z"), "{to:?}");
+        // The same content gets the same fingerprint, whatever link tags it carries.
+        let mut tagged = c.clone();
+        tagged["link_tags"] = json!({"params": [["utm_source", "dm"]]});
+        assert_eq!(part_hash(&variant("email", &tagged, "", "").0), part_hash(&v));
+    }
+
+    #[test]
+    fn too_much_is_flagged_not_cut() {
+        let long = "word ".repeat(TEXT_CHARS);
+        let (_, too_big) = variant("email", &json!({"subject": "s", "blocks": [{"type": "text", "html": long}]}), "", "");
+        assert!(too_big);
+        let many: Vec<(Value, bool)> = (0..=MAX_MESSAGES).map(|i| variant("sms", &json!({"body": format!("hi {i}")}), "", "")).collect();
+        assert!(Material::new("flow", Uuid::nil(), "f", false, many).too_big);
     }
 
     #[test]
@@ -589,6 +1010,17 @@ mod tests {
         assert_eq!(out["blocks"][1]["html"], "NEW");
         assert_eq!(out["blocks"][3]["columns"][0][1]["html"], "NEW2");
         assert!(!out.to_string().contains("saved_block_id"));
+    }
+
+    #[test]
+    fn the_model_gets_no_addresses_numbers_or_tokens() {
+        let c = json!({"subject": "Hi jane@x.test", "blocks": [{"type": "text", "html": "<p>Call +1 503 555 0199. <a href=\"https://acme.test/r/9f8e7d6c5b4a3f2e1d0c?t=SECRET\">go</a></p>"}]});
+        let (v, _) = variant("email", &c, "", "");
+        let sent = serde_json::to_string(&for_model(&[v])).unwrap();
+        for bad in ["jane@x.test", "555 0199", "SECRET", "9f8e7d6c5b4a3f2e1d0c"] {
+            assert!(!sent.contains(bad), "{bad} in {sent}");
+        }
+        assert!(sent.contains("acme.test/r/:id"), "{sent}");
     }
 
     #[test]

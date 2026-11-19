@@ -22,11 +22,13 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list_h(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<Value>> {
+    hosted_only(&state)?;
     check_admin(&state, &headers)?;
     let accounts: Vec<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object(
             'account_id', a.id, 'name', a.name, 'website', a.website, 'status', a.sending_review, 'since', a.sending_review_at, 'note', a.sending_review_note,
-            'answers', a.sending_review_answers, 'created_at', a.created_at, 'sending_paused_reason', a.sending_paused_reason,
+            'answers', a.sending_review_answers, 'created_at', a.created_at, 'sending_paused_at', a.sending_paused_at, 'sending_paused_reason', a.sending_paused_reason,
+            'affiliated_brands', a.sending_review_brands, 'checked_at', now(),
             'owner_email', (SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = a.id ORDER BY (m.role = 'owner') DESC, m.created_at LIMIT 1),
             'waiting_for', CASE WHEN a.sending_review <> 'pending' THEN NULL
                 WHEN a.sending_review_answers IS NULL THEN 'the customer''s answers (asked on their first send)'
@@ -57,35 +59,84 @@ struct DecideBody {
     decision: String,
     #[serde(default)]
     note: Option<String>,
+    /// When the operator looked (the listing's `checked_at`): refused if the account's standing or
+    /// pause changed after that, so a decision never erases something newer.
+    #[serde(default)]
+    seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Brands this account really belongs to (exempt from the lookalike rule for them).
+    #[serde(default)]
+    affiliated_brands: Option<Vec<String>>,
 }
 
-async fn decide_h(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<DecideBody>) -> AppResult<Json<Value>> {
+async fn decide_h(State(state): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> AppResult<Json<Value>> {
+    hosted_only(&state)?;
     check_admin(&state, &headers)?;
+    let b: DecideBody = body_json(&body)?;
     let (to, verdict) = match b.decision.as_str() {
         "approve" => (Standing::Approved, Verdict::Pass),
         "review" => (Standing::Review, Verdict::Review),
         "block" => (Standing::Blocked, Verdict::Block),
         _ => return Err(AppError::bad("decision must be approve, review or block")),
     };
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1)").bind(b.account_id).fetch_one(&state.db).await?;
-    if !exists {
-        return Err(AppError::not_found("account"));
+    let brands: Option<Vec<String>> = b.affiliated_brands.map(|v| v.iter().map(|x| plain(x, 40).to_ascii_lowercase()).filter(|x| !x.is_empty()).take(20).collect());
+    type Read = (String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, String);
+    let read: Option<Read> = sqlx::query_as("SELECT sending_review, sending_review_at, sending_paused_at, name FROM accounts WHERE id = $1").bind(b.account_id).fetch_optional(&state.db).await?;
+    let Some((old, old_at, paused_at, name)) = read else { return Err(AppError::not_found("account")) };
+    let changed = || AppError::Conflict("This account changed after you looked (a new check, a pause or another decision). Look again, then decide.".into());
+    if let Some(seen) = b.seen_at {
+        if old_at.is_some_and(|t| t > seen) || paused_at.is_some_and(|t| t > seen) {
+            return Err(changed());
+        }
     }
     let note = plain(b.note.as_deref().unwrap_or(""), 600);
+    let approve = to == Standing::Approved;
+    // One statement: the standing, the note and (approving) the email pause, only if nothing changed
+    // since the read above.
+    let n = sqlx::query(
+        "UPDATE accounts SET sending_review = $2, sending_review_at = now(), sending_review_note = NULLIF($3, ''),
+            sending_review_brands = COALESCE($4, sending_review_brands),
+            sending_paused_at = CASE WHEN $5 THEN NULL ELSE sending_paused_at END,
+            sending_paused_reason = CASE WHEN $5 THEN NULL ELSE sending_paused_reason END,
+            sending_window_start = CASE WHEN $5 AND sending_paused_at IS NOT NULL THEN now() ELSE sending_window_start END
+         WHERE id = $1 AND sending_review = $6 AND sending_review_at IS NOT DISTINCT FROM $7 AND sending_paused_at IS NOT DISTINCT FROM $8",
+    )
+    .bind(b.account_id)
+    .bind(to.as_str())
+    .bind(&note)
+    .bind(&brands)
+    .bind(approve)
+    .bind(&old)
+    .bind(old_at)
+    .bind(paused_at)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(changed());
+    }
+    let was_paused = approve && paused_at.is_some();
+    if was_paused {
+        crate::deliverability::forget_daily_limit(&state, b.account_id);
+    }
     let reasons: Vec<String> = if note.is_empty() { Vec::new() } else { vec![note.clone()] };
-    let mut s = New::rules("account", verdict, &reasons, json!({"decision": b.decision}));
+    let mut s = New::rules("account", verdict, &reasons, json!({"decision": b.decision, "affiliated_brands": brands}));
     s.source = "operator";
     standing::record(&state.db, b.account_id, s).await?;
-    let all = [Standing::Pending, Standing::Approved, Standing::Review, Standing::Blocked];
-    let changed = standing::move_to(&state, b.account_id, &all, to, &note, &format!("Operator decision: {}. {note}", b.decision)).await.map_err(AppError::Internal)?;
-    let mut was_paused = false;
-    if to == Standing::Approved {
-        // One call lets the account send again: the email pause goes too (as /admin/unpause).
-        was_paused = crate::deliverability::unpause(&state.db, b.account_id).await?;
-        sqlx::query("UPDATE accounts SET sending_review_note = NULL WHERE id = $1").bind(b.account_id).execute(&state.db).await?;
+    let old = Standing::parse(Some(&old));
+    if old != to {
+        standing::after_move(&state, b.account_id, &name, old, to, &note, &format!("Operator decision: {}. {note}", b.decision)).await.map_err(AppError::Internal)?;
     }
     tracing::warn!(account = %b.account_id, decision = %b.decision, "operator decided a sending review");
-    Ok(Json(json!({"account_id": b.account_id, "status": to.as_str(), "changed": changed.is_some(), "was_paused": was_paused})))
+    Ok(Json(json!({"account_id": b.account_id, "status": to.as_str(), "changed": old != to, "was_paused": was_paused})))
+}
+
+fn body_json<T: serde::de::DeserializeOwned>(b: &[u8]) -> AppResult<T> {
+    serde_json::from_slice(b).map_err(|e| AppError::bad(format!("invalid body: {e}")))
+}
+
+/// The operator routes exist only on the hosted service.
+fn hosted_only(state: &AppState) -> AppResult<()> {
+    if super::on(state) { Ok(()) } else { Err(AppError::NotFound("not found".into())) }
 }
 
 #[derive(Deserialize)]
@@ -95,11 +146,14 @@ struct PassBody {
 }
 
 /// Let held content go: the customer's next launch (or turning the flow on) of the same content passes.
-async fn pass_h(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<PassBody>) -> AppResult<Json<Value>> {
+async fn pass_h(State(state): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> AppResult<Json<Value>> {
+    hosted_only(&state)?;
     check_admin(&state, &headers)?;
-    let row: Option<(Uuid, String, Option<String>, Option<Uuid>, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT account_id, kind, subject, subject_id, subject_name, content_hash FROM screenings WHERE id = $1").bind(b.screening_id).fetch_optional(&state.db).await?;
-    let Some((account_id, kind, subject, subject_id, name, hash)) = row else { return Err(AppError::not_found("screening")) };
+    let b: PassBody = body_json(&body)?;
+    type Row = (Uuid, String, Option<String>, Option<Uuid>, Option<String>, Option<String>, Vec<String>);
+    let row: Option<Row> =
+        sqlx::query_as("SELECT account_id, kind, subject, subject_id, subject_name, content_hash, part_hashes FROM screenings WHERE id = $1").bind(b.screening_id).fetch_optional(&state.db).await?;
+    let Some((account_id, kind, subject, subject_id, name, hash, parts)) = row else { return Err(AppError::not_found("screening")) };
     if kind != "content" || hash.is_none() {
         return Err(AppError::bad("only a content screening (a held campaign or flow) can be passed; decide about an account with /admin/screening/decide"));
     }
@@ -114,6 +168,7 @@ async fn pass_h(State(state): State<AppState>, headers: HeaderMap, Json(b): Json
     s.subject_id = subject_id;
     s.subject_name = name.clone();
     s.content_hash = hash;
+    s.part_hashes = parts;
     let id = standing::record(&state.db, account_id, s).await?;
     standing::notify_owner(
         &state,

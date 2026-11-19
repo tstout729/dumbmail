@@ -14,6 +14,8 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS sending_review_note text;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS sending_review_answers jsonb;
 -- One account check at a time: set while one runs (a stale claim lapses after a few minutes).
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS sending_review_checking_at timestamptz;
+-- Brands an operator confirmed this account belongs to (exempt from the lookalike rule for them).
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS sending_review_brands text[] NOT NULL DEFAULT '{}';
 
 -- Every check's outcome. `reasons` are plain sentences safe to show the customer; `signals` are the
 -- facts behind the verdict, for the operator.
@@ -32,13 +34,17 @@ CREATE TABLE screenings (
     model        text,
     input_tokens  integer,
     output_tokens integer,
-    -- SHA-256 of what a content check sent to the model, so unchanged content is judged once.
+    -- SHA-256 of what a content check judged, so unchanged content is judged once.
     content_hash text,
+    -- The same for each message it covered (a flow step, a campaign version), so what's about to
+    -- send can be matched to a verdict.
+    part_hashes  text[] NOT NULL DEFAULT '{}',
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX screenings_account_idx ON screenings (account_id, created_at DESC);
 CREATE INDEX screenings_hash_idx ON screenings (account_id, content_hash, created_at DESC) WHERE content_hash IS NOT NULL;
 CREATE INDEX screenings_subject_idx ON screenings (subject_id, created_at DESC) WHERE subject_id IS NOT NULL;
+CREATE INDEX screenings_parts_idx ON screenings USING gin (part_hashes) WHERE kind = 'content';
 
 -- Claude calls per account per day (the account's time zone), counted in the statement that takes one.
 CREATE TABLE screening_ai_usage (
@@ -48,15 +54,16 @@ CREATE TABLE screening_ai_usage (
     PRIMARY KEY (account_id, day)
 );
 
--- Flow messages waiting for an account to be approved: when each first waited, so it's skipped
--- after 3 days instead of waiting forever.
+-- Flow messages waiting (for the account to be approved, or for their content's check): when each
+-- step of each flow run first waited, so it's skipped after 3 days instead of waiting forever.
+-- `run_key` is the flow run's id (or `p:<profile id>` for a send outside a run).
 CREATE TABLE screening_waits (
     account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     flow_id    uuid NOT NULL,
     node_id    text NOT NULL,
-    profile_id uuid NOT NULL,
+    run_key    text NOT NULL,
     since      timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (flow_id, node_id, profile_id)
+    PRIMARY KEY (flow_id, node_id, run_key)
 );
 CREATE INDEX screening_waits_account_idx ON screening_waits (account_id);
 

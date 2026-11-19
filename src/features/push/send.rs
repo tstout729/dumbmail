@@ -611,7 +611,9 @@ async fn final_claim(state: &AppState, message_id: Uuid, delivery_id: Uuid, atte
         Attempt::First => status == "sending",
         Attempt::Later => matches!(status.as_str(), "sending" | "retrying" | "sent" | "delivered" | "unconfirmed"),
     };
-    let closed: bool = sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_one(&mut *tx).await?;
+    // With the account's sending review (see features::screening): a blocked account sends no push.
+    let (closed, standing): (bool, String) =
+        sqlx::query_as(&format!("SELECT a.closed_at IS NOT NULL, {} FROM accounts a WHERE a.id = $1", crate::features::screening::standing_sql(state, "a"))).bind(account_id).fetch_one(&mut *tx).await?;
     let platform_on = row.as_ref().is_some_and(|r| r.ready_kinds().contains(&kind.as_str()));
     let device_ok = match &dev {
         Some((owner, member, v, dstatus, permission, ..)) => {
@@ -627,6 +629,8 @@ async fn final_claim(state: &AppState, message_id: Uuid, delivery_id: Uuid, atte
         Some("no longer queued")
     } else if closed {
         Some("account closed")
+    } else if standing == "blocked" {
+        Some(crate::features::screening::BLOCKED)
     } else if !device_ok || opted_out {
         Some("the device changed, or push is off for it")
     } else if is_test {

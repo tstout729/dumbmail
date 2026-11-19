@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::ai::{self, NoJudgment};
 use super::fetch;
+use super::redact;
 use super::rules;
 use super::standing::{self, New, Standing};
 use super::Verdict;
@@ -105,12 +106,13 @@ struct Facts {
     imports: Vec<Value>,
     other_sources: Value,
     first_content: Option<Value>,
+    brands: Vec<String>,
 }
 
 async fn facts(state: &AppState, account_id: Uuid, first_content: Option<Value>) -> anyhow::Result<Facts> {
     let db = &state.db;
-    let (name, website, answers, link_domain): (String, Option<String>, Option<Value>, Option<String>) =
-        sqlx::query_as("SELECT name, website, sending_review_answers, link_domain FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
+    let (name, website, answers, link_domain, brands): (String, Option<String>, Option<Value>, Option<String>, Vec<String>) =
+        sqlx::query_as("SELECT name, website, sending_review_answers, link_domain, sending_review_brands FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
     let owner = standing::owner_email(db, account_id).await;
     let owner_domain = owner.as_deref().and_then(|e| e.rsplit_once('@')).map(|(_, d)| d.to_ascii_lowercase());
     let owner_disposable = owner.as_deref().and_then(crate::models::normalize_email).is_some_and(|e| crate::deliverability::risky_address(&e) == Some("disposable"));
@@ -140,16 +142,15 @@ async fn facts(state: &AppState, account_id: Uuid, first_content: Option<Value>)
         Some(c) => Some(c),
         None => super::content::latest_material(state, account_id).await?,
     };
-    Ok(Facts { name, website, owner_domain, owner_disposable, answers, sending, link_domain, earlier, imports, other_sources, first_content })
+    Ok(Facts { name, website, owner_domain, owner_disposable, answers, sending, link_domain, earlier, imports, other_sources, first_content, brands })
 }
 
-/// Run the check now if the account is pending, has answered and isn't being checked already.
-/// Returns its standing afterwards. Holds no database connection while waiting on the network.
-pub async fn run(state: &AppState, account_id: Uuid, first_content: Option<Value>, deadline: Duration) -> anyhow::Result<Standing> {
-    if !super::on(state) {
-        return Ok(Standing::Approved);
-    }
-    let start = Instant::now();
+/// A claim on running the account's check (one at a time); give it back with [`release`].
+pub struct Claim(Uuid);
+
+/// Claim the check for a pending account that has answered. None: not pending, not answered, or
+/// another check is running.
+pub async fn claim(state: &AppState, account_id: Uuid) -> anyhow::Result<Option<Claim>> {
     let claimed: Option<Uuid> = sqlx::query_scalar(
         "UPDATE accounts SET sending_review_checking_at = now()
          WHERE id = $1 AND sending_review = 'pending' AND sending_review_answers IS NOT NULL AND closed_at IS NULL
@@ -159,16 +160,46 @@ pub async fn run(state: &AppState, account_id: Uuid, first_content: Option<Value
     .bind(CLAIM_MINUTES)
     .fetch_optional(&state.db)
     .await?;
-    if claimed.is_none() {
-        return Ok(standing::read(state, account_id).await?);
+    Ok(claimed.map(Claim))
+}
+
+pub async fn release(state: &AppState, c: Claim) -> anyhow::Result<()> {
+    sqlx::query("UPDATE accounts SET sending_review_checking_at = NULL WHERE id = $1").bind(c.0).execute(&state.db).await?;
+    Ok(())
+}
+
+/// Run the check now if the account is pending, has answered and isn't being checked already, and
+/// write its decision. Returns the standing afterwards. Holds no database connection while waiting
+/// on the network.
+pub async fn run(state: &AppState, account_id: Uuid, first_content: Option<Value>, deadline: Duration) -> anyhow::Result<Standing> {
+    if !super::on(state) {
+        return Ok(Standing::Approved);
     }
-    let out = check(state, account_id, first_content, deadline, start).await;
-    sqlx::query("UPDATE accounts SET sending_review_checking_at = NULL WHERE id = $1").bind(account_id).execute(&state.db).await?;
+    let start = Instant::now();
+    let Some(c) = claim(state, account_id).await? else { return Ok(standing::read(state, account_id).await?) };
+    let out = async {
+        if let Some(d) = assess(state, account_id, first_content, deadline, start).await? {
+            decide(state, account_id, d).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    release(state, c).await?;
     out?;
     Ok(standing::read(state, account_id).await?)
 }
 
-async fn check(state: &AppState, account_id: Uuid, first_content: Option<Value>, deadline: Duration, start: Instant) -> anyhow::Result<()> {
+/// The check's outcome, not written yet.
+pub struct Decision {
+    pub verdict: Verdict,
+    pub reasons: Vec<String>,
+    pub signals: Value,
+    pub judged: Option<ai::Judgment>,
+}
+
+/// Run the check (rules, then the model) under the caller's claim, without writing anything.
+/// None: it waits for a verified sending domain (the customer is told).
+pub async fn assess(state: &AppState, account_id: Uuid, first_content: Option<Value>, deadline: Duration, start: Instant) -> anyhow::Result<Option<Decision>> {
     let f = facts(state, account_id, first_content).await?;
     if f.sending.is_empty() {
         sqlx::query("UPDATE accounts SET sending_review_note = $2 WHERE id = $1 AND sending_review = 'pending'")
@@ -176,7 +207,7 @@ async fn check(state: &AppState, account_id: Uuid, first_content: Option<Value>,
             .bind("Next step: verify a sending domain in Settings → Domains. We check your account as soon as it's verified.")
             .execute(&state.db)
             .await?;
-        return Ok(());
+        return Ok(None);
     }
     let mut block: Vec<String> = Vec::new();
     let mut review: Vec<String> = Vec::new();
@@ -188,8 +219,11 @@ async fn check(state: &AppState, account_id: Uuid, first_content: Option<Value>,
     if let Some(l) = &f.link_domain {
         domains.push((l.clone(), "link"));
     }
+    // Proof of belonging to a brand: a verified sending domain on it, or an operator's word.
+    let verified: Vec<String> = f.sending.iter().map(|(d, _)| d.clone()).collect();
+    let proof = rules::Affiliation { verified_domains: &verified, brands: &f.brands };
     for (d, what) in &domains {
-        if let Some(brand) = rules::impersonated_brand(d, site_host.as_deref()) {
+        if let Some(brand) = rules::impersonated_brand(d, &proof) {
             block.push(format!("The {what} domain {d} looks like it impersonates {brand}."));
         }
     }
@@ -257,16 +291,26 @@ async fn check(state: &AppState, account_id: Uuid, first_content: Option<Value>,
     });
     // Rules that block decide on their own: the model can't change it.
     if rules_verdict == Verdict::Block {
-        return decide(state, account_id, Verdict::Block, rule_reasons, signals_base, None).await;
+        return Ok(Some(Decision { verdict: Verdict::Block, reasons: rule_reasons, signals: signals_base, judged: None }));
     }
+    // Only these fields go to the model, free text with addresses and numbers replaced.
+    let answers = f.answers.as_ref().map(|a| {
+        json!({
+            "business": redact::text(a["business"].as_str().unwrap_or("")),
+            "list_source": redact::text(a["list_source"].as_str().unwrap_or("")),
+            "monthly_volume": a["monthly_volume"].as_i64(),
+        })
+    });
+    let website_page = page.as_ref().map(|p| json!({"title": redact::text(&p.title), "description": redact::text(&p.description), "text": redact::text(&p.text)}));
+    let imports: Vec<Value> = f.imports.iter().map(|i| json!({"file": i["file"].as_str().map(redact::text), "verdict": i["verdict"], "stats": i["stats"]})).collect();
     let material = json!({
-        "account_name": crate::deliverability::plain(&f.name, 200),
+        "account_name": redact::text(&crate::deliverability::plain(&f.name, 200)),
         "website": site_host,
-        "website_page": page,
-        "answers": f.answers,
+        "website_page": website_page,
+        "answers": answers,
         "signup_email_domain": f.owner_domain,
         "domains": domain_ages,
-        "imports": f.imports,
+        "imports": imports,
         "contacts_from_other_sources": f.other_sources,
         "first_message": f.first_content,
     });
@@ -276,14 +320,13 @@ async fn check(state: &AppState, account_id: Uuid, first_content: Option<Value>,
                 and the first email or text it wants to send, if any. Pass a clear, real business with an honest list. Review anything unclear or unusual \
                 (a mismatch between the answers and the website, a very high volume for a small new business, a vague list source). Block clear cold outreach, bought lists, phishing, impersonation or a prohibited category.";
     let left = deadline.saturating_sub(start.elapsed());
-    match ai::judge(state, account_id, task, &material, left).await {
+    Ok(Some(match ai::judge(state, account_id, task, &material, left).await {
         Ok(j) => {
-            let verdict = j.verdict.max(rules_verdict);
             let mut reasons = rule_reasons;
             reasons.extend(j.reasons.iter().cloned());
             let mut signals = signals_base;
-            signals["model"] = json!({"verdict": j.verdict.as_str(), "notes": j.notes});
-            decide(state, account_id, verdict, reasons, signals, Some(&j)).await
+            signals["model"] = json!({"verdict": j.verdict.as_str(), "codes": j.codes, "notes": j.notes});
+            Decision { verdict: j.verdict.max(rules_verdict), reasons, signals, judged: Some(j) }
         }
         Err(e) => {
             let mut reasons = rule_reasons;
@@ -293,16 +336,17 @@ async fn check(state: &AppState, account_id: Uuid, first_content: Option<Value>,
             });
             let mut signals = signals_base;
             signals["model"] = json!({"unavailable": e.describe()});
-            decide(state, account_id, rules_verdict.max(Verdict::Review), reasons, signals, None).await
+            Decision { verdict: rules_verdict.max(Verdict::Review), reasons, signals, judged: None }
         }
-    }
+    }))
 }
 
-async fn decide(state: &AppState, account_id: Uuid, verdict: Verdict, reasons: Vec<String>, signals: Value, judged: Option<&ai::Judgment>) -> anyhow::Result<()> {
-    let mut reasons = reasons;
+/// Write the check's one decision: the screening and the account's standing (from pending).
+pub async fn decide(state: &AppState, account_id: Uuid, d: Decision) -> anyhow::Result<()> {
+    let Decision { verdict, mut reasons, signals, judged } = d;
     reasons.dedup();
     let mut s = New::rules("account", verdict, &reasons, signals.clone());
-    if let Some(j) = judged {
+    if let Some(j) = &judged {
         s = s.judged(j);
     }
     standing::record(&state.db, account_id, s).await?;

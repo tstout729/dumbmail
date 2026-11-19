@@ -25,6 +25,7 @@ pub mod engagement;
 pub mod fetch;
 pub mod gate;
 pub mod imports;
+pub mod redact;
 pub mod rules;
 pub mod standing;
 
@@ -39,9 +40,9 @@ use crate::auth::Ctx;
 use crate::error::AppResult;
 use crate::state::AppState;
 
-pub use content::{before_flow_edit, before_flow_live, before_launch, before_saved_block_edit};
+pub use content::{before_flow_edit, before_flow_live, before_launch, before_saved_block_edit, content_changed};
 pub use domains::check_domain;
-pub use gate::{send_gate, stop_if_held, tests_only_to_members};
+pub use gate::{final_stop, in_flow_run, notification_stop_sql, send_gate, standing_sql, stop_if_held, test_email_stop, tests_only_to_members, FinalStop, BLOCKED, NOT_APPROVED};
 pub use imports::check_import;
 pub use standing::Standing;
 
@@ -127,6 +128,7 @@ impl Feature for Module {
     async fn run_job(&self, state: &AppState, kind: &str, payload: &Value) -> Option<anyhow::Result<()>> {
         match kind {
             account::JOB => Some(account::run_job(state, payload).await),
+            content::JOB => Some(content::run_job(state, payload).await),
             engagement::JOB => Some(engagement::run_job(state).await),
             _ => None,
         }

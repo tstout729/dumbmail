@@ -18,32 +18,43 @@ const ADMIN: &str = "Bearer test-admin-token-0123456789abcdef0123";
 
 /// Requests the stand-in got (bodies).
 type Calls = Arc<Mutex<Vec<Value>>>;
+/// When set, the stand-in answers 500 (the model is unavailable).
+type Down = Arc<std::sync::atomic::AtomicBool>;
 
 /// A stand-in for `POST /v1/messages`: a pass, unless the material contains VERDICT_REVIEW,
-/// VERDICT_BLOCK or REFUSE_THIS.
-async fn stand_in() -> (Calls, String) {
+/// VERDICT_BLOCK or REFUSE_THIS; SLOW_MODEL answers after 3 seconds.
+async fn stand_in() -> (Calls, String, Down) {
     let calls: Calls = Default::default();
+    let down: Down = Default::default();
     let app = axum::Router::new()
         .route(
             "/v1/messages",
-            axum::routing::post(|axum::extract::State(c): axum::extract::State<Calls>, axum::Json(body): axum::Json<Value>| async move {
+            axum::routing::post(|axum::extract::State((c, down)): axum::extract::State<(Calls, Down)>, axum::Json(body): axum::Json<Value>| async move {
+                use axum::response::IntoResponse;
                 c.lock().unwrap().push(body.clone());
+                if down.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"type": "error"}))).into_response();
+                }
                 let text = body["messages"][0]["content"].as_str().unwrap_or("").to_string();
+                if text.contains("SLOW_MODEL") {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
                 if text.contains("REFUSE_THIS") {
-                    return axum::Json(json!({"model": "claude-opus-5-5", "stop_reason": "refusal", "content": [], "usage": {"input_tokens": 5, "output_tokens": 0}}));
+                    return axum::Json(json!({"model": "claude-opus-5-5", "stop_reason": "refusal", "content": [], "usage": {"input_tokens": 5, "output_tokens": 0}})).into_response();
                 }
                 let verdict = if text.contains("VERDICT_BLOCK") { "block" } else if text.contains("VERDICT_REVIEW") { "review" } else { "pass" };
-                let reasons: Vec<&str> = if verdict == "pass" { vec![] } else { vec!["The model had concerns."] };
-                let answer = json!({"verdict": verdict, "reasons": reasons, "operator_notes": "stand-in"}).to_string();
+                let codes: Vec<&str> = if verdict == "pass" { vec![] } else { vec!["needs_person"] };
+                let answer = json!({"verdict": verdict, "reason_codes": codes, "operator_notes": "stand-in notes MODEL-WORDS"}).to_string();
                 axum::Json(json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "stop_reason": "end_turn",
                     "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": answer}], "usage": {"input_tokens": 120, "output_tokens": 30}}))
+                .into_response()
             }),
         )
-        .with_state(calls.clone());
+        .with_state((calls.clone(), down.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (calls, format!("http://{addr}"))
+    (calls, format!("http://{addr}"), down)
 }
 
 fn canned_web() {
@@ -53,15 +64,19 @@ fn canned_web() {
 
 /// A screening harness: screening on, the stand-in as the API (or no key).
 async fn screened(key: bool) -> Option<(Harness, Calls)> {
+    screened_down(key).await.map(|(h, c, _)| (h, c))
+}
+
+async fn screened_down(key: bool) -> Option<(Harness, Calls, Down)> {
     canned_web();
-    let (calls, url) = stand_in().await;
+    let (calls, url, down) = stand_in().await;
     let h = Harness::with(|c| {
         c.screen_senders = true;
         c.anthropic_api_key = key.then(|| "sk-ant-test-0123456789".into());
         c.anthropic_api_base = Some(url.clone());
     })
     .await?;
-    Some((h, calls))
+    Some((h, calls, down))
 }
 
 macro_rules! screened {
@@ -629,5 +644,565 @@ async fn a_texts_real_link_destinations_are_judged() {
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     assert!(v.to_string().contains("can't be sent"), "{v}");
     assert!(calls.lock().unwrap().is_empty(), "the rules refused it");
+    h.cleanup().await;
+}
+
+// ---------- Review round: one test (or more) per item ----------
+
+use dumbmail::sending::{Conversational, Outcome, SendSpec};
+
+/// A time zone where it's the middle of the day now, so texts aren't held for quiet hours.
+fn daytime_tz() -> String {
+    (0..24)
+        .map(|o| format!("Etc/GMT{}{}", if o >= 12 { "-" } else { "+" }, if o >= 12 { o - 12 } else { o }))
+        .find(|tz| {
+            let t: chrono_tz::Tz = tz.parse().unwrap();
+            (11..17).contains(&chrono::Timelike::hour(&chrono::Utc::now().with_timezone(&t)))
+        })
+        .unwrap()
+}
+
+fn spec<'a>(account: &'a dumbmail::models::Account, profile: &'a dumbmail::models::Profile, channel: &'a str, content: &'a Value) -> SendSpec<'a> {
+    SendSpec { account, profile, channel, content, campaign_id: None, flow_id: None, flow_node_id: None, event: None, is_test: false, message_id: None, to_override: None }
+}
+
+async fn profile(h: &mut Harness, body: Value) -> dumbmail::models::Profile {
+    let p = h.ok("POST", "/api/profiles", Some(body)).await;
+    let id: Uuid = p["id"].as_str().unwrap().parse().unwrap();
+    dumbmail::api::audience::load_profile(&h.state, account_id(h).await, id).await.unwrap()
+}
+
+/// The account as an earlier read saw it (`standing`), whatever the database says now.
+async fn snapshot(h: &Harness, standing: &str) -> dumbmail::models::Account {
+    let mut a = dumbmail::campaigns::load_account(&h.state.db, account_id(h).await).await.unwrap();
+    a.sending_review = Some(standing.into());
+    a
+}
+
+async fn set_standing(h: &Harness, standing: &str) {
+    sqlx::query("UPDATE accounts SET sending_review = $1").bind(standing).execute(&h.state.db).await.unwrap();
+}
+
+fn email_content() -> Value {
+    json!({"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Our fall scents are here.</p>"}]})
+}
+
+// Item 1: texts the account writes itself, and flow notifications.
+#[tokio::test]
+async fn item1_inbox_texts_the_account_writes_wait_for_approval() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    h.credit(5.0).await;
+    let ours = h.claim_number().await;
+    let them = "+15035550177";
+    let p = profile(&mut h, json!({"phone_number": them})).await;
+    let a = dumbmail::campaigns::load_account(&h.state.db, account_id(&h).await).await.unwrap();
+    let body = json!({"body": "We're open till 6."});
+    let conv = |kind: &'static str| Conversational { kind, sent_by: None, to: them.into(), from: ours.clone() };
+    // A reply typed in the inbox: refused with the reason for the reply box.
+    let err = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &body), &conv("reply")).await.unwrap_err();
+    assert!(err.public_message().contains("Not sent") && err.public_message().contains("checked before its first send"), "{}", err.public_message());
+    // Keyword and automatic replies don't go out.
+    for kind in ["keyword_reply", "auto_reply"] {
+        let out = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &body), &conv(kind)).await.unwrap();
+        assert!(matches!(out, Outcome::Skipped("account not approved")), "{kind}: {out:?}");
+    }
+    // DumbMail's fixed compliance texts aren't held by the standing.
+    for kind in ["help", "confirmation", "optin_request"] {
+        let out = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &body), &conv(kind)).await;
+        assert!(!matches!(out, Ok(Outcome::Skipped("account not approved" | "account blocked"))), "{kind}: {out:?}");
+    }
+    // The final claim reads the standing again: an approved snapshot doesn't let a keyword reply through.
+    let stale = snapshot(&h, "approved").await;
+    let out = dumbmail::sending::send_conversational(&h.state, spec(&stale, &p, "sms", &body), &conv("keyword_reply")).await.unwrap();
+    assert!(matches!(out, Outcome::Skipped("account not approved")), "{out:?}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item1_flow_notifications_reach_only_members_until_approved() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    let def = json!({"entry": "n", "nodes": [{"id": "n", "type": "notify", "to": ["owner@acme.test", "pm@outside.test"], "subject": "New lead: {{ person.email }}", "body": "Call them.", "next": null}]});
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": "N", "trigger": {"type": "metric", "metric": "Lead"}, "definition": def}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    sqlx::query("UPDATE flow_notify_addresses SET confirmed_at = now()").execute(&h.state.db).await.unwrap();
+    let notes = |h: &Harness, to: &str| h.state.email.sent().into_iter().filter(|e| e.to == to && e.subject.starts_with("New lead")).count();
+    h.ok("POST", "/api/events", Some(json!({"metric": "Lead", "profile": {"email": "g1@x.test"}}))).await;
+    h.drain().await;
+    assert_eq!(notes(&h, "owner@acme.test"), 1, "members still get them");
+    assert_eq!(notes(&h, "pm@outside.test"), 0, "outsiders wait for approval");
+    let why: Vec<Option<String>> = sqlx::query_scalar("SELECT error FROM flow_notifications WHERE to_email = 'pm@outside.test'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(why, vec![Some("account not approved".to_string())]);
+    // Blocked: nobody.
+    set_standing(&h, "blocked").await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Lead", "profile": {"email": "g2@x.test"}}))).await;
+    h.drain().await;
+    assert_eq!(notes(&h, "owner@acme.test"), 1);
+    // Approved: everyone confirmed.
+    set_standing(&h, "approved").await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Lead", "profile": {"email": "g3@x.test"}}))).await;
+    h.drain().await;
+    assert_eq!((notes(&h, "owner@acme.test"), notes(&h, "pm@outside.test")), (2, 1));
+    h.cleanup().await;
+}
+
+// Item 2: the final claim reads the standing again.
+#[tokio::test]
+async fn item2_the_final_claim_reads_the_standing_again() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    h.credit(5.0).await;
+    h.claim_number().await;
+    h.ok("PATCH", "/api/account", Some(json!({"timezone": daytime_tz()}))).await;
+    let p = profile(&mut h, json!({"email": "ann@x.test", "email_consent": "subscribed", "phone_number": "+15035550188", "sms_consent": "subscribed"})).await;
+    set_standing(&h, "blocked").await;
+    // The send started from an approved read of the account; the claim sees it's blocked now.
+    let stale = snapshot(&h, "approved").await;
+    let content = email_content();
+    let out = dumbmail::sending::send(&h.state, spec(&stale, &p, "email", &content)).await.unwrap();
+    assert!(matches!(out, Outcome::Skipped("account blocked")), "{out:?}");
+    let sms = json!({"body": "New scents today."});
+    let out = dumbmail::sending::send(&h.state, spec(&stale, &p, "sms", &sms)).await.unwrap();
+    assert!(matches!(out, Outcome::Skipped("account blocked")), "{out:?}");
+    assert!(!h.state.email.sent().iter().any(|m| m.to == "ann@x.test"));
+    assert!(h.state.sms.sent().is_empty());
+    // A test email while pending: only to a current member, checked at the end too.
+    set_standing(&h, "pending").await;
+    let mut test = spec(&stale, &p, "email", &content);
+    test.is_test = true;
+    test.to_override = Some("stranger@x.test".into());
+    let out = dumbmail::sending::send(&h.state, test).await.unwrap();
+    assert!(matches!(out, Outcome::Skipped("account not approved")), "{out:?}");
+    let mut test = spec(&stale, &p, "email", &content);
+    test.is_test = true;
+    test.to_override = Some("owner@acme.test".into());
+    let out = dumbmail::sending::send(&h.state, test).await.unwrap();
+    assert!(matches!(out, Outcome::Sent(_)), "{out:?}");
+    assert!(!h.state.email.sent().iter().any(|m| m.to == "stranger@x.test"));
+    h.cleanup().await;
+}
+
+// Item 3: decisions are one conditional statement; a check and its content check write one decision.
+#[tokio::test]
+async fn item3_an_operator_decision_never_erases_something_newer() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    set_standing(&h, "review").await;
+    let aid = account_id(&h).await;
+    let (_, _, list) = h.raw("GET", "/admin/screening", &[("authorization", ADMIN)], "").await;
+    let seen = serde_json::from_str::<Value>(&list).unwrap()["accounts"][0]["checked_at"].clone();
+    // An engagement pause lands after the operator looked.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    sqlx::query("UPDATE accounts SET sending_paused_at = now(), sending_paused_reason = 'unopened rate 97%'").execute(&h.state.db).await.unwrap();
+    let body = json!({"account_id": aid, "decision": "approve", "note": "", "seen_at": seen}).to_string();
+    let (s, _, out) = h.raw("POST", "/admin/screening/decide", &[("authorization", ADMIN), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{out}");
+    let (st, paused): (String, Option<String>) = sqlx::query_as("SELECT sending_review, sending_paused_reason FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((st.as_str(), paused.as_deref()), ("review", Some("unopened rate 97%")), "nothing was erased");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item3_a_first_check_and_its_content_check_write_one_decision() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    verify_domain(&h, "acme.test").await;
+    h.ok("POST", "/api/screening/request", Some(json!({"business": "Soap", "list_source": "Our website form", "monthly_volume": 500}))).await;
+    // The answers alone don't run the check here (claimed elsewhere): reset to pending with answers.
+    set_standing(&h, "pending").await;
+    sqlx::query("DELETE FROM screenings").execute(&h.state.db).await.unwrap();
+    h.state.email.clear_sent();
+    let cid = campaign(&mut h, "Action needed", "<p>Unusual sign-in. <a href=\"https://login.evil-site.test\">Verify your account</a></p>", &["ann@x.test"]).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(standing(&h).await, "review");
+    assert!(!h.state.email.sent().iter().any(|m| m.to == "owner@acme.test" && m.subject.contains("approved")), "approval was never published");
+    let account_verdicts: Vec<String> = sqlx::query_scalar("SELECT verdict FROM screenings WHERE kind = 'account'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(account_verdicts, vec!["review".to_string()]);
+    h.cleanup().await;
+}
+
+// Item 4: what passes is what sends.
+#[tokio::test]
+async fn item4_every_version_language_and_hidden_block_is_judged() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "L"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "ann@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let aud = json!({"include": [{"type": "list", "id": list["id"]}]});
+    let clean = json!({"type": "text", "html": "<p>Fall scents.</p>"});
+    let tries = [
+        // An A/B version.
+        json!({"content": {"subject": "A", "blocks": [clean]}, "ab_test": {"variants": [{"id": "b", "content": {"subject": "B", "blocks": [{"type": "text", "html": "<p>VERDICT_REVIEW b</p>"}]}}]}}),
+        // A language version.
+        json!({"content": {"subject": "A", "blocks": [{"type": "text", "html": "<p>Fall scents.</p>", "i18n": {"fr": {"html": {"text": "<p>VERDICT_REVIEW fr</p>", "status": "reviewed", "source": dumbmail::features::translations::fields::hash("<p>Fall scents.</p>")}}}}]}}),
+        // One side of a template condition the sample person never sees.
+        json!({"content": {"subject": "A", "blocks": [{"type": "text", "html": "<p>{% if person.properties.vip %}VERDICT_REVIEW vip{% else %}Hi{% endif %}</p>"}]}}),
+    ];
+    for (i, t) in tries.iter().enumerate() {
+        let mut body = json!({"name": format!("C{i}"), "channel": "email", "audience": aud});
+        for (k, v) in t.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (s, c) = h.req("POST", "/api/campaigns", Some(body)).await;
+        assert!(s.is_success(), "{i}: {c}");
+        let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{i}: {v}");
+        assert!(v.to_string().contains("A person is checking this"), "{i}: {v}");
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item4_saved_blocks_and_review_request_steps_are_judged() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let (s, sb) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Footer", "blocks": [{"type": "text", "html": "<p>VERDICT_REVIEW footer</p>"}]}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{sb}");
+    let content = json!({"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hi</p>"}, {"type": "saved", "saved_block_id": sb["id"], "blocks": []}]});
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "L"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "ann@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "S", "channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": content}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    // A review request step.
+    let f = h
+        .ok("POST", "/api/flows", Some(json!({"name": "R", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "r", "nodes": [
+            {"id": "r", "type": "review_request", "channel": "email", "content": {"subject": "How was it?", "blocks": [{"type": "text", "html": "<p>VERDICT_REVIEW tell us</p>"}]}, "next": null}]}})))
+        .await;
+    let (s, v) = h.req("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item4_more_than_a_check_covers_is_held_for_a_person() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let n = dumbmail::features::screening::content::MAX_MESSAGES + 1;
+    let nodes: Vec<Value> = (0..n)
+        .map(|i| json!({"id": format!("e{i}"), "type": "email", "content": {"subject": format!("Step {i}"), "blocks": [{"type": "text", "html": format!("<p>Hello {i}</p>")}]}, "next": if i + 1 < n { json!(format!("e{}", i + 1)) } else { Value::Null }}))
+        .collect();
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": "Long", "trigger": {"type": "metric", "metric": "Joined"}, "definition": {"entry": "e0", "nodes": nodes}}))).await;
+    let (s, v) = h.req("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("too large for our automatic check"), "{v}");
+    assert!(calls.lock().unwrap().is_empty(), "nothing cut short and sent");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item4_a_live_flow_changed_outside_a_check_waits_for_one() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let f = h
+        .ok("POST", "/api/flows", Some(json!({"name": "W", "trigger": {"type": "metric", "metric": "Joined"}, "definition": {"entry": "e", "nodes": [
+            {"id": "e", "type": "email", "content": {"subject": "Welcome", "blocks": [{"type": "text", "html": "<p>Thanks for joining.</p>"}]}, "next": null}]}})))
+        .await;
+    let fid = f["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    // Changed by a path no editor check saw (a translation promotion, a direct write).
+    sqlx::query("UPDATE flows SET definition = jsonb_set(definition, '{nodes,0,content,blocks,0,html}', '\"<p>VERDICT_REVIEW new words</p>\"') WHERE id = $1::uuid").bind(&fid).execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/profiles", Some(json!({"email": "new@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Joined", "profile": {"email": "new@x.test"}}))).await;
+    h.drain().await;
+    assert!(!h.state.email.sent().iter().any(|m| m.to == "new@x.test"), "unchecked content doesn't go out");
+    assert_eq!(calls.lock().unwrap().len(), 2, "checked on the background lane");
+    let held: String = sqlx::query_scalar("SELECT verdict FROM screenings WHERE kind = 'content' ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(held, "review");
+    h.fast_forward().await;
+    assert!(!h.state.email.sent().iter().any(|m| m.to == "new@x.test"), "held content keeps waiting");
+    h.cleanup().await;
+}
+
+// Item 5: a "suppression" file that subscribes texts is an ordinary import.
+#[tokio::test]
+async fn item5_a_suppression_import_cant_subscribe_anyone() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    let csv = "email,phone\nann@x.test,+15035550101\n";
+    let (s, v) = h.req("POST", "/api/profiles/import", Some(json!({"csv": csv, "email_consent": "unsubscribed", "sms_consent": "subscribed"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "permission is needed: {v}");
+    let (s, v) = h.req("POST", "/api/profiles/import", Some(json!({"csv": csv, "file_name": "apollo_export.csv", "email_consent": "unsubscribed", "sms_consent": "subscribed", "permission_confirmed": true}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "and it's screened: {v}");
+    assert!(v.to_string().contains("bought or scraped"), "{v}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 0);
+    h.cleanup().await;
+}
+
+// Item 6: only allow-listed, redacted fields reach the model; customers see our own words.
+#[tokio::test]
+async fn item6_no_address_phone_or_token_reaches_the_model() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    verify_domain(&h, "acme.test").await;
+    let r = h
+        .ok("POST", "/api/screening/request", Some(json!({"business": "VERDICT_REVIEW Soap. Call me on +1 503 555 0188 or write jane.doe@corp.test", "list_source": "Our website form", "monthly_volume": 500})))
+        .await;
+    assert_eq!(r["status"], "review");
+    approve_directly(&h).await;
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email\nann@x.test\n", "file_name": "from bob.smith@corp.test.csv", "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    let cid = campaign(&mut h, "Fall", "<p>Shop <a href=\"https://acme.test/fall?token=SECRET123TOKEN&amp;u=ann@x.test\">now</a></p>", &["zed@x.test"]).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3);
+    let all = serde_json::to_string(&calls).unwrap();
+    for bad in ["555 0188", "5550188", "jane.doe@corp.test", "bob.smith@corp.test", "SECRET123TOKEN", "ann@x.test", "zed@x.test"] {
+        assert!(!all.contains(bad), "{bad} reached the model");
+    }
+    // The model's own words never reach the customer.
+    set_standing(&h, "review").await;
+    let mine = h.ok("GET", "/api/screening", None).await.to_string();
+    assert!(!mine.contains("MODEL-WORDS") && !mine.contains("stand-in"), "{mine}");
+    assert!(mine.contains("A person needs to look at this."), "our own sentence: {mine}");
+    h.cleanup().await;
+}
+
+// Item 7: a brand exception needs proof.
+#[tokio::test]
+async fn item7_a_typed_website_isnt_proof_of_a_brand() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    h.ok("PATCH", "/api/account", Some(json!({"website": "https://www.paypal.com"}))).await;
+    let (s, v) = h.req("POST", "/api/account/domains", Some(json!({"domain": "paypal-secure-login.com"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    // An operator confirmed the account belongs to the brand.
+    let aid = account_id(&h).await;
+    let body = json!({"account_id": aid, "decision": "approve", "note": "PayPal's own team", "affiliated_brands": ["paypal"]}).to_string();
+    let (s, _, out) = h.raw("POST", "/admin/screening/decide", &[("authorization", ADMIN), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    h.ok("POST", "/api/account/domains", Some(json!({"domain": "paypal-secure-login.com"}))).await;
+    h.cleanup().await;
+}
+
+// Item 8: real send times, delivery events, and flow mail waiting during an engagement review.
+async fn engagement_campaign(h: &Harness, send_at: &str, sent_at: &str, status: &str, n: usize, opened: usize) -> Uuid {
+    let aid = account_id(h).await;
+    let cid = Uuid::now_v7();
+    sqlx::query(&format!("INSERT INTO campaigns (id, account_id, name, channel, status, audience, content, send_at) VALUES ($1, $2, 'Blast', 'email', 'sent', '{{}}', '{{}}', now() - interval '{send_at}')"))
+        .bind(cid)
+        .bind(aid)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    for i in 0..n {
+        let pid = Uuid::now_v7();
+        sqlx::query("INSERT INTO profiles (id, account_id, email, email_consent) VALUES ($1, $2, $3, 'subscribed')").bind(pid).bind(aid).bind(format!("{cid}-{i}@x.test")).execute(&h.state.db).await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address, status, sent_at, opened_at) VALUES ($1, $2, $3, 'email', $4, 'x@x.test', $5, now() - interval '{sent_at}', CASE WHEN $6 THEN now() END)"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(aid)
+        .bind(pid)
+        .bind(cid)
+        .bind(status)
+        .bind(i < opened)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+    cid
+}
+
+#[tokio::test]
+async fn item8_engagement_uses_real_send_times_and_deliveries() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let aid = account_id(&h).await;
+    // Started two days ago, but every email went out an hour ago: too soon to judge.
+    engagement_campaign(&h, "2 days", "1 hour", "delivered", 300, 0).await;
+    // Accepted by the provider two days ago, no delivery event: not counted as delivered.
+    engagement_campaign(&h, "2 days", "2 days", "sent", 300, 0).await;
+    dumbmail::features::screening::engagement::check_account(&h.state, aid).await.unwrap();
+    let paused: Option<String> = sqlx::query_scalar("SELECT sending_paused_reason FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(paused, None);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item8_flow_email_waits_through_an_engagement_review_per_run() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let f = h
+        .ok("POST", "/api/flows", Some(json!({"name": "W", "trigger": {"type": "metric", "metric": "Joined"}, "definition": {"entry": "e", "nodes": [
+            {"id": "e", "type": "email", "content": {"subject": "Welcome", "blocks": [{"type": "text", "html": "<p>Thanks for joining.</p>"}]}, "next": null}]}})))
+        .await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    // An engagement check paused email and put the account in review.
+    sqlx::query("UPDATE accounts SET sending_review = 'review', sending_paused_at = now(), sending_paused_reason = 'unopened rate 98%'").execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/profiles", Some(json!({"email": "new@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Joined", "profile": {"email": "new@x.test"}}))).await;
+    h.drain().await;
+    let skipped: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE to_address = 'new@x.test' AND status = 'skipped'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(skipped, 0, "it waits instead of being skipped by the pause");
+    let (key, run): (String, Uuid) = sqlx::query_as("SELECT w.run_key, r.id FROM screening_waits w JOIN flow_runs r ON r.flow_id = w.flow_id").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(key, run.to_string(), "tracked per flow run and step");
+    h.cleanup().await;
+}
+
+// Item 9: self-hosted is untouched.
+#[tokio::test]
+async fn item9_self_hosted_screens_nothing() {
+    canned_web();
+    let (calls, url, _) = stand_in().await;
+    let Some(mut h) = Harness::with(|c| {
+        c.hosted = false;
+        c.screen_senders = true;
+        c.anthropic_api_key = Some("sk-ant-test-0123456789".into());
+        c.anthropic_api_base = Some(url.clone());
+    })
+    .await
+    else {
+        return;
+    };
+    h.signup().await;
+    assert_eq!(standing(&h).await, "pending", "the column's default, which nothing reads here");
+    for (m, p) in [("GET", "/admin/screening"), ("POST", "/admin/screening/decide"), ("POST", "/admin/screening/pass")] {
+        let (s, _, _) = h.raw(m, p, &[("authorization", ADMIN), ("content-type", "application/json")], "{}").await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{m} {p}");
+    }
+    let cid = campaign(&mut h, "Fall", "<p>VERDICT_BLOCK whatever</p>", &["ann@x.test"]).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert!(h.state.email.sent().iter().any(|m| m.to == "ann@x.test"));
+    assert!(calls.lock().unwrap().is_empty());
+    h.cleanup().await;
+}
+
+// Item 10: limits and deadlines.
+#[tokio::test]
+async fn item10_the_daily_limit_uses_a_fixed_pacific_day() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    verify_domain(&h, "acme.test").await;
+    // A time zone whose date differs from Pacific's right now.
+    let tz: String = sqlx::query_scalar(
+        "SELECT z FROM unnest(ARRAY['Pacific/Kiritimati', 'Etc/GMT+12']) z WHERE (now() AT TIME ZONE z)::date <> (now() AT TIME ZONE 'America/Los_Angeles')::date LIMIT 1",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    h.ok("PATCH", "/api/account", Some(json!({"timezone": tz}))).await;
+    sqlx::query("INSERT INTO screening_ai_usage (account_id, day, calls) SELECT id, (now() AT TIME ZONE 'America/Los_Angeles')::date, 30 FROM accounts").execute(&h.state.db).await.unwrap();
+    let r = answers(&mut h, "We make handmade soap.").await;
+    assert_eq!(r["status"], "review");
+    assert!(calls.lock().unwrap().is_empty(), "changing the time zone doesn't reset the day");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item10_a_due_campaign_is_checked_on_the_background_lane() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let cid = campaign(&mut h, "Fall", soap(), &["ann@x.test"]).await;
+    let at = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    h.ok("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at}))).await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    sqlx::query("UPDATE campaigns SET content = jsonb_set(content, '{subject}', '\"Fall, now with pear\"'), send_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&cid).execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    // Run the sending lane only: the batch puts itself off and asks the background lane.
+    loop {
+        let job: Option<(i64, String, Value)> = sqlx::query_as("SELECT id, kind, payload FROM jobs WHERE lane = 'main' AND run_at <= now() ORDER BY id LIMIT 1").fetch_optional(&h.state.db).await.unwrap();
+        let Some((id, kind, payload)) = job else { break };
+        sqlx::query("DELETE FROM jobs WHERE id = $1").bind(id).execute(&h.state.db).await.unwrap();
+        match kind.as_str() {
+            "campaign_send" => dumbmail::campaigns::prepare_send(&h.state, payload["campaign_id"].as_str().unwrap().parse().unwrap()).await.unwrap(),
+            "campaign_batch" => {
+                let ids: Vec<Uuid> = serde_json::from_value(payload["message_ids"].clone()).unwrap();
+                dumbmail::campaigns::send_batch(&h.state, payload["campaign_id"].as_str().unwrap().parse().unwrap(), &ids).await.unwrap()
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(calls.lock().unwrap().len(), 1, "no Claude call on the sending lane");
+    assert!(!h.state.email.sent().iter().any(|m| m.to == "ann@x.test"));
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE lane = 'background' AND kind = 'screening_content_check'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(queued, 1);
+    // The check runs; the batch, waiting a minute between looks, goes once it passed.
+    h.fast_forward().await;
+    h.fast_forward().await;
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert!(h.state.email.sent().iter().any(|m| m.to == "ann@x.test"), "it goes once the check passes");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item10_a_rules_only_pass_is_judged_again_when_claude_is_back() {
+    let Some((mut h, calls, down)) = screened_down(true).await else { return };
+    h.signup().await;
+    approve_directly(&h).await;
+    // An established sender: 1,000 real emails, the first 15 days ago.
+    let aid = account_id(&h).await;
+    let pid = profile(&mut h, json!({"email": "old@x.test", "email_consent": "subscribed"})).await.id;
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status, sent_at, created_at) SELECT gen_random_uuid(), $1, $2, 'email', 'old@x.test', 'delivered', now() - interval '15 days', now() - interval '15 days' FROM generate_series(1, 1000)")
+        .bind(aid)
+        .bind(pid)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let cid = campaign(&mut h, "Fall", soap(), &["ann@x.test"]).await;
+    let at = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.ok("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at}))).await;
+    let src: String = sqlx::query_scalar("SELECT source FROM screenings WHERE kind = 'content' ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(src, "rules");
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.ok("POST", &format!("/api/campaigns/{cid}/cancel"), None).await;
+    let before = calls.lock().unwrap().len();
+    h.ok("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at}))).await;
+    assert_eq!(calls.lock().unwrap().len(), before + 1, "judged again now that Claude answers");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn item10_the_deadline_covers_the_whole_launch() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    dumbmail::features::screening::content::testing::deadline(account_id(&h).await, 1000);
+    let cid = campaign(&mut h, "Fall", "<p>SLOW_MODEL scents</p>", &["ann@x.test"]).await;
+    let t = std::time::Instant::now();
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert!(!s.is_success());
+    assert!(t.elapsed() < std::time::Duration::from_millis(2500), "{:?}", t.elapsed());
+    h.cleanup().await;
+}
+
+// Item 11: a failed lookup is unknown, not "no mail server".
+#[tokio::test]
+async fn item11_failed_mail_lookups_are_unknown() {
+    let (mut h, _) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    let mut csv = String::from("email\n");
+    for i in 0..30 {
+        let d = format!("slowdns{i}.test");
+        net::mail_lookup_fails(&d);
+        csv.push_str(&format!("p{i}@{d}\n"));
+    }
+    for i in 0..20 {
+        let d = format!("deadmx{i}.test");
+        if i < 5 {
+            net::mail_server(&d, false);
+        }
+        csv.push_str(&format!("q{i}@{d}\n"));
+    }
+    // 5 of the 20 checked (25%) can't receive mail, but only 40% of the file could be checked.
+    let r = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "file_name": "customers.csv", "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    assert_eq!(r["created"], 50, "not blocked: {r}");
+    let (verdict, checked): (String, i64) = sqlx::query_as("SELECT verdict, (signals->'stats'->>'mx_checked')::bigint FROM screenings WHERE kind = 'import'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((verdict.as_str(), checked), ("review", 20));
     h.cleanup().await;
 }

@@ -278,7 +278,8 @@ pub struct ImportBody {
 }
 
 pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> AppResult<Value> {
-    let as_unsubscribed = b.email_consent.as_deref() == Some("unsubscribed");
+    // A suppression file: everyone in it is unsubscribed, and it subscribes nobody on any channel.
+    let as_unsubscribed = b.email_consent.as_deref() == Some("unsubscribed") && b.sms_consent.as_deref() != Some("subscribed");
     if state.cfg.hosted && !as_unsubscribed && !b.permission_confirmed {
         return Err(AppError::bad(
             "Confirm that everyone in this file agreed to get email from you (permission_confirmed: true). Bought, rented or scraped lists aren't allowed.",

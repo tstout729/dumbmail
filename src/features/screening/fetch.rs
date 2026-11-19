@@ -26,7 +26,7 @@ pub const PAGE_TEXT_CHARS: usize = 4000;
 struct Canned {
     pages: HashMap<String, Option<(String, String)>>,
     registered: HashMap<String, DateTime<Utc>>,
-    mx: HashMap<String, bool>,
+    mx: HashMap<String, Option<bool>>,
 }
 
 static CANNED: Lazy<Mutex<Option<Canned>>> = Lazy::new(|| Mutex::new(None));
@@ -63,7 +63,14 @@ pub mod testing {
 
     pub fn mail_server(domain: &str, has: bool) {
         with(|c| {
-            c.mx.insert(domain.to_ascii_lowercase(), has);
+            c.mx.insert(domain.to_ascii_lowercase(), Some(has));
+        });
+    }
+
+    /// A domain whose lookup fails (an error or no answer in time).
+    pub fn mail_lookup_fails(domain: &str) {
+        with(|c| {
+            c.mx.insert(domain.to_ascii_lowercase(), None);
         });
     }
 }
@@ -183,18 +190,43 @@ pub async fn registered_at(domain: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Whether a mail domain has a mail server (an MX record, or an address to fall back on).
-/// None when the lookup didn't answer.
+/// One DNS question over HTTPS: Some(answers) when the resolver answered for certain (none for a
+/// name that doesn't exist or has no such records), None when it couldn't say (an error, a server
+/// failure, no answer in time).
+async fn dns(state: &AppState, name: &str, rtype: &str) -> Option<Vec<String>> {
+    let res = state
+        .http
+        .get("https://cloudflare-dns.com/dns-query")
+        .query(&[("name", name), ("type", rtype)])
+        .header("accept", "application/dns-json")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = res.json().await.ok()?;
+    match v["Status"].as_i64() {
+        // NOERROR (maybe with no records of this type), NXDOMAIN: certain.
+        Some(0) | Some(3) => {}
+        _ => return None,
+    }
+    Some(v["Answer"].as_array().into_iter().flatten().filter_map(|x| x["data"].as_str()).map(|d| d.trim_end_matches('.').to_ascii_lowercase()).collect())
+}
+
+/// Whether a mail domain has a mail server (an MX record, or an address to fall back on). None
+/// when that's unknown: a lookup failed or timed out never counts as "no mail server".
 pub async fn has_mail_server(state: &AppState, domain: &str) -> Option<bool> {
     if let Some(c) = canned() {
-        return Some(c.mx.get(domain).copied().unwrap_or(true));
+        return c.mx.get(domain).copied().unwrap_or(Some(true));
     }
-    let mx = crate::domains::lookup(state, domain, "MX").await;
+    let mx = dns(state, domain, "MX").await?;
     if !mx.is_empty() {
         // A "null MX" (`0 .`) says the domain takes no mail.
         return Some(mx.iter().any(|r| r.split_whitespace().nth(1).is_some_and(|h| !h.is_empty() && h != ".")));
     }
-    let a = crate::domains::lookup(state, domain, "A").await;
+    let a = dns(state, domain, "A").await?;
     Some(!a.is_empty())
 }
 

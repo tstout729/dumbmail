@@ -685,10 +685,28 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, r: &Row) 
     }
     let slot = Slot { state, account_id: account.id, done: false };
     crate::sending::throttle_email(state).await;
-    // A pause, a removed member or address, or a bounce can land while waiting for a slot.
-    let (allowed, bad, paused): (bool, bool, bool) =
-        sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}, COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true)")).bind(account.id).bind(&r.to_email).fetch_one(db).await?;
-    let stop = if paused { Some("sending paused") } else if bad { Some("address bounced or complained") } else if !allowed { Some("address not confirmed") } else { None };
+    // A pause, a removed member or address, or a bounce can land while waiting for a slot. With the
+    // account's sending review (see features::screening): until it's approved only members get
+    // notifications, and none while it's blocked.
+    let (allowed, bad, paused, screened): (bool, bool, bool, Option<String>) = sqlx::query_as(&format!(
+        "SELECT {ALLOWED}, {BAD_ADDRESS}, COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true), {}",
+        crate::features::screening::notification_stop_sql(state)
+    ))
+    .bind(account.id)
+    .bind(&r.to_email)
+    .fetch_one(db)
+    .await?;
+    let stop = if paused {
+        Some("sending paused")
+    } else if let Some(why) = screened.as_deref() {
+        Some(if why == crate::features::screening::BLOCKED { crate::features::screening::BLOCKED } else { crate::features::screening::NOT_APPROVED })
+    } else if bad {
+        Some("address bounced or complained")
+    } else if !allowed {
+        Some("address not confirmed")
+    } else {
+        None
+    };
     if let Some(why) = stop {
         settle(db, r.id, "pending", "skipped", why).await?;
         return Ok(None);

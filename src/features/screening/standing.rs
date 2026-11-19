@@ -86,6 +86,8 @@ pub struct New<'a> {
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
     pub content_hash: Option<String>,
+    /// Each message's own hash (see `content`).
+    pub part_hashes: Vec<String>,
 }
 
 impl<'a> New<'a> {
@@ -103,6 +105,7 @@ impl<'a> New<'a> {
             input_tokens: None,
             output_tokens: None,
             content_hash: None,
+            part_hashes: Vec::new(),
         }
     }
 
@@ -120,8 +123,8 @@ pub async fn record(db: &sqlx::PgPool, account_id: Uuid, s: New<'_>) -> sqlx::Re
     let id = Uuid::now_v7();
     let subject_name = s.subject_name.map(|n| plain(&n, 200));
     sqlx::query(
-        "INSERT INTO screenings (id, account_id, kind, subject, subject_id, subject_name, verdict, reasons, signals, source, model, input_tokens, output_tokens, content_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        "INSERT INTO screenings (id, account_id, kind, subject, subject_id, subject_name, verdict, reasons, signals, source, model, input_tokens, output_tokens, content_hash, part_hashes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(id)
     .bind(account_id)
@@ -137,6 +140,7 @@ pub async fn record(db: &sqlx::PgPool, account_id: Uuid, s: New<'_>) -> sqlx::Re
     .bind(s.input_tokens)
     .bind(s.output_tokens)
     .bind(s.content_hash)
+    .bind(s.part_hashes)
     .execute(db)
     .await?;
     Ok(id)
@@ -161,6 +165,13 @@ pub async fn move_to(state: &AppState, account_id: Uuid, from: &[Standing], to: 
     .await?;
     let Some((old, name)) = old else { return Ok(None) };
     let old = Standing::parse(Some(&old));
+    after_move(state, account_id, &name, old, to, &note, why).await?;
+    Ok(Some(old))
+}
+
+/// What follows a change of standing (after it committed): campaigns stopped, waiting flow
+/// messages released, the owner told, the operator alerted.
+pub async fn after_move(state: &AppState, account_id: Uuid, name: &str, old: Standing, to: Standing, note: &str, why: &str) -> anyhow::Result<()> {
     tracing::warn!(account = %account_id, from = old.as_str(), to = to.as_str(), "sending review changed");
     match to {
         Standing::Approved => {
@@ -185,15 +196,15 @@ pub async fn move_to(state: &AppState, account_id: Uuid, from: &[Standing], to: 
                 ),
             )
             .await;
-            alert_operator(state, account_id, &name, to, why).await;
+            alert_operator(state, account_id, name, to, why).await;
         }
         Standing::Review => {
             stop_sends(state, account_id, false).await?;
-            alert_operator(state, account_id, &name, to, why).await;
+            alert_operator(state, account_id, name, to, why).await;
         }
         Standing::Pending => {}
     }
-    Ok(Some(old))
+    Ok(())
 }
 
 /// Stop the account's campaigns (email and text): those sending, and when `all` scheduled ones

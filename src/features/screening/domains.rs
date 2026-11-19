@@ -18,11 +18,18 @@ pub async fn check_domain(state: &AppState, account_id: Uuid, domain: &str, what
     if !super::on(state) {
         return Ok(());
     }
-    let website: Option<String> = sqlx::query_scalar("SELECT website FROM accounts WHERE id = $1").bind(account_id).fetch_optional(&state.db).await?.flatten();
+    // Proof the account belongs to a brand: a verified sending domain on it, or an operator's word.
+    // (Its website is only what it typed.)
+    let (verified, brands, website): (Vec<String>, Vec<String>, Option<String>) = sqlx::query_as(
+        "SELECT ARRAY(SELECT d.domain FROM sending_domains d WHERE d.account_id = a.id AND d.status = 'verified'), a.sending_review_brands, a.website FROM accounts a WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&state.db)
+    .await?;
     let site_host = website.as_deref().and_then(fetch::website_host);
     let mut reasons = Vec::new();
     let mut verdict = Verdict::Pass;
-    if let Some(brand) = rules::impersonated_brand(domain, site_host.as_deref()) {
+    if let Some(brand) = rules::impersonated_brand(domain, &rules::Affiliation { verified_domains: &verified, brands: &brands }) {
         verdict = Verdict::Block;
         reasons.push(format!("{domain} looks like it impersonates {brand}. Use a domain that belongs to your own business."));
     }

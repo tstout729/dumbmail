@@ -89,7 +89,7 @@ pub async fn request(state: &AppState, ctx: &Ctx, a: Answers) -> AppResult<Value
     sqlx::query("UPDATE accounts SET sending_review_answers = $2 WHERE id = $1").bind(ctx.account_id).bind(json!(a)).execute(&state.db).await?;
     crate::features::team::audit(state, ctx, "sending_review.request", None, json!({"status": before.as_str()})).await;
     if before == Standing::Pending {
-        super::account::run(state, ctx.account_id, None, super::content::DEADLINE).await.map_err(AppError::Internal)?;
+        super::account::run(state, ctx.account_id, None, super::content::deadline(ctx.account_id)).await.map_err(AppError::Internal)?;
     }
     review(state, ctx.account_id).await
 }
