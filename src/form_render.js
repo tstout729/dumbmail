@@ -643,12 +643,22 @@
       });
     }
 
+    // An optional box naming WhatsApp, when the form has WhatsApp consent wording.
+    function whatsappEl() {
+      var cb = h("input", { type: "checkbox", name: "whatsapp_consent", value: "1" });
+      return { cb: cb, el: h("label", { cls: "dm-consent" }, [cb, h("span", { text: str(c.whatsapp_consent_text) })]) };
+    }
+
     function formScreen() {
-      var rows = fields.map(fieldEl), consent = null;
+      var rows = fields.map(fieldEl), consent = null, wa = null;
       var formEl = h("form", { cls: "dm-form", novalidate: true });
       rows.forEach(function (r) {
         formEl.appendChild(r.wrap);
-        if (r.f.key === "phone_number") { consent = consentEl(); r.wrap.insertBefore(consent.el, r.err); }
+        if (r.f.key === "phone_number") {
+          consent = consentEl();
+          r.wrap.insertBefore(consent.el, r.err);
+          if (trim(c.whatsapp_consent_text)) { wa = whatsappEl(); r.wrap.insertBefore(wa.el, r.err); }
+        }
       });
       var btn = button(filled(c.button_text, DEFAULTS.button_text));
       var formErr = h("p", { cls: "dm-error dm-form-error", role: "alert" });
@@ -664,6 +674,7 @@
         if (!d) return;
         var data = { form_id: form.id, variant: form.version || null };
         for (var k in d) if (has(d, k)) data[k] = d[k];
+        if (wa && wa.cb.checked && data.phone_number) data.whatsapp_consent = true;
         // The visitor's time zone lets the server guess their location for new profiles.
         try { data.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e2) {}
         // The browser's language: a hint for which language version of a message they get.
