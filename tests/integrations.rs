@@ -1436,7 +1436,8 @@ async fn capped_backfills_resume_and_old_pages_cant_overwrite_progress() {
     assert_eq!(b["pages"], 3);
     // Where to pick up is saved, encrypted (it can carry what the app put in a Link header), and never shown.
     let saved: Value = sqlx::query_scalar("SELECT backfill FROM integrations WHERE id = $1::uuid").bind(&id).fetch_one(&h.state.db).await.unwrap();
-    assert!(saved["next_enc"].as_str().is_some_and(|s| !s.contains("http")), "{saved}");
+    // Ciphertext is base64, which has no ':' (random bytes can spell "http", so look for "://").
+    assert!(saved["next_enc"].as_str().is_some_and(|s| !s.contains("://")), "{saved}");
     assert!(b.get("next_enc").is_none() && b.get("next").is_none(), "{b}");
     let first = count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Booked'").await;
     assert!(first < 150, "{first}");
