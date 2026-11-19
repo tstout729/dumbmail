@@ -492,10 +492,16 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         // A queued message names the address it was meant for. If the profile's address changed since
         // (an edit, a merge), it isn't sent to the new one (the write above refused it).
         if let Some(mid) = spec.message_id {
-            let n = sqlx::query("UPDATE messages SET status = 'skipped', error = 'address changed' WHERE id = $1 AND status IN ('queued', 'sending')").bind(mid).execute(&state.db).await?.rows_affected();
+            // A resend says so in its own words (see features::campaigns_plus::resend).
+            let resend: bool = match spec.campaign_id {
+                Some(c) => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaign_resends WHERE campaign_id = $1)").bind(c).fetch_one(&state.db).await?,
+                None => false,
+            };
+            let why = if resend { "address changed since the original (resend)" } else { "address changed" };
+            let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status IN ('queued', 'sending')").bind(mid).bind(why).execute(&state.db).await?.rows_affected();
             if n > 0 {
                 crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
-                return Ok(Outcome::Skipped("address changed"));
+                return Ok(Outcome::Skipped(why));
             }
         }
         return Ok(Outcome::Skipped("profile deleted"));
@@ -693,10 +699,6 @@ async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, mes
         if suppressed {
             return Ok(Some(Stop::Skip("suppressed", None)));
         }
-        // The address it's going to must still be the profile's (an edit or a merge may have moved it).
-        if spec.to_override.is_none() && email.as_deref() != Some(to) {
-            return Ok(Some(Stop::Skip("address changed", None)));
-        }
         if held {
             return Ok(Some(Stop::Skip(crate::marketing_hold::SKIP_REASON, None)));
         }
@@ -706,6 +708,10 @@ async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, mes
         // A resend: only to the address that got the original, and only while subscribed.
         if let Some(why) = crate::features::campaigns_plus::resend::handoff_stop(resend, &email_consent, email.as_deref(), original_to.as_deref(), to) {
             return Ok(Some(Stop::Skip(why, None)));
+        }
+        // The address it's going to must still be the profile's (an edit or a merge may have moved it).
+        if spec.to_override.is_none() && email.as_deref() != Some(to) {
+            return Ok(Some(Stop::Skip("address changed", None)));
         }
         return Ok(None);
     }
