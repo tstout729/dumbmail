@@ -109,11 +109,11 @@ async fn mock() -> (Mock, String) {
                 let mut s = m.lock().unwrap();
                 s.sends.push((to.clone(), b.clone()));
                 let n = s.sends.len();
-                if let Some(q) = s.answers.get_mut(&to) {
-                    if !q.is_empty() {
-                        let (code, body) = q.remove(0);
-                        return (StatusCode::from_u16(code).unwrap(), Json(body));
-                    }
+                if let Some(q) = s.answers.get_mut(&to)
+                    && !q.is_empty()
+                {
+                    let (code, body) = q.remove(0);
+                    return (StatusCode::from_u16(code).unwrap(), Json(body));
                 }
                 let wa_id: String = to.chars().filter(char::is_ascii_digit).collect();
                 (StatusCode::OK, Json(json!({"messaging_product": "whatsapp", "contacts": [{"input": to, "wa_id": wa_id}], "messages": [{"id": format!("wamid.TEST{n}")}]})))

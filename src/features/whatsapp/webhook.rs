@@ -156,7 +156,8 @@ async fn handle(state: &AppState, account_id: Uuid, waba_id: Option<&str>, phone
                     }
                 }
                 Some("phone_number_quality_update") => {
-                    let limit = value["current_limit"].as_str().or(value["new_limit"].as_str()).map(|s| s.chars().take(40).collect::<String>());
+                    // `max_daily_conversations_per_business` replaces the deprecated `current_limit`.
+                    let limit = value["max_daily_conversations_per_business"].as_str().or(value["current_limit"].as_str()).map(|s| s.chars().take(40).collect::<String>());
                     sqlx::query("UPDATE whatsapp_settings SET messaging_limit = COALESCE($2, messaging_limit), updated_at = now() WHERE account_id = $1")
                         .bind(account_id)
                         .bind(limit)

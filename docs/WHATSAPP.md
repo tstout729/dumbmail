@@ -157,7 +157,7 @@ These were built and tested against Meta's published Cloud API documentation (Gr
 - the send request and its answer (`messages[0].id`, `contacts[0].wa_id`), and the error codes in the table above;
 - template listing (fields, `paging.cursors.after`), template creation's answer (`id`, `status`, `category`) and Meta's acceptance of templates with tracked link buttons;
 - the phone number fields `display_phone_number`, `verified_name`, `quality_rating` and `whatsapp_business_manager_messaging_limit`;
-- the webhook payloads: inbound messages (text, quick-reply buttons, interactive replies, media), statuses with `errors[].code` and `pricing.category`, `message_template_status_update`, `message_template_quality_update` (`new_quality_score`), `phone_number_quality_update` (`current_limit`) and `user_preferences`;
+- the webhook payloads: inbound messages (text, quick-reply buttons, interactive replies, media), statuses with `errors[].code` and `pricing.category`, `message_template_status_update`, `message_template_quality_update` (`new_quality_score`), `phone_number_quality_update` (`max_daily_conversations_per_business`, or the older `current_limit`) and `user_preferences`;
 - the signature check over the raw body.
 
 A first live check should: connect a test number and check it; verify the webhook in the Meta app; sync templates; create a template with a tracked link button and watch it reach approved; send a test to a team number and see sent, delivered and read arrive; tap the link button; reply STOP and see consent change; message the number and reply inside the window; and wait 24 hours to see the reply box switch to templates.
