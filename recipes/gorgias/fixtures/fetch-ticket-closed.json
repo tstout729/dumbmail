@@ -1,0 +1,135 @@
+{
+  "description": "Closed: Ticket Closed once for this closing (and Ticket Created, already recorded)",
+  "doc": "https://developers.gorgias.com/reference/the-ticket-object (example object, trimmed, with a message added; personal data replaced)",
+  "expect": [
+    {
+      "email": "jo.example@example.com",
+      "keys": {
+        "gorgias_ticket": "4242"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Ticket Created",
+      "profile": {
+        "email": "jo.example@example.com"
+      },
+      "properties": {
+        "channel": "email",
+        "status": "closed",
+        "subject": "Where is my order?",
+        "ticket_id": "4242"
+      },
+      "time": "2019-11-16T15:59:35.000000+00:00",
+      "type": "track_event",
+      "unique_id": "gorgias:4242:created"
+    },
+    {
+      "metric": "Ticket Closed",
+      "profile": {
+        "email": "jo.example@example.com"
+      },
+      "properties": {
+        "channel": "email",
+        "status": "closed",
+        "subject": "Where is my order?",
+        "ticket_id": "4242"
+      },
+      "time": "2019-11-17T09:00:00.000000+00:00",
+      "type": "track_event",
+      "unique_id": "gorgias:4242:closed:2019-11-17T09:00:00.000000+00:00"
+    }
+  ],
+  "input": {
+    "payload": {
+      "assignee_user": {
+        "email": "agent@example.com",
+        "id": 3,
+        "name": "Agent"
+      },
+      "channel": "email",
+      "closed_datetime": "2019-11-17T09:00:00.000000+00:00",
+      "created_datetime": "2019-11-16T15:59:35.000000+00:00",
+      "custom_fields": null,
+      "customer": {
+        "email": "jo.example@example.com",
+        "external_id": null,
+        "firstname": "Jo",
+        "id": 120,
+        "integrations": {
+          "7": {
+            "__integration_type__": "shopify",
+            "customer": {
+              "email": "jo.example@example.com",
+              "id": 555,
+              "total_spent": "401.00"
+            },
+            "orders": [
+              {
+                "id": 1001,
+                "shipping_address": {
+                  "address1": "9 Test Road"
+                }
+              }
+            ]
+          }
+        },
+        "lastname": "Example",
+        "meta": {},
+        "name": "Jo Example",
+        "note": "VIP, prefers phone"
+      },
+      "external_id": null,
+      "from_agent": false,
+      "id": 4242,
+      "imported": false,
+      "is_unread": false,
+      "language": "en",
+      "last_message_datetime": "2019-11-16T15:59:35.000000+00:00",
+      "last_received_message_datetime": "2019-11-16T15:59:35.000000+00:00",
+      "messages": [
+        {
+          "body_html": "<p>My order 1001 hasn't arrived. My card ends 4242 and my address is 9 Test Road.</p>",
+          "body_text": "My order 1001 hasn't arrived. My card ends 4242 and my address is 9 Test Road.",
+          "channel": "email",
+          "id": 1,
+          "sender": {
+            "email": "jo.example@example.com"
+          },
+          "stripped_text": "My order 1001 hasn't arrived.",
+          "via": "email"
+        }
+      ],
+      "meta": null,
+      "opened_datetime": "2019-11-16T16:00:00.000000+00:00",
+      "processed_datetime": null,
+      "reply_options": {},
+      "satisfaction_survey": null,
+      "snooze_datetime": null,
+      "spam": false,
+      "status": "closed",
+      "subject": "Where is my order?",
+      "summary": null,
+      "tags": [
+        {
+          "id": 1,
+          "name": "wismo"
+        }
+      ],
+      "trashed_datetime": null,
+      "updated_datetime": "2019-11-17T09:00:00.000000+00:00",
+      "uri": "/api/tickets/4242/",
+      "via": "email"
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://your-account.gorgias.com/api/tickets/4242"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:00:00.000Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

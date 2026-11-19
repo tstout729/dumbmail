@@ -280,13 +280,20 @@ fn keep_into(src: &Value, segs: &[Seg], dst: &mut Value, depth: usize) {
         Seg::Key { name, each, filter } => {
             let (Value::Object(s), Value::Object(d)) = (src, &mut *dst) else { return };
             let Some(child) = s.get(name) else { return };
-            if *each {
-                if !child.is_array() {
-                    return;
-                }
+            if *each && child.is_array() {
                 let slot = d.entry(name.clone()).or_insert_with(|| Value::Array(Vec::new()));
                 items(child, slot, &|it| filter.as_ref().is_none_or(|f| f.matches(it)));
-            } else if rest.is_empty() {
+                return;
+            }
+            if *each {
+                // A filter on a key that holds an object (answers keyed by question id) keeps the
+                // object only when it matches; anything else isn't kept.
+                match filter {
+                    Some(f) if child.is_object() && f.matches(child) => {}
+                    _ => return,
+                }
+            }
+            if rest.is_empty() {
                 let end = kept_end(child);
                 merge_kept(d.entry(name.clone()).or_insert(Value::Null), end);
             } else {
@@ -369,8 +376,8 @@ pub fn body(content_type: Option<&str>, raw: &str, paths: &[Path]) -> Option<Str
     if paths.is_empty() {
         return Some(raw.to_string());
     }
-    let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    if ct.contains("application/x-www-form-urlencoded") {
+    // A body that says it's JSON is read as JSON, whatever its parameters say.
+    if super::engine::media_type(content_type) == "application/x-www-form-urlencoded" {
         let mut m = Map::new();
         for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
             m.insert(k.into_owned(), Value::String(v.into_owned()));
@@ -403,6 +410,16 @@ mod tests {
         let ps: Vec<Path> = list.iter().map(|p| Path::parse(p).unwrap()).collect();
         apply(&mut v, &ps);
         v
+    }
+
+    #[test]
+    fn a_filter_on_an_object_key_keeps_it_only_when_it_matches() {
+        let v = json!({"answers": {"3": {"type": "control_textbox", "answer": "Surfing", "prettyFormat": "Surfing"}, "4": {"type": "control_address", "answer": {"addr_line1": "1 Test Street"}}, "5": {"type": "control_fullname", "answer": {"first": "Bart", "last": "Ex", "middle": "M"}}}});
+        let list: Vec<String> = ["keep:answers.{setting:copy}[type=control_textbox|control_fullname].answer", "keep:answers.{setting:copy}[type=control_textbox|control_fullname].type", "keep:answers.{setting:copy}[type=control_textbox|control_fullname].answer.first", "keep:answers.{setting:copy}[type=control_textbox|control_fullname].answer.last"].iter().map(|s| s.to_string()).collect();
+        let settings = json!({"copy": ["3", "4", "5"]}).as_object().cloned().unwrap();
+        let mut out = v.clone();
+        apply(&mut out, &paths_with(&list, &settings));
+        assert_eq!(out, json!({"answers": {"3": {"type": "control_textbox", "answer": "Surfing"}, "5": {"type": "control_fullname", "answer": {"first": "Bart", "last": "Ex"}}}}), "the address answer isn't kept, nor prettyFormat or the middle name");
     }
 
     #[test]

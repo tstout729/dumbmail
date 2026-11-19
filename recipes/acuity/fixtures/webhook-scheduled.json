@@ -1,0 +1,21 @@
+{
+  "description": "scheduled: fetch the appointment, carrying the action",
+  "doc": "https://developers.acuityscheduling.com/docs/webhooks (form-encoded body; example \"action=changed&id=13&calendarID=1&appointmentTypeID=13\")",
+  "expect": [
+    {
+      "context": {
+        "action": "scheduled"
+      },
+      "type": "next_request",
+      "url": "/api/v1/appointments/54321"
+    }
+  ],
+  "input": {
+    "payload": {
+      "action": "scheduled",
+      "appointmentTypeID": "1",
+      "calendarID": "27238",
+      "id": "54321"
+    }
+  }
+}

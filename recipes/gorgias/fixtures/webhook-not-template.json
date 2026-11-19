@@ -1,0 +1,15 @@
+{
+  "description": "A body without the template's ticket_id records nothing",
+  "doc": "https://docs.gorgias.com/data-and-http-integrations/http-integrations (body is the template from the setup steps; {{ticket.id}} from https://developers.gorgias.com/reference/the-tickethttpintegration-object)",
+  "expect": [
+    {
+      "message": "not the DumbMail body (see the recipe's setup steps): no ticket_id",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "subject": "hi"
+    }
+  }
+}

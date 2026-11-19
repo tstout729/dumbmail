@@ -1,0 +1,438 @@
+{
+  "description": "The batch's first page: each shipped order is looked up once (with its shipments), voided and return labels are skipped, and the other pages are asked for",
+  "doc": "https://www.shipstation.com/docs/api/shipments/list/ (example response; personal data replaced)",
+  "expect": [
+    {
+      "context": {
+        "shipments": [
+          {
+            "carrier": "stamps_com",
+            "id": "33974374",
+            "order_number": "100038-1",
+            "service": "usps_first_class_mail",
+            "ship_date": "2014-10-03",
+            "tracking_number": "9400111899561704681189"
+          }
+        ]
+      },
+      "type": "lookup",
+      "url": "/orders/43945660"
+    },
+    {
+      "context": {
+        "shipments": [
+          {
+            "carrier": "stamps_com",
+            "id": "33974373",
+            "order_number": "100028",
+            "service": "usps_first_class_mail",
+            "ship_date": "2014-10-03",
+            "tracking_number": "9400111899561704681196"
+          },
+          {
+            "carrier": "stamps_com",
+            "id": "33974372",
+            "order_number": "100028",
+            "service": "usps_first_class_mail",
+            "ship_date": "2014-10-03",
+            "tracking_number": "9400111899561704681202"
+          }
+        ]
+      },
+      "type": "lookup",
+      "url": "/orders/43337328"
+    },
+    {
+      "query": {
+        "batchId": "12345678",
+        "page": "2",
+        "pageSize": "50",
+        "storeID": "123456"
+      },
+      "type": "lookup",
+      "url": "/shipments"
+    },
+    {
+      "query": {
+        "batchId": "12345678",
+        "page": "3",
+        "pageSize": "50",
+        "storeID": "123456"
+      },
+      "type": "lookup",
+      "url": "/shipments"
+    }
+  ],
+  "input": {
+    "payload": {
+      "page": 1,
+      "pages": 3,
+      "shipments": [
+        {
+          "advancedOptions": null,
+          "batchNumber": "100301",
+          "carrierCode": "stamps_com",
+          "confirmation": "delivery",
+          "createDate": "2014-10-03T06:51:33.6270000",
+          "dimensions": null,
+          "formData": null,
+          "insuranceCost": 0,
+          "insuranceOptions": {
+            "insureShipment": false,
+            "insuredValue": 0,
+            "provider": null
+          },
+          "isReturnLabel": false,
+          "labelData": null,
+          "marketplaceNotified": true,
+          "notifyErrorMessage": null,
+          "orderId": 43945660,
+          "orderKey": "8061c220f0794a9b92460b8bae6837e4",
+          "orderNumber": "100038-1",
+          "packageCode": "package",
+          "serviceCode": "usps_first_class_mail",
+          "shipDate": "2014-10-03",
+          "shipTo": {
+            "city": "MANCHACA",
+            "company": "",
+            "country": "US",
+            "name": "Yoda Example",
+            "phone": "2105550144",
+            "postalCode": "78652-3602",
+            "residential": null,
+            "state": "TX",
+            "street1": "12223 LOWDEN LN",
+            "street2": "",
+            "street3": null
+          },
+          "shipmentCost": 1.93,
+          "shipmentId": 33974374,
+          "shipmentItems": [
+            {
+              "fulfillmentSku": null,
+              "imageUrl": null,
+              "lineItemKey": null,
+              "name": "Potato Kitten -",
+              "options": null,
+              "orderItemId": 56568665,
+              "productId": 7565777,
+              "quantity": 1,
+              "sku": "SQ3785739",
+              "unitPrice": 1,
+              "warehouseLocation": null,
+              "weight": null
+            }
+          ],
+          "trackingNumber": "9400111899561704681189",
+          "userId": "123456AB-ab12-3c4d-5e67-89f1abc1defa",
+          "voidDate": null,
+          "voided": false,
+          "warehouseId": 16079,
+          "weight": {
+            "units": "ounces",
+            "value": 1
+          }
+        },
+        {
+          "advancedOptions": null,
+          "batchNumber": "100301",
+          "carrierCode": "stamps_com",
+          "confirmation": "delivery",
+          "createDate": "2014-10-03T06:51:33.6270000",
+          "dimensions": null,
+          "formData": null,
+          "insuranceCost": 0,
+          "insuranceOptions": {
+            "insureShipment": false,
+            "insuredValue": 0,
+            "provider": null
+          },
+          "isReturnLabel": false,
+          "labelData": null,
+          "marketplaceNotified": true,
+          "notifyErrorMessage": null,
+          "orderId": 43337328,
+          "orderKey": "8061c220f0794a9b92460b8bae6837e4",
+          "orderNumber": "100028",
+          "packageCode": "package",
+          "serviceCode": "usps_first_class_mail",
+          "shipDate": "2014-10-03",
+          "shipTo": {
+            "city": "MANCHACA",
+            "company": "",
+            "country": "US",
+            "name": "Luke Example",
+            "phone": "2105550144",
+            "postalCode": "78652-3602",
+            "residential": null,
+            "state": "TX",
+            "street1": "2815 EXPOSITION BLVD",
+            "street2": "",
+            "street3": null
+          },
+          "shipmentCost": 1.93,
+          "shipmentId": 33974373,
+          "shipmentItems": [
+            {
+              "fulfillmentSku": null,
+              "imageUrl": null,
+              "lineItemKey": null,
+              "name": "Potato Kitten -",
+              "options": null,
+              "orderItemId": 56568665,
+              "productId": 7565777,
+              "quantity": 1,
+              "sku": "SQ3785739",
+              "unitPrice": 1,
+              "warehouseLocation": null,
+              "weight": null
+            }
+          ],
+          "trackingNumber": "9400111899561704681196",
+          "userId": "123456AB-ab12-3c4d-5e67-89f1abc1defa",
+          "voidDate": null,
+          "voided": false,
+          "warehouseId": 16079,
+          "weight": {
+            "units": "ounces",
+            "value": 1
+          }
+        },
+        {
+          "advancedOptions": null,
+          "batchNumber": "100301",
+          "carrierCode": "stamps_com",
+          "confirmation": "delivery",
+          "createDate": "2014-10-03T06:51:33.6270000",
+          "dimensions": null,
+          "formData": null,
+          "insuranceCost": 0,
+          "insuranceOptions": {
+            "insureShipment": false,
+            "insuredValue": 0,
+            "provider": null
+          },
+          "isReturnLabel": false,
+          "labelData": null,
+          "marketplaceNotified": true,
+          "notifyErrorMessage": null,
+          "orderId": 43337328,
+          "orderKey": "8061c220f0794a9b92460b8bae6837e4",
+          "orderNumber": "100028",
+          "packageCode": "package",
+          "serviceCode": "usps_first_class_mail",
+          "shipDate": "2014-10-03",
+          "shipTo": {
+            "city": "MANCHACA",
+            "company": "",
+            "country": "US",
+            "name": "Luke Example",
+            "phone": "2105550144",
+            "postalCode": "78652-3602",
+            "residential": null,
+            "state": "TX",
+            "street1": "2815 EXPOSITION BLVD",
+            "street2": "",
+            "street3": null
+          },
+          "shipmentCost": 1.93,
+          "shipmentId": 33974372,
+          "shipmentItems": [
+            {
+              "fulfillmentSku": null,
+              "imageUrl": null,
+              "lineItemKey": null,
+              "name": "Potato Kitten -",
+              "options": null,
+              "orderItemId": 56568665,
+              "productId": 7565777,
+              "quantity": 1,
+              "sku": "SQ3785739",
+              "unitPrice": 1,
+              "warehouseLocation": null,
+              "weight": null
+            }
+          ],
+          "trackingNumber": "9400111899561704681202",
+          "userId": "123456AB-ab12-3c4d-5e67-89f1abc1defa",
+          "voidDate": null,
+          "voided": false,
+          "warehouseId": 16079,
+          "weight": {
+            "units": "ounces",
+            "value": 1
+          }
+        },
+        {
+          "advancedOptions": null,
+          "batchNumber": "100301",
+          "carrierCode": "stamps_com",
+          "confirmation": "delivery",
+          "createDate": "2014-10-03T06:51:33.6270000",
+          "dimensions": null,
+          "formData": null,
+          "insuranceCost": 0,
+          "insuranceOptions": {
+            "insureShipment": false,
+            "insuredValue": 0,
+            "provider": null
+          },
+          "isReturnLabel": false,
+          "labelData": null,
+          "marketplaceNotified": true,
+          "notifyErrorMessage": null,
+          "orderId": 43000001,
+          "orderKey": "8061c220f0794a9b92460b8bae6837e4",
+          "orderNumber": "100020",
+          "packageCode": "package",
+          "serviceCode": "usps_first_class_mail",
+          "shipDate": "2014-10-03",
+          "shipTo": {
+            "city": "MANCHACA",
+            "company": "",
+            "country": "US",
+            "name": "Void Example",
+            "phone": "2105550144",
+            "postalCode": "78652-3602",
+            "residential": null,
+            "state": "TX",
+            "street1": "1 VOID ST",
+            "street2": "",
+            "street3": null
+          },
+          "shipmentCost": 1.93,
+          "shipmentId": 33974371,
+          "shipmentItems": [
+            {
+              "fulfillmentSku": null,
+              "imageUrl": null,
+              "lineItemKey": null,
+              "name": "Potato Kitten -",
+              "options": null,
+              "orderItemId": 56568665,
+              "productId": 7565777,
+              "quantity": 1,
+              "sku": "SQ3785739",
+              "unitPrice": 1,
+              "warehouseLocation": null,
+              "weight": null
+            }
+          ],
+          "trackingNumber": "9400111899561704681300",
+          "userId": "123456AB-ab12-3c4d-5e67-89f1abc1defa",
+          "voidDate": "2014-10-03T08:00:00.0000000",
+          "voided": true,
+          "warehouseId": 16079,
+          "weight": {
+            "units": "ounces",
+            "value": 1
+          }
+        },
+        {
+          "advancedOptions": null,
+          "batchNumber": "100301",
+          "carrierCode": "stamps_com",
+          "confirmation": "delivery",
+          "createDate": "2014-10-03T06:51:33.6270000",
+          "dimensions": null,
+          "formData": null,
+          "insuranceCost": 0,
+          "insuranceOptions": {
+            "insureShipment": false,
+            "insuredValue": 0,
+            "provider": null
+          },
+          "isReturnLabel": true,
+          "labelData": null,
+          "marketplaceNotified": true,
+          "notifyErrorMessage": null,
+          "orderId": 43000002,
+          "orderKey": "8061c220f0794a9b92460b8bae6837e4",
+          "orderNumber": "RMA-1",
+          "packageCode": "package",
+          "serviceCode": "usps_first_class_mail",
+          "shipDate": "2014-10-03",
+          "shipTo": {
+            "city": "MANCHACA",
+            "company": "",
+            "country": "US",
+            "name": "Return Example",
+            "phone": "2105550144",
+            "postalCode": "78652-3602",
+            "residential": null,
+            "state": "TX",
+            "street1": "1 RETURN ST",
+            "street2": "",
+            "street3": null
+          },
+          "shipmentCost": 1.93,
+          "shipmentId": 33974370,
+          "shipmentItems": [
+            {
+              "fulfillmentSku": null,
+              "imageUrl": null,
+              "lineItemKey": null,
+              "name": "Potato Kitten -",
+              "options": null,
+              "orderItemId": 56568665,
+              "productId": 7565777,
+              "quantity": 1,
+              "sku": "SQ3785739",
+              "unitPrice": 1,
+              "warehouseLocation": null,
+              "weight": null
+            }
+          ],
+          "trackingNumber": "9400111899561704681400",
+          "userId": "123456AB-ab12-3c4d-5e67-89f1abc1defa",
+          "voidDate": null,
+          "voided": false,
+          "warehouseId": 16079,
+          "weight": {
+            "units": "ounces",
+            "value": 1
+          }
+        }
+      ],
+      "total": 105
+    },
+    "request": {
+      "method": "GET",
+      "query": [
+        [
+          "batchId",
+          "12345678"
+        ],
+        [
+          "storeID",
+          "123456"
+        ],
+        [
+          "page",
+          "1"
+        ],
+        [
+          "pageSize",
+          "50"
+        ]
+      ],
+      "url": "https://ssapi.shipstation.com/shipments"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:00:00.000Z",
+      "status": 200
+    },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
+    },
+    "source": "fetch"
+  },
+  "sensitive": [
+    "12223 LOWDEN LN",
+    "2815 EXPOSITION BLVD",
+    "SQ3785739"
+  ]
+}

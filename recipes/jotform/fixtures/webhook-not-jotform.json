@@ -1,0 +1,25 @@
+{
+  "description": "A body without a submissionID records nothing",
+  "doc": "https://www.jotform.com/answers/1211524-receiving-webhooks-from-jotform and https://www.jotform.com/answers/321875-webhook-access-to-the-submissionid-value (multipart fields formID, submissionID, rawRequest; shown here as the form the webhook is stored as; personal data replaced)",
+  "expect": [
+    {
+      "message": "not a Jotform submission (no submissionID)",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "hello": "world"
+    },
+    "settings": {
+      "consent_field": "6",
+      "consent_value": "Yes, send me emails",
+      "copy_fields": [
+        "7",
+        "3"
+      ],
+      "email_field": "5",
+      "form_id": "31751954731962"
+    }
+  }
+}

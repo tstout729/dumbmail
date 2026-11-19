@@ -146,8 +146,9 @@ fn open_next(state: &AppState, sealed: &Value) -> NextRequest {
 
 /// Turn a stored body into the script's `payload`: JSON, a form, or the text itself.
 pub fn parse_body(content_type: Option<&str>, body: &str) -> Value {
-    let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    if ct.contains("application/x-www-form-urlencoded") {
+    // A body that says it's JSON is read as JSON, whatever its parameters say.
+    let media = media_type(content_type);
+    if media == "application/x-www-form-urlencoded" {
         let mut m = Map::new();
         for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
             m.insert(k.into_owned(), Value::String(v.into_owned()));
@@ -158,6 +159,54 @@ pub fn parse_body(content_type: Option<&str>, body: &str) -> Value {
         return Value::Null;
     }
     serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
+}
+
+/// A body's media type, lower-cased and without its parameters (`application/json`).
+pub fn media_type(content_type: Option<&str>) -> String {
+    content_type.unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+/// Whether a media type is JSON (`application/json`, or any `+json` type).
+pub fn is_json(media: &str) -> bool {
+    media == "application/json" || media.ends_with("+json")
+}
+
+/// A `multipart/form-data` body (Jotform's webhooks) as an ordinary form: its text fields,
+/// URL-encoded, so it is stored, redacted and handed to the script like any form. Read with a
+/// maintained, bounded MIME parser; file parts and fields that aren't UTF-8 text are left out, at
+/// most 1,000 fields are kept. `None` when the body isn't readable multipart (it's then kept as it
+/// came, like any other body).
+pub async fn multipart_as_form(content_type: &str, body: axum::body::Bytes) -> Option<String> {
+    if media_type(Some(content_type)) != "multipart/form-data" {
+        return None;
+    }
+    let boundary = multer::parse_boundary(content_type).ok()?;
+    let limits = multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(BODY_MAX_BYTES as u64).per_field(BODY_MAX_BYTES as u64));
+    let stream = futures_util::stream::once(async move { Ok::<axum::body::Bytes, std::io::Error>(body) });
+    let mut parts = multer::Multipart::with_constraints(stream, boundary, limits);
+    let mut kept: Vec<(String, String)> = Vec::new();
+    loop {
+        let field = match parts.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        if field.file_name().is_some() {
+            continue;
+        }
+        let Some(name) = field.name().map(str::to_string).filter(|n| !n.is_empty()) else { continue };
+        let Ok(bytes) = field.bytes().await else { return None };
+        let Ok(text) = String::from_utf8(bytes.to_vec()) else { continue };
+        if kept.len() >= 1000 {
+            break;
+        }
+        kept.push((name, text));
+    }
+    let mut out = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in &kept {
+        out.append_pair(k, v);
+    }
+    Some(out.finish())
 }
 
 #[derive(Default)]
@@ -1348,9 +1397,16 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     let context = next.context.as_ref().map(Value::to_string).unwrap_or_default();
     let mut query: Vec<String> = next.query.iter().flatten().map(|(k, v)| format!("{k}={v}")).collect();
     query.sort();
-    // The record alone (its path and query) is the intent's identity; a second callback for it
-    // while it waits merges its context in (the latest wins).
-    let key = crate::auth::sha256_hex(&format!("{}\n{}", next.url.as_deref().unwrap_or(""), query.join("&")));
+    let rules = integ.pull_config().and_then(|c| c.fetch);
+    // By default the record alone (its path and query) is the intent's identity, and a second
+    // callback for it while it waits merges its context in (the latest wins). With
+    // `identity: record_and_context` each context is its own piece of work: a second callback
+    // naming the same record never replaces a waiting or claimed one's context.
+    let key = if rules.as_ref().is_some_and(|r| r.context_is_identity()) {
+        crate::auth::sha256_hex(&format!("{}\n{}\n{}", next.url.as_deref().unwrap_or(""), query.join("&"), context))
+    } else {
+        crate::auth::sha256_hex(&format!("{}\n{}", next.url.as_deref().unwrap_or(""), query.join("&")))
+    };
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut **tx).await?;
     let (mine, all): (i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE integration_id = $1), count(*) FROM integration_deliveries
@@ -1389,19 +1445,22 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     Ok(())
 }
 
-/// How long the app asked us to wait: `Retry-After` (seconds or an HTTP date) or BigCommerce's
-/// `X-Rate-Limit-Time-Reset-Ms`. At most two hours.
-fn cooldown(headers: &Map<String, Value>) -> Option<chrono::Duration> {
+/// How long the app asked us to wait: BigCommerce's `X-Rate-Limit-Time-Reset-Ms`, then
+/// `Retry-After` (seconds or an HTTP date), then, only for an integration whose fetch rules declare
+/// it (`reset_header`, ShipStation's `X-Rate-Limit-Reset`), the seconds until the app's rate
+/// window resets. At most two hours.
+fn cooldown(headers: &Map<String, Value>, reset_header: Option<&str>) -> Option<chrono::Duration> {
     let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, v)| v.as_str()).map(str::trim);
     // Values are clamped before a duration is built, so an absurd header can't overflow it.
     let ms: i64 = if let Some(ms) = get("x-rate-limit-time-reset-ms").and_then(|v| v.parse::<i64>().ok()) {
         ms
-    } else {
-        let v = get("retry-after")?;
+    } else if let Some(v) = get("retry-after") {
         match v.parse::<i64>() {
             Ok(s) => s.clamp(0, 7200) * 1000,
             Err(_) => (DateTime::parse_from_rfc2822(v).ok()?.timestamp() - Utc::now().timestamp()).clamp(0, 7200) * 1000,
         }
+    } else {
+        get(reset_header?)?.parse::<i64>().ok()?.clamp(0, 7200) * 1000
     };
     Some(chrono::Duration::milliseconds(ms.clamp(1000, 7_200_000)))
 }
@@ -1436,6 +1495,44 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
     .await?;
     let Some((integration_id, request)) = row else { return Ok(()) };
     let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
+    // These credentials' cooldown (the app said to wait, after a 429) and, when the recipe declares
+    // them, their rate (`per_minute`) and hourly budget (`per_hour`) hold for every lookup of the
+    // integration: checked here, under the account's lock, from the requests actually sent. A
+    // lookup over any of them isn't refused or dropped, and uses up none of its tries: it waits
+    // until there's room, then runs.
+    let declared = integ.pull_config().and_then(|c| c.fetch);
+    let per_minute = declared.as_ref().and_then(|r| r.per_minute).map(i64::from);
+    let per_hour = declared.as_ref().and_then(|r| r.per_hour).map(i64::from);
+    let (cool_until, recent, oldest, hour, hour_oldest): (Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT max((request->>'cooldown_until')::timestamptz) FILTER (WHERE request ? 'cooldown_until'),
+                count(*) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute'),
+                min((request->>'sent_at')::timestamptz) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute'),
+                count(*) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 hour'),
+                min((request->>'sent_at')::timestamptz) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 hour')
+         FROM integration_deliveries WHERE integration_id = $1 AND source = 'fetch' AND created_at > now() - interval '1 day'",
+    )
+    .bind(integration_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let claimed_at = Utc::now();
+    let mut wait_until = cool_until.filter(|t| *t > claimed_at);
+    let mut later = |room: DateTime<Utc>| wait_until = Some(wait_until.map_or(room, |w| w.max(room)));
+    if let (Some(max), Some(first)) = (per_minute, oldest) {
+        if recent >= max {
+            later(first + chrono::Duration::seconds(61));
+        }
+    }
+    if let (Some(max), Some(first)) = (per_hour, hour_oldest) {
+        if hour >= max {
+            later(first + chrono::Duration::seconds(3601));
+        }
+    }
+    if let Some(at) = wait_until {
+        sqlx::query("UPDATE integration_deliveries SET next_attempt_at = $2 WHERE id = $1").bind(id).bind(at).execute(&mut *tx).await?;
+        crate::jobs::enqueue_background(&mut *tx, JOB_FETCH, json!({"delivery_id": id}), Some(at)).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
     let mut scrub = scrub_for(state, &integ).await;
     let attempts = request["fetch"]["attempts"].as_i64().unwrap_or(0) as i32;
     let reserve = BODY_MAX_BYTES as i64;
@@ -1449,12 +1546,13 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
         Err(other) => return Err(anyhow::anyhow!("{other:?}")),
     }
     sqlx::query(
-        "UPDATE integration_deliveries SET request = request || jsonb_build_object('claimed_until', now() + interval '2 minutes', 'reserved', $2::int),
+        "UPDATE integration_deliveries SET request = request || jsonb_build_object('claimed_until', now() + interval '2 minutes', 'reserved', $2::int, 'sent_at', $3::timestamptz),
              body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes) + $2
          WHERE id = $1",
     )
     .bind(id)
     .bind(reserve as i32)
+    .bind(claimed_at)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1504,13 +1602,21 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
         Err(e) => return fetch_failed(state, &integ, &scrub, id, attempts, Some(logged.log_json()), &e.public_message(), None, true).await,
     };
     let mut made = logged.log_json();
-    made["response"] = json!({"status": resp.status, "headers": resp.headers});
+    // When DumbMail sent the request (it was claimed then): a later request for the same record is
+    // only sent once an earlier one's answer is stored, so a script can version what an answer says
+    // by it. And when the answer came back.
+    made["sent_at"] = json!(claimed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    made["response"] = json!({"status": resp.status, "headers": resp.headers, "received_at": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)});
     if !(200..300).contains(&resp.status) {
         if token.is_some() && matches!(resp.status, 401 | 403) {
             pull::drop_token(state, integ.id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
         }
         let again = matches!(resp.status, 401 | 403 | 404 | 408 | 409 | 425 | 429) || resp.status >= 500;
-        let wait = if matches!(resp.status, 429 | 503) { cooldown(&resp.headers) } else { None };
+        let wait = if matches!(resp.status, 429 | 503) { cooldown(&resp.headers, rules.reset_header.as_deref()) } else { None };
+        // The wait holds for these credentials: every lookup of the integration waits it out.
+        if let Some(w) = wait {
+            sqlx::query("UPDATE integration_deliveries SET request = request || jsonb_build_object('cooldown_until', $2::timestamptz) WHERE id = $1").bind(id).bind(Utc::now() + w).execute(&state.db).await?;
+        }
         let msg = format!("{} answered HTTP {} ({})", req.place(), resp.status, pull::status_class(resp.status));
         return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), &msg, wait, again).await;
     }
@@ -1649,4 +1755,55 @@ pub async fn prune_with(state: &AppState, budget: Duration, bytes_per_account: i
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn multipart_forms_become_plain_forms() {
+        let mut body: Vec<u8> = b"--XyZ\r\nContent-Disposition: form-data; name=\"formID\"\r\n\r\n31751954731962\r\n--XyZ\r\nContent-Disposition: form-data; name=\"submissionID\"\r\n\r\n2379550\r\n".to_vec();
+        // A binary file part and a field that isn't UTF-8 are left out.
+        body.extend_from_slice(b"--XyZ\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n\x00\xff\xfe--not-a-boundary\r\n");
+        body.extend_from_slice(b"--XyZ\r\nContent-Disposition: form-data; name=\"raw\"\r\n\r\n\xff\xfe\x00\r\n");
+        body.extend_from_slice(b"--XyZ\r\nContent-Disposition: form-data; name=\"rawRequest\"\r\n\r\n{\"q3_email\":\"a&b@example.com\"}\r\n--XyZ--\r\n");
+        let form = block_on(multipart_as_form("multipart/form-data; boundary=XyZ", axum::body::Bytes::from(body.clone()))).unwrap();
+        let parsed = parse_body(Some("application/x-www-form-urlencoded"), &form);
+        assert_eq!(parsed, json!({"formID": "31751954731962", "submissionID": "2379550", "rawRequest": "{\"q3_email\":\"a&b@example.com\"}"}));
+        assert_eq!(block_on(multipart_as_form("multipart/form-data; boundary=\"XyZ\"", axum::body::Bytes::from(body.clone()))), Some(form));
+        assert_eq!(block_on(multipart_as_form("application/json", axum::body::Bytes::from(body.clone()))), None);
+        assert_eq!(block_on(multipart_as_form("multipart/form-data", axum::body::Bytes::from(body.clone()))), None, "no boundary");
+        // Broken framing (a part that never ends) isn't read as a form.
+        let broken = b"--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nno end".to_vec();
+        assert_eq!(block_on(multipart_as_form("multipart/form-data; boundary=XyZ", axum::body::Bytes::from(broken))), None);
+    }
+
+    #[test]
+    fn a_json_body_is_read_as_json() {
+        let body = r#"{"a":1}"#;
+        assert_eq!(parse_body(Some("application/json; charset=utf-8"), body), json!({"a": 1}));
+        // A parameter mentioning a form doesn't make a JSON body a form.
+        assert_eq!(parse_body(Some("application/json; profile=\"application/x-www-form-urlencoded\""), body), json!({"a": 1}));
+        assert_eq!(parse_body(Some("application/vnd.api+json"), body), json!({"a": 1}));
+        assert_eq!(parse_body(Some("application/x-www-form-urlencoded; charset=utf-8"), "a=1"), json!({"a": "1"}));
+    }
+
+    #[test]
+    fn cooldowns_follow_the_apps_own_headers() {
+        let h = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<Map<String, Value>>();
+        assert_eq!(cooldown(&h(&[("Retry-After", "30")]), None), Some(chrono::Duration::seconds(30)));
+        assert_eq!(cooldown(&h(&[("X-Rate-Limit-Time-Reset-Ms", "15000")]), None), Some(chrono::Duration::seconds(15)));
+        // ShipStation's seconds-to-reset header counts only where the recipe declares it…
+        assert_eq!(cooldown(&h(&[("X-Rate-Limit-Reset", "20")]), Some("X-Rate-Limit-Reset")), Some(chrono::Duration::seconds(20)));
+        assert_eq!(cooldown(&h(&[("X-Rate-Limit-Reset", "20")]), None), None, "undeclared, it's ignored");
+        // …and Retry-After keeps its precedence over it.
+        assert_eq!(cooldown(&h(&[("Retry-After", "30"), ("X-Rate-Limit-Reset", "999")]), Some("X-Rate-Limit-Reset")), Some(chrono::Duration::seconds(30)));
+        assert_eq!(cooldown(&h(&[("X-Rate-Limit-Reset", "999999")]), Some("X-Rate-Limit-Reset")), Some(chrono::Duration::hours(2)), "at most two hours");
+        assert_eq!(cooldown(&Map::new(), Some("X-Rate-Limit-Reset")), None);
+    }
 }

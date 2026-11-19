@@ -43,8 +43,10 @@ enum Sign {
     Webflow,
     /// base64 HMAC-SHA256 of `<ISO time>body` (Zendesk).
     Zendesk,
-    /// The secret itself in a header (BigCommerce custom headers, Gorgias).
+    /// The secret itself in a header (BigCommerce custom headers, Gorgias, Cloudbeds).
     Header(&'static str),
+    /// Not signed: the integration's URL is the secret (Eventbrite, Jotform, ShipStation).
+    Unsigned,
 }
 
 fn mac256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -80,6 +82,7 @@ fn sign(how: Sign, secret: &str, url: &str, body: &str) -> Vec<(String, String)>
             vec![("X-Zendesk-Webhook-Signature-Timestamp".into(), ts.clone()), ("X-Zendesk-Webhook-Signature".into(), b64(&mac256(secret.as_bytes(), format!("{ts}{body}").as_bytes())))]
         }
         Sign::Header(h) => vec![(h.into(), secret.into())],
+        Sign::Unsigned => vec![],
     }
 }
 
@@ -101,7 +104,9 @@ struct Installed {
 async fn install(h: &mut Harness, recipe: &'static str, sign: Sign, secret: &str, create_flows: bool) -> Installed {
     let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": recipe, "create_flows": create_flows}))).await;
     let id = created["integration"]["id"].as_str().unwrap().to_string();
-    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature_secret": secret}))).await;
+    if !matches!(sign, Sign::Unsigned) {
+        h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature_secret": secret}))).await;
+    }
     for f in created["flows"].as_array().unwrap() {
         assert_eq!(f["status"], "draft", "{recipe}: suggested flows start as drafts");
     }
@@ -1336,6 +1341,8 @@ async fn a_fetch_is_reserved_once_and_waits_for_room_and_the_vendors_cooldown() 
     b.post_as(&h, &body.to_string(), &json!({}), &json!({}), &b.secret).await;
     let wait: f64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM run_at - now())::float8 FROM jobs WHERE kind = 'integrations_fetch' ORDER BY run_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
     assert!((10.0..20.0).contains(&wait), "rescheduled after the 15-second reset: {wait}");
+    // The reset time passes (the wait holds for every lookup with these credentials until then).
+    sqlx::query("UPDATE integration_deliveries SET request = request - 'cooldown_until'").execute(&h.state.db).await.unwrap();
     retry_now(&h).await;
     assert_eq!(order_reads(&store, "219"), 2);
     assert_eq!(events(&h, "Placed Order").await, 2);
@@ -1631,5 +1638,843 @@ async fn keep_lists_keep_only_named_leaves_everywhere() {
     assert!(!shown.contains("NESTED-SECRET-1") && !shown.contains("503 555 0177"), "the dry run saw what would be stored only: {shown}");
     assert!(!shown.contains("Weekend stays"), "an object value keeps none of its leaves unless they're named: {shown}");
     assert!(shown.contains("Email"), "{shown}");
+    h.cleanup().await;
+}
+
+// ---------- Second round: Cloudbeds, Acuity, Eventbrite, Jotform, Gorgias, ShipStation ----------
+//
+// Every one of these fetches what its webhook names from the vendor's API (a local stand-in that
+// answers with the documented example bodies kept in the recipe's fixtures), and records only that.
+
+/// What a stand-in API saw: (the credential header it got, path with query) of each request.
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+/// How a stand-in API answers: (path, query) → (status, headers, body).
+type Answer = std::sync::Arc<dyn Fn(&str, &std::collections::HashMap<String, String>) -> (u16, Vec<(&'static str, String)>, Value) + Send + Sync>;
+
+/// Holds the stand-in's answer to one path until released: a request "in flight" for as long as
+/// a test needs.
+#[derive(Default)]
+struct Gate {
+    path: std::sync::Mutex<String>,
+    arrived: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn arm(&self, path: &str) {
+        *self.path.lock().unwrap() = path.to_string();
+        self.arrived.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_arrived(&self) {
+        for _ in 0..500 {
+            if self.arrived.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the held request never came");
+    }
+
+    fn open(&self) {
+        self.path.lock().unwrap().clear();
+        self.release.notify_waiters();
+    }
+}
+
+/// A stand-in for a vendor's API: every GET is noted (with its Authorization, x-api-key or APIKEY
+/// header) and answered by `answer`.
+async fn mock_api(answer: Answer) -> (Seen, String) {
+    mock_api_gated(answer, std::sync::Arc::new(Gate::default())).await
+}
+
+async fn mock_api_gated(answer: Answer, gate: std::sync::Arc<Gate>) -> (Seen, String) {
+    use axum::response::IntoResponse;
+    let seen: Seen = Default::default();
+    let noted = seen.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, uri: axum::http::Uri| {
+        let noted = noted.clone();
+        let answer = answer.clone();
+        let gate = gate.clone();
+        async move {
+            let cred = ["authorization", "x-api-key", "apikey"].iter().find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok())).unwrap_or("").to_string();
+            noted.lock().unwrap().push((cred, uri.path_and_query().map(|p| p.to_string()).unwrap_or_default()));
+            let held = { gate.path.lock().unwrap().clone() };
+            if !held.is_empty() && uri.path() == held {
+                let wait = gate.release.notified();
+                gate.arrived.store(true, std::sync::atomic::Ordering::SeqCst);
+                wait.await;
+            }
+            let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).into_owned().collect();
+            let (status, hdrs, body) = answer(uri.path(), &q);
+            let mut res = (StatusCode::from_u16(status).unwrap(), axum::Json(body)).into_response();
+            for (k, v) in hdrs {
+                res.headers_mut().insert(k, v.parse().unwrap());
+            }
+            res
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (seen, format!("http://{addr}"))
+}
+
+/// Point an installed recipe's API at the stand-in (same path), with credentials and settings.
+async fn wire(h: &mut Harness, inst: &Installed, base: &str, credentials: Value, settings: Option<Value>) {
+    let i = h.ok("GET", &format!("/api/integrations/{}", inst.id), None).await;
+    let mut pull = i["pull"].clone();
+    let url = pull["url"].as_str().unwrap().to_string();
+    let path = &url[url.find("://").map(|i| i + 3).unwrap()..];
+    pull["url"] = json!(format!("{base}{}", &path[path.find('/').unwrap()..]));
+    let mut body = json!({"pull": pull, "credentials": credentials});
+    if let Some(s) = settings {
+        body["settings"] = s;
+    }
+    h.ok("PATCH", &format!("/api/integrations/{}", inst.id), Some(body)).await;
+}
+
+/// An unsigned recipe's webhook sent to a URL that isn't the integration's: refused, nothing written.
+async fn wrong_url_refused(h: &Harness, inst: &Installed, body: &str) {
+    let before = count(h, "SELECT count(*) FROM integration_deliveries").await;
+    let path = format!("{}x", &inst.path()[..inst.path().len() - 1]);
+    let (s, _, _) = h.raw("POST", &path, &[("content-type", "application/json")], body).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{}: a guessed URL", inst.recipe);
+    assert_eq!(count(h, "SELECT count(*) FROM integration_deliveries").await, before);
+}
+
+/// Post a webhook as the vendor would, without running anything yet.
+async fn post_only(h: &Harness, inst: &Installed, body: &str) {
+    let mut hdrs: Vec<(String, String)> = vec![("content-type".into(), "application/json".into())];
+    hdrs.extend(sign(inst.sign, &inst.secret, &inst.url, body));
+    let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (s, _, r) = h.raw("POST", &inst.path(), &hdrs, body).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+}
+
+fn form_body(v: &Value) -> String {
+    let mut out = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in v.as_object().unwrap() {
+        out.append_pair(k, v.as_str().unwrap());
+    }
+    out.finish()
+}
+
+fn pt_day(days: i64) -> String {
+    (chrono::Utc::now().with_timezone(&chrono_tz::America::Los_Angeles).date_naive() + chrono::Duration::days(days)).format("%Y-%m-%d").to_string()
+}
+
+fn mail_to(h: &Harness, to: &str) -> String {
+    h.state.email.sent().into_iter().filter(|m| m.to == to).map(|m| format!("{} {}", m.subject, m.html)).collect()
+}
+
+// ---------- Cloudbeds ----------
+
+type Book = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Value>>>;
+
+/// A stand-in for Cloudbeds' API: getReservation answers from `book` (or `success: false`), and
+/// getReservations lists its confirmed reservations.
+async fn mock_cloudbeds(book: Book, gate: std::sync::Arc<Gate>) -> (Seen, String) {
+    mock_api_gated(
+        std::sync::Arc::new(move |path: &str, q: &std::collections::HashMap<String, String>| {
+            let book = book.lock().unwrap();
+            match path {
+                "/api/v1.3/getReservation" => match q.get("reservationID").and_then(|id| book.get(id)) {
+                    Some(r) => (200, vec![], json!({"success": true, "data": r})),
+                    None => (200, vec![], json!({"success": false, "message": "Reservation not found"})),
+                },
+                "/api/v1.3/getReservations" => {
+                    assert_eq!(q.get("status").map(String::as_str), Some("confirmed"));
+                    let rows: Vec<Value> = book.values().filter(|r| r["status"] == "confirmed").map(|r| json!({"reservationID": r["reservationID"], "propertyID": r["propertyID"], "status": "confirmed", "balance": r["balance"]})).collect();
+                    (200, vec![], json!({"success": true, "data": rows, "count": rows.len(), "total": rows.len()}))
+                }
+                _ => (404, vec![], json!({"success": false})),
+            }
+        }),
+        gate,
+    )
+    .await
+}
+
+fn cloudbeds_res(id: &str, email: &str, balance: f64, paid: f64, status: &str) -> Value {
+    let mut r = fixture("cloudbeds", "fetch-reservation-paid.json")["input"]["payload"]["data"].clone();
+    r["reservationID"] = json!(id);
+    r["guestEmail"] = json!(email);
+    r["status"] = json!(status);
+    r["balance"] = json!(balance);
+    r["balanceDetailed"]["paid"] = json!(paid);
+    r["startDate"] = json!(pt_day(2));
+    r["endDate"] = json!(pt_day(4));
+    r["guestList"]["55501"]["guestCellPhone"] = json!(format!("+1503555{id}"));
+    r
+}
+
+fn cloudbeds_hook(id: &str, event: &str) -> String {
+    let mut p = fixture("cloudbeds", "webhook-reservation-created.json")["input"]["payload"].clone();
+    p["reservationID"] = json!(id);
+    p["event"] = json!(event);
+    p.to_string()
+}
+
+async fn cloudbeds_paid(h: &Harness) -> Vec<String> {
+    let rows: Vec<(String, Option<Value>, Option<Value>)> = sqlx::query_as(
+        "SELECT o.external_id, o.fields->'paid_in_full', o.fields->'status' FROM objects o JOIN object_types t ON t.id = o.type_id WHERE t.key = 'cloudbeds_reservation' ORDER BY o.external_id",
+    )
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    rows.into_iter().map(|(k, p, s)| format!("{k}={}/{}", p.unwrap_or(Value::Null), s.unwrap_or(Value::Null).as_str().unwrap_or("-"))).collect()
+}
+
+#[tokio::test]
+async fn cloudbeds_records_exact_payment_evidence_and_never_reaches_guesty_flows() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let book: Book = Default::default();
+    let gate = std::sync::Arc::new(Gate::default());
+    let (seen, base) = mock_cloudbeds(book.clone(), gate.clone()).await;
+    // Guesty is installed too, with its booking flows live: none of them may act on a Cloudbeds booking.
+    let g = install(&mut h, "guesty", Sign::Unsigned, "", true).await;
+    for f in &g.flows {
+        let id = f["id"].as_str().unwrap();
+        let flow = h.ok("GET", &format!("/api/flows/{id}"), None).await;
+        let mut trigger = flow["trigger"].clone();
+        if trigger.get("hour").is_some() {
+            trigger["hour"] = json!(0);
+        }
+        h.ok("PATCH", &format!("/api/flows/{id}"), Some(json!({"trigger": trigger}))).await;
+        h.ok("POST", &format!("/api/flows/{id}/status"), Some(json!({"status": "live"}))).await;
+    }
+    let c = install(&mut h, "cloudbeds", Sign::Header("X-Webhook-Token"), "cb-webhook-token-0001", true).await;
+    assert!(c.flows.is_empty(), "Cloudbeds ships no pre-arrival starter");
+    wire(&mut h, &c, &base, json!({"api_key": "cb-api-key-0001"}), None).await;
+    live_flow(&mut h, "Cloudbeds Reservation Confirmed", "Thanks for booking", true).await;
+    {
+        let mut b = book.lock().unwrap();
+        b.insert("1001".into(), cloudbeds_res("1001", "robin.example@example.com", 0.0, 241.8, "confirmed"));
+        b.insert("1002".into(), cloudbeds_res("1002", "kit.example@example.com", 241.8, 0.0, "confirmed"));
+        b.insert("1003".into(), cloudbeds_res("1003", "dee.example@example.com", 0.0, 100.0, "confirmed"));
+        b.insert("1004".into(), cloudbeds_res("1004", "lee.example@example.com", 0.0, 241.8, "confirmed"));
+        b.insert("1005".into(), cloudbeds_res("1005", "sam.example@example.com", 241.8, 0.0, "confirmed"));
+        let mut no_grand = cloudbeds_res("1006", "max.example@example.com", 0.0, 241.8, "confirmed");
+        no_grand["balanceDetailed"].as_object_mut().unwrap().remove("grandTotal");
+        b.insert("1006".into(), no_grand);
+        b.insert("1007".into(), cloudbeds_res("1007", "ava.example@example.com", 0.0, 241.8, "canceled"));
+    }
+    c.refused(&h, "webhook-reservation-created.json").await;
+    for id in ["1001", "1002", "1003", "1004", "1005", "1006"] {
+        c.post_as(&h, &cloudbeds_hook(id, "reservation/created"), &json!({}), &json!({}), &c.secret).await;
+    }
+    // Duplicate: the same webhook again records nothing new.
+    c.post_as(&h, &cloudbeds_hook("1001", "reservation/created"), &json!({}), &json!({}), &c.secret).await;
+    // Out of order: Ava's reservation is cancelled by the time its (late) created webhook is fetched.
+    c.post_as(&h, &cloudbeds_hook("1007", "reservation/status_changed"), &json!({}), &json!({}), &c.secret).await;
+    c.post_as(&h, &cloudbeds_hook("1007", "reservation/created"), &json!({}), &json!({}), &c.secret).await;
+    assert_eq!(events(&h, "Cloudbeds Reservation Confirmed").await, 6, "one per reservation");
+    assert_eq!(events(&h, "Cloudbeds Reservation Cancelled").await, 1);
+    // Payments change with no reservation webhook: Lee's has a balance due again, Sam paid. The
+    // hourly check sets its window, then fetches every confirmed arrival again.
+    {
+        let mut b = book.lock().unwrap();
+        b.insert("1004".into(), cloudbeds_res("1004", "lee.example@example.com", 80.0, 161.8, "confirmed"));
+        b.insert("1005".into(), cloudbeds_res("1005", "sam.example@example.com", 0.0, 241.8, "confirmed"));
+    }
+    h.ok("POST", &format!("/api/integrations/{}/pull", c.id), Some(json!({}))).await;
+    h.drain().await;
+    assert_eq!(
+        cloudbeds_paid(&h).await,
+        [
+            "cloudbeds:1001=true/confirmed", "cloudbeds:1002=false/confirmed", "cloudbeds:1003=false/confirmed", "cloudbeds:1004=false/confirmed",
+            "cloudbeds:1005=true/confirmed", "cloudbeds:1006=false/confirmed", "cloudbeds:1007=false/canceled",
+        ],
+        "paid in full only on exact, complete evidence (Max's has no grand total)"
+    );
+    assert!(seen.lock().unwrap().iter().all(|(k, _)| k == "cb-api-key-0001"));
+
+    // Zed's reservation is fetched (the request is sent and held in flight), then deleted before
+    // the answer arrives: the answer, requested before the deletion was handled, can't bring it back.
+    book.lock().unwrap().insert("1008".into(), cloudbeds_res("1008", "zed.example@example.com", 0.0, 241.8, "confirmed"));
+    gate.arm("/api/v1.3/getReservation");
+    post_only(&h, &c, &cloudbeds_hook("1008", "reservation/created")).await;
+    let st = h.state.clone();
+    let in_flight = tokio::spawn(async move { dumbmail::jobs::drain(&st).await.unwrap() });
+    gate.wait_arrived().await;
+    book.lock().unwrap().remove("1008");
+    let mut deleted = fixture("cloudbeds", "webhook-deleted.json")["input"]["payload"].clone();
+    deleted["reservationId"] = json!("1008");
+    post_only(&h, &c, &deleted.to_string()).await;
+    h.drain().await;
+    gate.open();
+    in_flight.await.unwrap();
+    h.drain().await;
+    assert!(cloudbeds_paid(&h).await.contains(&"cloudbeds:1008=false/deleted".to_string()), "{:?}", cloudbeds_paid(&h).await);
+    // A later webhook for it: Cloudbeds doesn't return it, so it stays deleted…
+    c.post_as(&h, &cloudbeds_hook("1008", "reservation/status_changed"), &json!({}), &json!({}), &c.secret).await;
+    assert!(cloudbeds_paid(&h).await.contains(&"cloudbeds:1008=false/deleted".to_string()));
+    // …until Cloudbeds actually returns it again.
+    book.lock().unwrap().insert("1008".into(), cloudbeds_res("1008", "zed.example@example.com", 0.0, 241.8, "confirmed"));
+    c.post_as(&h, &cloudbeds_hook("1008", "reservation/status_changed"), &json!({}), &json!({}), &c.secret).await;
+    assert!(cloudbeds_paid(&h).await.contains(&"cloudbeds:1008=true/confirmed".to_string()));
+
+    // Guesty's flows (booking confirmation on Reservation Booked, review request on Reservation
+    // Confirmed, pre-arrival on reservation objects) never started for a Cloudbeds booking.
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE f.name LIKE 'Guesty%'").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM objects o JOIN object_types t ON t.id = o.type_id WHERE t.key = 'reservation'").await, 0);
+    for m in ["Reservation Booked", "Reservation Confirmed", "Reservation Cancelled"] {
+        assert_eq!(events(&h, m).await, 0, "{m}");
+    }
+    // No purchases, no revenue.
+    assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE name LIKE 'Cloudbeds%' AND purchase").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name LIKE 'Cloudbeds%' AND e.value IS NOT NULL AND e.value <> 0").await, 0);
+    // The service flow on Cloudbeds' own event reached the guests once each; they're held back from marketing.
+    assert_eq!(sent_to(&h, "Thanks for booking").len(), 7);
+    assert_eq!(consent(&h, "robin.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "robin.example@example.com").await);
+    let needles = sensitive("cloudbeds", &["fetch-reservation-paid.json"]);
+    let mail = mail_to(&h, "robin.example@example.com");
+    for n in &needles {
+        assert!(!mail.contains(n.as_str()), "{n:?} reached an email");
+    }
+    let mut stored = needles.clone();
+    stored.push("cb-api-key-0001".into());
+    never_stored(&mut h, &c, &stored, &["webhook-reservation-created.json", "webhook-notes-changed.json"]).await;
+    h.cleanup().await;
+}
+
+// ---------- Acuity Scheduling ----------
+
+#[tokio::test]
+async fn acuity_records_what_the_fetched_appointment_says() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let appt = std::sync::Arc::new(std::sync::Mutex::new(fixture("acuity", "fetch-scheduled.json")["input"]["payload"].clone()));
+    let a2 = appt.clone();
+    let (seen, base) = mock_api(std::sync::Arc::new(move |path: &str, _q: &std::collections::HashMap<String, String>| match path {
+        "/api/v1/appointments/54321" => (200, vec![], a2.lock().unwrap().clone()),
+        _ => (404, vec![], json!({"status_code": 404, "message": "Not Found"})),
+    }))
+    .await;
+    let a = install(&mut h, "acuity", Sign::Base64("X-Acuity-Signature"), "acuity-api-key-0001", false).await;
+    wire(&mut h, &a, &base, json!({"user_id": "11145481", "api_key": "acuity-api-key-0001"}), None).await;
+    live_flow(&mut h, "Appointment Scheduled", "See you at your appointment", true).await;
+    let form = |name: &str| form_body(&fixture("acuity", name)["input"]["payload"]);
+    let ct = json!({"content-type": "application/x-www-form-urlencoded"});
+    // A wrong signature is refused.
+    let body = form("webhook-scheduled.json");
+    let (s, _) = a.post_as(&h, &body, &ct, &json!({}), "not-the-key-0000").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    a.post_as(&h, &body, &ct, &json!({}), &a.secret).await;
+    // Acuity resends the same body: fetched again, recorded once.
+    a.post_as(&h, &body, &ct, &json!({}), &a.secret).await;
+    assert_eq!(events(&h, "Appointment Scheduled").await, 1);
+    appt.lock().unwrap()["datetime"] = json!("2013-06-18T09:00:00-0700");
+    a.post_as(&h, &form("webhook-rescheduled.json"), &ct, &json!({}), &a.secret).await;
+    assert_eq!(prop(&h, "Appointment Rescheduled", "datetime").await, vec!["2013-06-18T09:00:00-07:00"]);
+    // Cancelled; then a late "scheduled" webhook finds it cancelled and books nothing.
+    appt.lock().unwrap()["noShow"] = json!(false);
+    a.post_as(&h, &form("webhook-canceled.json"), &ct, &json!({}), &a.secret).await;
+    a.post_as(&h, &body, &ct, &json!({}), &a.secret).await;
+    for (m, n) in [("Appointment Scheduled", 1), ("Appointment Rescheduled", 1), ("Appointment Cancelled", 1)] {
+        assert_eq!(events(&h, m).await, n, "{m}");
+    }
+    let creds: Vec<String> = seen.lock().unwrap().iter().map(|(c, _)| c.clone()).collect();
+    let basic = format!("Basic {}", b64(b"11145481:acuity-api-key-0001"));
+    assert!(creds.iter().all(|c| *c == basic), "{creds:?}");
+    assert_eq!(sent_to(&h, "See you at your appointment"), vec!["bob.example@example.com"], "a service message, once");
+    assert_eq!(consent(&h, "bob.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "bob.example@example.com").await);
+    let mut needles = sensitive("acuity", &["fetch-scheduled.json"]);
+    needles.push("acuity-api-key-0001".into());
+    never_stored(&mut h, &a, &needles, &["fetch-scheduled.json"]).await;
+    h.cleanup().await;
+}
+
+// ---------- Eventbrite ----------
+
+/// A stand-in for Eventbrite's API: orders (with `expand=refund_requests`) and attendees.
+async fn mock_eventbrite() -> (Seen, String) {
+    let paid = fixture("eventbrite", "fetch-order-refunded.json")["input"]["payload"].clone();
+    let jpy = fixture("eventbrite", "fetch-order-zero-decimal.json")["input"]["payload"].clone();
+    let attendee = fixture("eventbrite", "fetch-attendee-checked-in.json")["input"]["payload"].clone();
+    mock_api(std::sync::Arc::new(move |path: &str, q: &std::collections::HashMap<String, String>| {
+        let order = |o: &Value, id: &str, email: &str, event: &str| {
+            assert_eq!(q.get("expand").map(String::as_str), Some("refund_requests"));
+            let mut o = o.clone();
+            o["id"] = json!(id);
+            o["email"] = json!(email);
+            o["event_id"] = json!(event);
+            for it in o["refund_requests"]["items"].as_array_mut().into_iter().flatten() {
+                if it["order_id"] == "1234567890" {
+                    it["order_id"] = json!(id);
+                }
+            }
+            (200, vec![], o)
+        };
+        match path {
+            "/v3/orders/1234567890/" => {
+                let mut o = paid.clone();
+                o.as_object_mut().unwrap().remove("refund_requests");
+                order(&o, "1234567890", "kennedy.example@example.com", "123456")
+            }
+            "/v3/orders/1234567891/" => order(&paid, "1234567891", "kennedy.example@example.com", "123456"),
+            "/v3/orders/3000/" => order(&jpy, "3000", "aiko.example@example.com", "123456"),
+            "/v3/orders/4000/" => order(&paid, "4000", "other.event@example.com", "999"),
+            "/v3/events/12345/attendees/12345/" => (200, vec![], attendee.clone()),
+            p if p.starts_with("/v3/orders/") => order(&paid, &p[11..p.len() - 1], &format!("buyer{}@example.com", &p[11..p.len() - 1]), "123456"),
+            _ => (404, vec![], json!({"status_code": 404, "error": "NOT_FOUND"})),
+        }
+    }))
+    .await
+}
+
+fn eventbrite_order_hook(id: &str, action: &str) -> String {
+    let mut p = fixture("eventbrite", "webhook-order-placed.json")["input"]["payload"].clone();
+    p["api_url"] = json!(format!("https://www.eventbriteapi.com/v3/orders/{id}/"));
+    p["config"]["action"] = json!(action);
+    p.to_string()
+}
+
+#[tokio::test]
+async fn eventbrite_records_money_only_from_verified_records_within_its_events() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let (seen, base) = mock_eventbrite().await;
+    let e = install(&mut h, "eventbrite", Sign::Unsigned, "", false).await;
+    wire(&mut h, &e, &base, json!({"token": "eb-private-token-0001"}), Some(json!({"event_ids": ["123456", "12345"]}))).await;
+    live_flow(&mut h, "Placed Order", "Your tickets", true).await;
+    wrong_url_refused(&h, &e, &eventbrite_order_hook("1234567890", "order.placed")).await;
+    for body in [eventbrite_order_hook("1234567890", "order.placed"), eventbrite_order_hook("1234567890", "order.placed")] {
+        e.post_as(&h, &body, &json!({}), &json!({}), "").await;
+    }
+    assert_eq!(values(&h, "Placed Order", "kennedy.example@example.com").await, vec![29.95], "from 2995 minor units, once");
+    assert_eq!(prop(&h, "Placed Order", "currency").await, vec!["CAD"]);
+    // A yen order: 3000 minor units is ¥3000.
+    e.post_as(&h, &eventbrite_order_hook("3000", "order.placed"), &json!({}), &json!({}), "").await;
+    assert_eq!(values(&h, "Placed Order", "aiko.example@example.com").await, vec![3000.0]);
+    // Refunds come from the processed items of the order's refund request, each once, for its own
+    // processed amount; pending and failed items, and another order's, aren't refunds.
+    e.post_as(&h, &eventbrite_order_hook("1234567891", "order.refunded"), &json!({}), &json!({}), "").await;
+    e.post_as(&h, &eventbrite_order_hook("1234567891", "order.updated"), &json!({}), &json!({}), "").await;
+    assert_eq!(values(&h, "Refunded Order", "kennedy.example@example.com").await, vec![14.97]);
+    // An order for an event that isn't in event_ids records nothing, whatever the webhook says.
+    e.post_as(&h, &eventbrite_order_hook("4000", "order.placed"), &json!({}), &json!({}), "").await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'other.event@example.com'").await, 0);
+    // A pointer anywhere but Eventbrite's API is never followed.
+    e.post(&h, "webhook-elsewhere.json").await;
+    e.post(&h, "webhook-checked-in.json").await;
+    e.post(&h, "webhook-barcode-checked-in.json").await;
+    assert_eq!(events(&h, "Checked In").await, 1);
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().all(|(c, _)| c == "Bearer eb-private-token-0001"), "{seen:?}");
+    assert!(seen.iter().all(|(_, p)| p.starts_with("/v3/")), "{seen:?}");
+    assert_eq!(sent_to(&h, "Your tickets"), vec!["aiko.example@example.com", "kennedy.example@example.com"]);
+    assert_eq!(consent(&h, "kennedy.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "kennedy.example@example.com").await);
+    let mut needles = sensitive("eventbrite", &["fetch-order-refunded.json", "fetch-attendee-checked-in.json"]);
+    needles.push("eb-private-token-0001".into());
+    never_stored(&mut h, &e, &needles, &["fetch-attendee-checked-in.json", "fetch-order-refunded.json"]).await;
+    h.cleanup().await;
+}
+
+/// Make the stand-in hour pass: requests sent so far count as sent two hours ago.
+async fn an_hour_passes(h: &Harness) {
+    sqlx::query("UPDATE integration_deliveries SET request = jsonb_set(request, '{sent_at}', to_jsonb((now() - interval '2 hours')::text)) WHERE request ? 'sent_at'").execute(&h.state.db).await.unwrap();
+}
+
+#[tokio::test]
+async fn over_the_hourly_budget_webhooks_wait_and_lose_nothing() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let (seen, base) = mock_eventbrite().await;
+    let e = install(&mut h, "eventbrite", Sign::Unsigned, "", false).await;
+    wire(&mut h, &e, &base, json!({"token": "eb-private-token-0001"}), Some(json!({"event_ids": ["123456"]}))).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", e.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["fetch"]["per_hour"] = json!(2);
+    h.ok("PATCH", &format!("/api/integrations/{}", e.id), Some(json!({"pull": pull}))).await;
+    for id in ["5001", "5002", "5003"] {
+        e.post_as(&h, &eventbrite_order_hook(id, "order.placed"), &json!({}), &json!({}), "").await;
+    }
+    let orders = |seen: &Seen| seen.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/v3/orders/")).count();
+    assert_eq!(orders(&seen), 2, "two requests this hour");
+    // Nothing failed and no try was used up: every webhook is done, and the third lookup waits for
+    // the hour to free up.
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'webhook' AND (status <> 'ok' OR error IS NOT NULL OR attempts > 1)").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending' AND (request->'fetch'->>'attempts')::int = 0 AND next_attempt_at > now() + interval '50 minutes'").await, 1);
+    // Due early (a retry sweep), it still waits.
+    retry_now(&h).await;
+    assert_eq!(orders(&seen), 2);
+    an_hour_passes(&h).await;
+    retry_now(&h).await;
+    assert_eq!(orders(&seen), 3);
+    for id in ["5001", "5002", "5003"] {
+        assert_eq!(values(&h, "Placed Order", &format!("buyer{id}@example.com")).await, vec![29.95], "{id}: recorded once");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn over_the_hourly_budget_a_pulls_lookups_wait_and_lose_nothing() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let book: Book = Default::default();
+    let (seen, base) = mock_cloudbeds(book.clone(), std::sync::Arc::new(Gate::default())).await;
+    let c = install(&mut h, "cloudbeds", Sign::Header("X-Webhook-Token"), "cb-webhook-token-0001", false).await;
+    wire(&mut h, &c, &base, json!({"api_key": "cb-api-key-0001"}), None).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", c.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["fetch"]["per_hour"] = json!(2);
+    h.ok("PATCH", &format!("/api/integrations/{}", c.id), Some(json!({"pull": pull}))).await;
+    for n in 1..=5 {
+        let id = format!("200{n}");
+        book.lock().unwrap().insert(id.clone(), cloudbeds_res(&id, &format!("guest{n}@example.com"), 0.0, 241.8, "confirmed"));
+    }
+    // The hourly check lists five arrivals: all five lookups are kept, two run now.
+    h.ok("POST", &format!("/api/integrations/{}/pull", c.id), Some(json!({}))).await;
+    h.drain().await;
+    let reads = |seen: &Seen| seen.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/api/v1.3/getReservation?")).count();
+    assert_eq!(reads(&seen), 2);
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'pull' AND error IS NOT NULL").await, 0, "no lookups were skipped");
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending'").await, 3);
+    an_hour_passes(&h).await;
+    retry_now(&h).await;
+    assert_eq!(reads(&seen), 4);
+    an_hour_passes(&h).await;
+    retry_now(&h).await;
+    assert_eq!(reads(&seen), 5);
+    assert_eq!(events(&h, "Cloudbeds Reservation Confirmed").await, 5, "each reservation once");
+    assert_eq!(cloudbeds_paid(&h).await.len(), 5);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_recipe_that_declares_no_budget_has_no_hourly_limit() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let (store, base) = mock_bigcommerce().await;
+    let b = bigcommerce_with_mock(&mut h, &base).await;
+    let (integration, account): (uuid::Uuid, uuid::Uuid) = sqlx::query_as("SELECT id, account_id FROM integrations WHERE id = $1::uuid").bind(&b.id).fetch_one(&h.state.db).await.unwrap();
+    // Two thousand lookups were already sent this hour.
+    sqlx::query(
+        "INSERT INTO integration_deliveries (id, integration_id, account_id, source, status, request, created_at)
+         SELECT gen_random_uuid(), $1, $2, 'fetch', 'ok', jsonb_build_object('sent_at', now() - interval '10 minutes'), now() - interval '10 minutes' FROM generate_series(1, 2000)",
+    )
+    .bind(integration)
+    .bind(account)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    b.post(&h, "webhook-order-created.json").await;
+    assert_eq!(order_reads(&store, "218"), 1, "BigCommerce declares no budget: the order is read at once");
+    assert_eq!(events(&h, "Placed Order").await, 1);
+    h.cleanup().await;
+}
+
+// ---------- Jotform ----------
+
+fn multipart(fields: &Value) -> (String, String) {
+    let boundary = "------------------------d74496d66958873e";
+    let mut body = String::new();
+    for (k, v) in fields.as_object().unwrap() {
+        body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{}\r\n", v.as_str().unwrap()));
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+#[tokio::test]
+async fn jotform_submissions_are_fetched_never_subscribe_and_never_rename_anyone() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    // Someone who was already here.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "bart.example@example.com", "first_name": "Bartholomew"}))).await;
+    let sub = fixture("jotform", "fetch-submission.json")["input"]["payload"].clone();
+    let (seen, base) = mock_api(std::sync::Arc::new(move |path: &str, _q: &std::collections::HashMap<String, String>| match path {
+        "/submission/237955080346633702" => (200, vec![], sub.clone()),
+        "/submission/237955080346633703" => (200, vec![], {
+            let mut s = sub.clone();
+            s["content"]["id"] = json!("237955080346633703");
+            s["content"]["answers"]["5"]["answer"] = json!("new.respondent@example.com");
+            s
+        }),
+        _ => (404, vec![], json!({"responseCode": 404, "message": "Submission not found"})),
+    }))
+    .await;
+    let j = install(&mut h, "jotform", Sign::Unsigned, "", false).await;
+    let settings = fixture("jotform", "fetch-submission.json")["input"]["settings"].clone();
+    wire(&mut h, &j, &base, json!({"api_key": "jf-api-key-0001"}), Some(settings)).await;
+    live_flow(&mut h, "Form Submitted", "Thanks for writing", false).await;
+    let hook = fixture("jotform", "webhook-submission.json")["input"]["payload"].clone();
+    wrong_url_refused(&h, &j, &hook.to_string()).await;
+    let (ct, body) = multipart(&hook);
+    let hdr = json!({"content-type": ct});
+    j.post_as(&h, &body, &hdr, &json!({}), "").await;
+    // Jotform resends: fetched again, recorded once.
+    j.post_as(&h, &body, &hdr, &json!({}), "").await;
+    let mut other = hook.clone();
+    other["submissionID"] = json!("237955080346633703");
+    let (ct2, body2) = multipart(&other);
+    j.post_as(&h, &body2, &json!({"content-type": ct2}), &json!({}), "").await;
+    // A made-up submission id: Jotform has no such submission, so nothing is recorded.
+    let mut forged = hook.clone();
+    forged["submissionID"] = json!("999999999999999999");
+    forged["rawRequest"] = json!("{\"q5_email\":\"victim@example.com\"}");
+    let (ct3, body3) = multipart(&forged);
+    j.post_as(&h, &body3, &json!({"content-type": ct3}), &json!({}), "").await;
+    assert_eq!(events(&h, "Form Submitted").await, 2);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'victim@example.com'").await, 0);
+    assert_eq!(prop(&h, "Form Submitted", "marketing_consent").await, vec!["true", "true"], "the consent answer is recorded…");
+    // Only answers of safe types are copied, as values: the address and the free-text message
+    // listed in copy_fields aren't, and Jotform's formatted text is never kept.
+    let answers: Vec<Value> = sqlx::query_scalar("SELECT e.properties->'answers' FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Form Submitted'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(answers, vec![json!({"3": "Bart Example", "7": "Surfing"}); 2]);
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE body LIKE '%prettyFormat%' OR body LIKE '%control_address%' OR body LIKE '%control_textarea%'").await, 0);
+    // …but nobody is subscribed, the existing profile kept its name, and the new one is held.
+    let (name, cons): (Option<String>, String) = sqlx::query_as("SELECT first_name, email_consent FROM profiles WHERE email = 'bart.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((name.as_deref(), cons.as_str()), (Some("Bartholomew"), "never_subscribed"));
+    assert_eq!(consent(&h, "new.respondent@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "new.respondent@example.com").await);
+    // The marketing flow on Form Submitted reached the existing (unheld) person, not the held one.
+    assert_eq!(sent_to(&h, "Thanks for writing"), vec!["bart.example@example.com"]);
+    assert!(seen.lock().unwrap().iter().all(|(c, _)| c == "jf-api-key-0001"));
+    // The message (in rawRequest and the fetched answers) and the IP are never stored or shown.
+    let mut needles = sensitive("jotform", &["fetch-submission.json"]);
+    needles.push("jf-api-key-0001".into());
+    never_stored(&mut h, &j, &needles, &["webhook-submission.json", "fetch-submission.json"]).await;
+    h.cleanup().await;
+}
+
+// ---------- Gorgias ----------
+
+#[tokio::test]
+async fn gorgias_tickets_keep_only_subject_status_and_score() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let ticket = std::sync::Arc::new(std::sync::Mutex::new(fixture("gorgias", "fetch-ticket-open.json")["input"]["payload"].clone()));
+    let t2 = ticket.clone();
+    let (seen, base) = mock_api(std::sync::Arc::new(move |path: &str, _q: &std::collections::HashMap<String, String>| match path {
+        "/api/tickets/4242" => (200, vec![], t2.lock().unwrap().clone()),
+        _ => (404, vec![], json!({"error": {"msg": "Resource not found"}})),
+    }))
+    .await;
+    let g = install(&mut h, "gorgias", Sign::Header("X-Webhook-Token"), "gorgias-token-0001", false).await;
+    wire(&mut h, &g, &base, json!({"email": "agent@example.com", "api_key": "gorgias-api-key-0001"}), None).await;
+    live_flow(&mut h, "Ticket Closed", "How did we do", true).await;
+    g.refused(&h, "webhook-ticket.json").await;
+    g.post(&h, "webhook-ticket.json").await;
+    g.post(&h, "webhook-ticket.json").await;
+    assert_eq!(events(&h, "Ticket Created").await, 1);
+    *ticket.lock().unwrap() = fixture("gorgias", "fetch-ticket-closed.json")["input"]["payload"].clone();
+    g.post(&h, "webhook-ticket.json").await;
+    *ticket.lock().unwrap() = fixture("gorgias", "fetch-ticket-rated.json")["input"]["payload"].clone();
+    g.post(&h, "webhook-ticket.json").await;
+    // A resent request after all that: the ticket is fetched again, and nothing is recorded twice.
+    g.post(&h, "webhook-ticket.json").await;
+    for (m, n) in [("Ticket Created", 1), ("Ticket Closed", 1), ("Satisfaction Rated", 1)] {
+        assert_eq!(events(&h, m).await, n, "{m}");
+    }
+    assert_eq!(prop(&h, "Satisfaction Rated", "score").await, vec!["2"]);
+    assert_eq!(prop(&h, "Ticket Closed", "subject").await, vec!["Where is my order?"]);
+    let basic = format!("Basic {}", b64(b"agent@example.com:gorgias-api-key-0001"));
+    assert!(seen.lock().unwrap().iter().all(|(c, _)| *c == basic));
+    assert_eq!(sent_to(&h, "How did we do"), vec!["jo.example@example.com"]);
+    // The customer's name isn't taken; they're held back from marketing.
+    let name: Option<String> = sqlx::query_scalar("SELECT first_name FROM profiles WHERE email = 'jo.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(name, None);
+    assert_eq!(consent(&h, "jo.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "jo.example@example.com").await);
+    let mut needles = sensitive("gorgias", &["fetch-ticket-open.json", "fetch-ticket-rated.json"]);
+    needles.push("gorgias-api-key-0001".into());
+    never_stored(&mut h, &g, &needles, &["fetch-ticket-rated.json"]).await;
+    h.cleanup().await;
+}
+
+// ---------- ShipStation ----------
+
+/// A stand-in for ShipStation's API: `/shipments?batchId=…&page=…` from `batches` (batch id →
+/// pages of shipments), `/orders/{id}` with the customer's email and store (999 for orders in
+/// `other_store`), and a 429 with `X-Rate-Limit-Reset` for the first `limited` order reads.
+struct MockShipStation {
+    batches: std::sync::Mutex<std::collections::HashMap<String, Vec<Vec<Value>>>>,
+    limited: std::sync::atomic::AtomicUsize,
+    other_store: Vec<u64>,
+    /// Orders answered 404 once (not readable yet).
+    not_yet: std::sync::Mutex<Vec<u64>>,
+}
+
+async fn mock_shipstation(m: std::sync::Arc<MockShipStation>, gate: std::sync::Arc<Gate>) -> (Seen, String) {
+    let template = fixture("shipstation", "fetch-order.json")["input"]["payload"].clone();
+    mock_api_gated(
+        std::sync::Arc::new(move |path: &str, q: &std::collections::HashMap<String, String>| {
+            if path == "/shipments" {
+                let batches = m.batches.lock().unwrap();
+                let Some(pages) = q.get("batchId").and_then(|b| batches.get(b)) else { return (200, vec![], json!({"shipments": [], "total": 0, "page": 1, "pages": 0})) };
+                let page: usize = q.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+                let rows = pages.get(page - 1).cloned().unwrap_or_default();
+                return (200, vec![], json!({"shipments": rows, "total": pages.iter().map(Vec::len).sum::<usize>(), "page": page, "pages": pages.len()}));
+            }
+            if let Some(id) = path.strip_prefix("/orders/") {
+                if m.limited.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    m.limited.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return (429, vec![("X-Rate-Limit-Limit", "40".to_string()), ("X-Rate-Limit-Remaining", "0".to_string()), ("X-Rate-Limit-Reset", "20".to_string())], json!({"message": "Too Many Requests"}));
+                }
+                let id: u64 = id.parse().unwrap();
+                {
+                    let mut later = m.not_yet.lock().unwrap();
+                    if let Some(i) = later.iter().position(|x| *x == id) {
+                        later.remove(i);
+                        return (404, vec![], json!({"message": "Not Found"}));
+                    }
+                }
+                let mut o = template.clone();
+                o["orderId"] = json!(id);
+                o["customerEmail"] = json!(format!("buyer{id}@example.com"));
+                o["advancedOptions"]["storeId"] = json!(if m.other_store.contains(&id) { 999 } else { 123456 });
+                return (200, vec![], o);
+            }
+            (404, vec![], json!({"message": "Not Found"}))
+        }),
+        gate,
+    )
+    .await
+}
+
+fn shipment(id: u64, order: u64) -> Value {
+    let mut s = fixture("shipstation", "fetch-shipments-first-page.json")["input"]["payload"]["shipments"][0].clone();
+    s["shipmentId"] = json!(id);
+    s["orderId"] = json!(order);
+    s["trackingNumber"] = json!(format!("TRK{id}"));
+    s
+}
+
+fn ship_notify(batch: &str) -> String {
+    json!({"resource_url": format!("https://ssapi.shipstation.com/shipments?storeID=123456&batchId={batch}"), "resource_type": "SHIP_NOTIFY"}).to_string()
+}
+
+async fn install_shipstation(h: &mut Harness, base: &str) -> Installed {
+    let s = install(h, "shipstation", Sign::Unsigned, "", true).await;
+    wire(h, &s, base, json!({"api_key": "ss-key-0001", "api_secret": "ss-secret-0001"}), Some(json!({"store_ids": ["123456"]}))).await;
+    s
+}
+
+fn shipstation_order_reads(seen: &Seen) -> usize {
+    seen.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/orders/")).count()
+}
+
+#[tokio::test]
+async fn shipstation_reads_its_stores_batches_and_waits_out_its_rate_limit() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let first = fixture("shipstation", "fetch-shipments-first-page.json")["input"]["payload"]["shipments"].as_array().unwrap().clone();
+    let mut page2 = vec![shipment(33974399, 43999999), shipment(33974398, 43000099)];
+    page2[0]["trackingNumber"] = json!("9400111899561704681189");
+    let m = std::sync::Arc::new(MockShipStation { batches: Default::default(), limited: std::sync::atomic::AtomicUsize::new(1), other_store: vec![43000099], not_yet: Default::default() });
+    m.batches.lock().unwrap().insert("12345678".into(), vec![first, page2]);
+    // A batch of 51 pages: more than one webhook can read.
+    m.batches.lock().unwrap().insert("777".into(), (0..51).map(|i| vec![shipment(70000 + i, 80000 + i)]).collect());
+    let (seen, base) = mock_shipstation(m.clone(), std::sync::Arc::new(Gate::default())).await;
+    let s = install_shipstation(&mut h, &base).await;
+    let shipped = s.flow("order shipped");
+    h.ok("POST", &format!("/api/flows/{shipped}/status"), Some(json!({"status": "live"}))).await;
+    wrong_url_refused(&h, &s, &fixture("shipstation", "webhook-ship-notify.json")["input"]["payload"].to_string()).await;
+    s.post(&h, "webhook-other-store.json").await;
+    s.post(&h, "webhook-ship-notify.json").await;
+    // ShipStation answered the first order read with 429 and 20 seconds to wait: every waiting
+    // lookup for these credentials waits too (the batch's other orders and its second page).
+    assert_eq!(shipstation_order_reads(&seen), 1);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/shipments") && p.contains("page=2")).count(), 0);
+    let until: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT max((request->>'cooldown_until')::timestamptz) FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    let wait = until - chrono::Utc::now();
+    assert!(wait > chrono::Duration::seconds(10) && wait <= chrono::Duration::seconds(20), "{wait:?}");
+    retry_now(&h).await;
+    assert_eq!(shipstation_order_reads(&seen), 1, "still waiting");
+    // The 20 seconds pass.
+    sqlx::query("UPDATE integration_deliveries SET request = request - 'cooldown_until'").execute(&h.state.db).await.unwrap();
+    retry_now(&h).await;
+    // Page 1: orders 43945660 and 43337328 (two shipments); page 2: order 43999999, and an order
+    // from another store (not recorded). Voided and return labels aren't shipments.
+    assert_eq!(events(&h, "Order Shipped").await, 4);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'buyer43000099@example.com'").await, 0);
+    // ShipStation resends the webhook: everything is read again, recorded once.
+    s.post(&h, "webhook-item-ship-notify.json").await;
+    retry_now(&h).await;
+    assert_eq!(events(&h, "Order Shipped").await, 4);
+    // A batch too big for one webhook fails, visibly, instead of being cut short.
+    s.post_as(&h, &ship_notify("777"), &json!({}), &json!({}), "").await;
+    let failed: String = sqlx::query_scalar("SELECT error FROM integration_deliveries WHERE source = 'fetch' AND status = 'error' AND error LIKE '%51 pages%'").fetch_one(&h.state.db).await.unwrap();
+    assert!(failed.contains("at most 50"), "{failed}");
+    assert_eq!(shipstation_order_reads(&seen), 5 + 4, "no order of the big batch was read");
+    let basic = format!("Basic {}", b64(b"ss-key-0001:ss-secret-0001"));
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().all(|(c, _)| *c == basic), "{seen:?}");
+    // One email per person at a time: the order shipped in two parts gets one.
+    assert_eq!(sent_to(&h, "Your order"), vec!["buyer43337328@example.com", "buyer43945660@example.com", "buyer43999999@example.com"]);
+    assert_eq!(consent(&h, "buyer43945660@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "buyer43945660@example.com").await);
+    let needles = sensitive("shipstation", &["fetch-shipments-first-page.json", "fetch-order.json"]);
+    never_stored(&mut h, &s, &[needles, vec!["ss-secret-0001".into()]].concat(), &["fetch-order.json"]).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn shipstation_never_loses_a_shipment_when_batches_overlap_and_keeps_its_rate() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let m = std::sync::Arc::new(MockShipStation { batches: Default::default(), limited: std::sync::atomic::AtomicUsize::new(0), other_store: vec![], not_yet: std::sync::Mutex::new(vec![60]) });
+    {
+        let mut b = m.batches.lock().unwrap();
+        b.insert("1".into(), vec![vec![shipment(501, 50)]]);
+        b.insert("2".into(), vec![vec![shipment(502, 50)]]);
+        b.insert("3".into(), vec![vec![shipment(601, 60)]]);
+        b.insert("4".into(), vec![vec![shipment(602, 60)]]);
+        b.insert("5".into(), vec![(1..=4).map(|i| shipment(700 + i, 70 + i)).collect()]);
+    }
+    let gate = std::sync::Arc::new(Gate::default());
+    let (seen, base) = mock_shipstation(m.clone(), gate.clone()).await;
+    let s = install_shipstation(&mut h, &base).await;
+    // Two batches name the same order while its lookup waits: both shipments are recorded.
+    post_only(&h, &s, &ship_notify("1")).await;
+    post_only(&h, &s, &ship_notify("2")).await;
+    h.drain().await;
+    assert_eq!(prop(&h, "Order Shipped", "shipment_id").await.len(), 2);
+    // A second batch names the order while its lookup is claimed (a worker is fetching it): its
+    // lookup is its own piece of work, so the claimed one keeps its shipment and both are recorded.
+    s.post_as(&h, &ship_notify("3"), &json!({}), &json!({}), "").await;
+    let claimed: uuid::Uuid = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending' AND next_attempt_at IS NOT NULL").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE integration_deliveries SET request = request || jsonb_build_object('claimed_until', now() + interval '2 minutes') WHERE id = $1").bind(claimed).execute(&h.state.db).await.unwrap();
+    s.post_as(&h, &ship_notify("4"), &json!({}), &json!({}), "").await;
+    sqlx::query("UPDATE integration_deliveries SET request = request - 'claimed_until' WHERE id = $1").bind(claimed).execute(&h.state.db).await.unwrap();
+    retry_now(&h).await;
+    let mut ids = prop(&h, "Order Shipped", "shipment_id").await;
+    ids.sort();
+    assert_eq!(ids, vec!["501", "502", "601", "602"]);
+    // The credentials' rate: at most `per_minute` requests a minute; the rest wait their turn.
+    let i = h.ok("GET", &format!("/api/integrations/{}", s.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["fetch"]["per_minute"] = json!(2);
+    h.ok("PATCH", &format!("/api/integrations/{}", s.id), Some(json!({"pull": pull}))).await;
+    sqlx::query("UPDATE integration_deliveries SET request = jsonb_set(request, '{sent_at}', to_jsonb((now() - interval '5 minutes')::text)) WHERE request ? 'sent_at'").execute(&h.state.db).await.unwrap();
+    let before = seen.lock().unwrap().len();
+    s.post_as(&h, &ship_notify("5"), &json!({}), &json!({}), "").await;
+    assert_eq!(seen.lock().unwrap().len() - before, 2, "the batch and one order this minute");
+    let waiting: i64 = count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending' AND next_attempt_at > now() + interval '30 seconds'").await;
+    assert_eq!(waiting, 3);
+    for _ in 0..3 {
+        sqlx::query("UPDATE integration_deliveries SET request = jsonb_set(request, '{sent_at}', to_jsonb((now() - interval '5 minutes')::text)) WHERE request ? 'sent_at'").execute(&h.state.db).await.unwrap();
+        retry_now(&h).await;
+    }
+    assert_eq!(events(&h, "Order Shipped").await, 8);
     h.cleanup().await;
 }

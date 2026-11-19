@@ -1,0 +1,21 @@
+{
+  "description": "A batch for a store that isn't in store_ids is never looked up",
+  "doc": "https://help.shipstation.com/hc/en-us/articles/360025856252-ShipStation-Webhooks (example payload)",
+  "expect": [
+    {
+      "message": "ignored a batch for another store (999)",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "resource_type": "SHIP_NOTIFY",
+      "resource_url": "https://ssapi.shipstation.com/shipments?storeID=999&batchId=12345678"
+    },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
+    }
+  }
+}
