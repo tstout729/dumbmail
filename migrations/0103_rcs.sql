@@ -46,6 +46,10 @@ CREATE TABLE rcs_messages (
     from_number     text NOT NULL,
     sms_body        text NOT NULL,
     payload         jsonb NOT NULL,
+    -- Which Telnyx credentials sent it (the settings' short hash). Its status events count only
+    -- while the account still uses those credentials, so a key the account controls later can't
+    -- report a platform-sent message failed (a refund and a free fallback).
+    creds_key       text NOT NULL,
     -- The marketing rules it was sent under (the fallback's last check applies the same ones).
     strict          boolean NOT NULL DEFAULT false,
     is_test         boolean NOT NULL DEFAULT false,

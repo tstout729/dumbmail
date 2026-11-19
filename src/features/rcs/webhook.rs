@@ -111,11 +111,12 @@ struct Known {
     message_id: Uuid,
     agent_id: String,
     is_test: bool,
+    creds_key: String,
 }
 
 async fn status(state: &AppState, account_id: Uuid, kind: &str, p: &Value, occurred: Option<DateTime<Utc>>) -> AppResult<StatusCode> {
     let Some(id) = p["id"].as_str().filter(|s| !s.is_empty() && s.len() <= 100) else { return Ok(StatusCode::OK) };
-    let known: Option<Known> = sqlx::query_as("SELECT message_id, agent_id, is_test FROM rcs_messages WHERE rcs_provider_id = $1 AND account_id = $2")
+    let known: Option<Known> = sqlx::query_as("SELECT message_id, agent_id, is_test, creds_key FROM rcs_messages WHERE rcs_provider_id = $1 AND account_id = $2")
         .bind(id)
         .bind(account_id)
         .fetch_optional(&state.db)
@@ -126,6 +127,13 @@ async fn status(state: &AppState, account_id: Uuid, kind: &str, p: &Value, occur
         let failure = matches!(p["to"][0]["status"].as_str(), Some("sending_failed" | "delivery_failed"));
         return Ok(if fresh && failure { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK });
     };
+    // The key that verified this event belongs to the account's current Telnyx connection: it
+    // speaks only for messages that connection sent.
+    let current = super::settings::creds(state, account_id).await?.ok().map(|c| c.fingerprint());
+    if current.as_deref() != Some(k.creds_key.as_str()) {
+        tracing::warn!(account = %account_id, "RCS status for a message sent through a different Telnyx connection; ignored");
+        return Ok(StatusCode::OK);
+    }
     if p["from"]["agent_id"].as_str().is_some_and(|a| a != k.agent_id) {
         tracing::warn!(account = %account_id, "RCS status for a different agent than the message's; ignored");
         return Ok(StatusCode::OK);

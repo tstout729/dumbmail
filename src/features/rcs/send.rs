@@ -91,8 +91,8 @@ pub async fn hand_off(state: &AppState, spec: &SendSpec<'_>, plan: &Plan, sms: &
     // The record comes first, and only while RCS is still on for this agent. An existing record
     // means an earlier attempt already went to Telnyx: never again.
     let written: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO rcs_messages (message_id, account_id, agent_id, to_number, from_number, sms_body, payload, strict, is_test)
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM rcs_settings s WHERE s.account_id = $2 AND s.enabled AND s.checked_agent_id = $3
+        "INSERT INTO rcs_messages (message_id, account_id, agent_id, to_number, from_number, sms_body, payload, strict, is_test, creds_key)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 FROM rcs_settings s WHERE s.account_id = $2 AND s.enabled AND s.checked_agent_id = $3 AND s.checked_key = $10
          ON CONFLICT (message_id) DO NOTHING RETURNING message_id",
     )
     .bind(sms.message_id)
@@ -104,6 +104,7 @@ pub async fn hand_off(state: &AppState, spec: &SendSpec<'_>, plan: &Plan, sms: &
     .bind(&body)
     .bind(strict)
     .bind(spec.is_test)
+    .bind(a.creds.fingerprint())
     .fetch_optional(&state.db)
     .await?;
     if written.is_none() {
@@ -255,6 +256,10 @@ pub async fn fallback(state: &AppState, message_id: Uuid) -> anyhow::Result<()> 
         Some(Stop::Skip("profile deleted"))
     } else if r.campaign_id.is_some() && matches!(campaign.as_deref(), Some("cancelled") | None) {
         Some(Stop::Skip("campaign cancelled"))
+    } else if provider.is_none() {
+        Some(Stop::Skip("texting isn't set up"))
+    } else if !funded {
+        Some(Stop::Skip("insufficient credit"))
     } else if r.is_test {
         None
     } else if consent.as_deref() != Some("subscribed") {
@@ -263,10 +268,6 @@ pub async fn fallback(state: &AppState, message_id: Uuid) -> anyhow::Result<()> 
         Some(Stop::Skip("their number changed"))
     } else if r.strict && held {
         Some(Stop::Skip(crate::marketing_hold::SKIP_REASON))
-    } else if provider.is_none() {
-        Some(Stop::Skip("texting isn't set up"))
-    } else if !funded {
-        Some(Stop::Skip("insufficient credit"))
     } else {
         let tz: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
         let ((s, e), skip_conflicts) = crate::features::sendtime::settings::window_from(start.zip(end), conflict.as_deref());
@@ -278,7 +279,6 @@ pub async fn fallback(state: &AppState, message_id: Uuid) -> anyhow::Result<()> 
             hours.wait.map(Stop::Wait)
         }
     };
-    let stop = stop.or_else(|| provider.is_none().then_some(Stop::Skip("texting isn't set up")));
     match stop {
         Some(Stop::Wait(until)) => {
             // Quiet hours: the fallback waits for the window (still queued; checked again then).
