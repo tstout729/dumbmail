@@ -315,9 +315,10 @@ async fn create(state: &AppState, st: &Start<'_>, s: &Settings) -> AppResult<Res
     let tools = json!({"orders": st.who.orders.key(), "list": tools_for(st.who.orders)});
     let id = Uuid::now_v7();
     let token = (st.place != "sms").then(|| crate::auth::random_token(24));
-    let ip = st.ip.map(|i| ip_hash(state, i));
+    // Visitors with no readable address share one bucket (the limit never fails open).
+    let ip = matches!(st.place, "hub" | "site").then(|| ip_hash(state, st.ip.unwrap_or("unknown")));
     let mut tx = state.db.begin().await?;
-    if let (Some(ip), true) = (&ip, matches!(st.place, "hub" | "site")) {
+    if let Some(ip) = &ip {
         let ok: Option<i32> = sqlx::query_scalar(
             "INSERT INTO agent_visitor_usage (ip_hash, hour, conversations) VALUES ($1, date_trunc('hour', now()), 1)
              ON CONFLICT (ip_hash, hour) DO UPDATE SET conversations = agent_visitor_usage.conversations + 1 WHERE agent_visitor_usage.conversations < $2

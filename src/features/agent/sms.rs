@@ -21,6 +21,20 @@ pub const JOB: &str = "agent_sms_answer";
 /// The longest text the agent sends.
 const MAX_REPLY_CHARS: usize = 640;
 
+/// The model's words as they must reach the texter: automatic texts are rendered as message
+/// templates, so template markers (`{{ }}`, `{% %}`, `{# #}`) are broken up and can never run a
+/// tag (a coupon code, a link, someone's details), whatever a page or a shopper got the model to say.
+pub fn plain_text(s: &str) -> String {
+    let mut out = s.to_string();
+    loop {
+        let next = out.replace("{{", "{ {").replace("}}", "} }").replace("{%", "{ %").replace("%}", "% }").replace("{#", "{ #").replace("#}", "# }");
+        if next == out {
+            return out;
+        }
+        out = next;
+    }
+}
+
 /// Whether the agent answers this text (its job is queued; the inbox's default reply doesn't go).
 pub async fn take(state: &AppState, rx: &Received) -> AppResult<bool> {
     if !rx.verified || rx.from == rx.to || rx.text.trim().is_empty() {
@@ -113,9 +127,23 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         return crate::features::inbox::replies::default_reply(state, &rx).await.map_err(|e| anyhow::anyhow!(e.public_message()));
     }
     let Some(reply) = out.reply.filter(|r| !r.trim().is_empty()) else { return Ok(()) };
-    let reply: String = reply.chars().take(MAX_REPLY_CHARS).collect();
+    let reply = plain_text(&reply.chars().take(MAX_REPLY_CHARS).collect::<String>());
     crate::features::inbox::replies::queue_auto(state, &rx, "agent_reply", &reply, None, json!({"agent_conversation": out.conversation_id}))
         .await
         .map_err(|e| anyhow::anyhow!(e.public_message()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replies_never_carry_template_tags() {
+        for s in ["{% coupon_code 'VIP' %}", "{{ person.email }}", "{{{ x }}}", "{#{% raw %}#}", "%}}{{%"] {
+            let p = plain_text(s);
+            assert!(!["{{", "}}", "{%", "%}", "{#", "#}"].iter().any(|m| p.contains(m)), "{s} -> {p}");
+        }
+        assert_eq!(plain_text("Use code SAVE10 at {store}"), "Use code SAVE10 at {store}");
+    }
 }
