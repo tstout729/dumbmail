@@ -15,6 +15,9 @@ use uuid::Uuid;
 use super::consent::{self, ConsentSource, ConsentState};
 use crate::error::{AppError, AppResult};
 
+/// A message claimed longer ago than this was abandoned by its worker (sends are bounded far below it).
+pub const STALE_CLAIM_MINUTES: i32 = 15;
+
 /// What a merge does with the merged-away profile's rows in one table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnMerge {
@@ -150,6 +153,8 @@ struct Row {
     sms_suppressed_reason: Option<String>,
     ads_opt_out: bool,
     marketing_hold: bool,
+    /// Opted out of ads by the flag or by a property ad audiences read (`opted_out_sql`).
+    ads_effective: bool,
     created_at: DateTime<Utc>,
     last_event_at: Option<DateTime<Utc>>,
 }
@@ -249,9 +254,12 @@ fn combine(keep: &Row, other: &Row, choices: &HashMap<String, String>) -> AppRes
         sms_consent: stricter_consent(&keep.sms_consent, &other.sms_consent).to_string(),
         email_suppressed_reason: stronger_suppression(keep.email_suppressed_reason.clone(), other.email_suppressed_reason.clone()),
         sms_suppressed_reason: stronger_suppression(keep.sms_suppressed_reason.clone(), other.sms_suppressed_reason.clone()),
-        ads_opt_out: keep.ads_opt_out || other.ads_opt_out,
+        // An ad opt-out either side had, by the flag or by a property, stays (as the flag, so no
+        // property the kept profile wins on can drop it).
+        ads_opt_out: keep.ads_effective || other.ads_effective,
         // Held if either was (the database lets go of it when the merged email consent is subscribed).
         marketing_hold: keep.marketing_hold || other.marketing_hold,
+        ads_effective: keep.ads_effective || other.ads_effective,
         created_at: keep.created_at.min(other.created_at),
         last_event_at: keep.last_event_at.max(other.last_event_at),
     };
@@ -275,7 +283,10 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
     }
     let salt = super::privacy::salt(db, account_id).await?;
     let mut tx = db.begin().await?;
-    let rows: Vec<Row> = sqlx::query_as(&format!("SELECT {ROW_COLS} FROM profiles WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE"))
+    let rows: Vec<Row> = sqlx::query_as(&format!(
+        "SELECT {ROW_COLS}, {} AS ads_effective FROM profiles WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE",
+        crate::features::audiences::sync::opted_out_sql("profiles")
+    ))
         .bind(account_id)
         .bind([b.keep_id, b.merge_id])
         .fetch_all(&mut *tx)
@@ -300,17 +311,29 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
         return Ok(out);
     }
 
-    // A message already handed to a worker or being sent by a flow can't be moved safely: ask to retry.
-    let busy: Vec<(Uuid, String, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, status, campaign_id, created_at FROM messages WHERE profile_id = ANY($1) AND status IN ('queued', 'sending') ORDER BY id FOR UPDATE",
+    // A send already claimed for either profile can't be moved safely: ask to retry. Every kind of
+    // send has its own claim: a message, a transactional send, an automatic text (before its message
+    // exists) and a push delivery. Waiting ones are locked, so nobody claims them until this commits.
+    // A message claim older than STALE_CLAIM_MINUTES belongs to a worker that died (the campaign
+    // sweep gives such messages back); it doesn't hold a merge up forever.
+    let ids = [keep.id, other.id];
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = ANY($1) AND status = 'sending' AND COALESCE(claimed_at, created_at) > now() - make_interval(mins => $2))
+             OR EXISTS (SELECT 1 FROM transactional_sends WHERE profile_id = ANY($1) AND status = 'sending')
+             OR EXISTS (SELECT 1 FROM sms_auto_sends WHERE profile_id = ANY($1) AND status = 'sending')
+             OR EXISTS (SELECT 1 FROM push_deliveries WHERE owner_profile_id = ANY($1) AND status = 'sending')",
     )
-    .bind([keep.id, other.id])
-    .fetch_all(&mut *tx)
+    .bind(ids)
+    .bind(STALE_CLAIM_MINUTES)
+    .fetch_one(&mut *tx)
     .await?;
-    let recent = Utc::now() - chrono::Duration::minutes(10);
-    if busy.iter().any(|m| m.1 == "sending" || (m.2.is_none() && m.3 > recent)) {
+    if busy {
         return Err(AppError::Conflict("A message to one of these profiles is being sent right now. Try the merge again in a minute.".into()));
     }
+    sqlx::query("SELECT id FROM messages WHERE profile_id = ANY($1) AND status = 'queued' ORDER BY id FOR UPDATE").bind(ids).execute(&mut *tx).await?;
+    sqlx::query("SELECT id FROM transactional_sends WHERE profile_id = ANY($1) AND status = 'queued' ORDER BY id FOR UPDATE").bind(ids).execute(&mut *tx).await?;
+    sqlx::query("SELECT id FROM sms_auto_sends WHERE profile_id = ANY($1) AND status = 'queued' ORDER BY id FOR UPDATE").bind(ids).execute(&mut *tx).await?;
+    sqlx::query("SELECT id FROM push_deliveries WHERE owner_profile_id = ANY($1) AND status IN ('queued', 'retry') ORDER BY id FOR UPDATE").bind(ids).execute(&mut *tx).await?;
 
     let r = &merged.row;
     // Free the identifiers first: they're unique per account.

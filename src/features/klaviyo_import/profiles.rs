@@ -189,6 +189,34 @@ const SAME_S: &str = "COALESCE(k.kp IS NOT NULL AND (p.phone_number = k.kp OR (p
 const IMP_E: &str = "COALESCE(p.email_consent = 'subscribed' AND w.email_sub = COALESCE(p.email, k.se), false)";
 const IMP_S: &str = "COALESCE(p.sms_consent = 'subscribed' AND w.sms_sub = COALESCE(p.phone_number, k.sp), false)";
 
+/// After a page's write and its consent history (features::people), in the same transaction: the
+/// consent each profile committed with (a retained block or a held-back opt-in can differ from what
+/// the statement wrote), and the import's bookkeeping brought in line, so it never claims a
+/// subscription that didn't stick.
+async fn settle(tx: &mut sqlx::PgConnection, account_id: Uuid, ids: &[Uuid]) -> sqlx::Result<HashMap<Uuid, (String, String)>> {
+    sqlx::query(
+        "UPDATE klaviyo_consent_writes w SET email_sub = CASE WHEN p.email_consent = 'subscribed' THEN w.email_sub END,
+                sms_sub = CASE WHEN p.sms_consent = 'subscribed' THEN w.sms_sub END, updated_at = now()
+         FROM profiles p WHERE w.profile_id = p.id AND p.account_id = $1 AND p.id = ANY($2)
+           AND ((w.email_sub IS NOT NULL AND p.email_consent <> 'subscribed') OR (w.sms_sub IS NOT NULL AND p.sms_consent <> 'subscribed'))",
+    )
+    .bind(account_id)
+    .bind(ids)
+    .execute(&mut *tx)
+    .await?;
+    let rows: Vec<(Uuid, String, String)> = sqlx::query_as("SELECT id, email_consent, sms_consent FROM profiles WHERE account_id = $1 AND id = ANY($2)").bind(account_id).bind(ids).fetch_all(&mut *tx).await?;
+    Ok(rows.into_iter().map(|(id, e, s)| (id, (e, s))).collect())
+}
+
+/// Opt-ins whose history couldn't be written were held back (their opt-outs committed): fail the
+/// step so the runner tries the page again.
+fn held_back(w: &crate::features::people::consent::Written) -> anyhow::Result<()> {
+    if w.held_back.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("consent history couldn't be written for {} opt-ins; their opt-outs are saved and the page will be tried again", w.held_back.len()))
+}
+
 /// Lock a page's matched profiles, in id order, before they're read and merged.
 const LOCK_SQL: &str = "SELECT p.id FROM profiles p WHERE p.account_id = $1 AND p.id = ANY($2) ORDER BY p.id FOR UPDATE";
 
@@ -362,10 +390,22 @@ impl Run<'_> {
         // Each change goes in consent history, and a deleted person's suppression record for the
         // final address beats an imported "subscribed" (features::people), in this transaction.
         let written: Vec<Uuid> = res.iter().map(|r| r.1).collect();
-        crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &before, &written, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
+        let recorded = crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &before, &written, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
+        let now = settle(&mut tx, self.imp.account_id, &written).await?;
         write_locales(&mut tx, &pid, &rows.iter().map(|(_, k, _)| k.locale.clone()).collect::<Vec<_>>()).await?;
         tx.commit().await?;
-        Ok(res.into_iter().map(wrote).collect())
+        held_back(&recorded)?;
+        // What's reported is what committed (after retained blocks and any held-back opt-in).
+        Ok(res
+            .into_iter()
+            .map(|mut r| {
+                if let Some((e, sms)) = now.get(&r.1) {
+                    r.6 = e.clone();
+                    r.7 = sms.clone();
+                }
+                wrote(r)
+            })
+            .collect())
     }
 
     /// Insert brand-new profiles; rows that clash with an existing one are left out (returned empty).
@@ -418,9 +458,18 @@ impl Run<'_> {
         .fetch_all(&mut *tx)
         .await?;
         let made: Vec<Uuid> = res.iter().map(|r| r.0).collect();
-        crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &Default::default(), &made, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
+        let recorded = crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &Default::default(), &made, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
+        let now = settle(&mut tx, self.imp.account_id, &made).await?;
         write_locales(&mut tx, &ids, &rows.iter().map(|(_, k)| k.locale.clone()).collect::<Vec<_>>()).await?;
         tx.commit().await?;
+        held_back(&recorded)?;
+        let res: Vec<(Uuid, Option<String>, Option<String>, String, String)> = res
+            .into_iter()
+            .map(|(id, e, p, ec, sc)| match now.get(&id) {
+                Some((ne, ns)) => (id, e, p, ne.clone(), ns.clone()),
+                None => (id, e, p, ec, sc),
+            })
+            .collect();
         Ok(res
             .into_iter()
             .filter_map(|(id, e, p, ec, sc)| {
@@ -512,8 +561,9 @@ impl Run<'_> {
             .execute(&mut *tx)
             .await?;
         }
-        crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &before, &touched, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
+        let recorded = crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &before, &touched, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
         tx.commit().await?;
+        held_back(&recorded)?;
         Ok(())
     }
 

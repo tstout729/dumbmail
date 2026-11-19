@@ -1637,9 +1637,17 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
         .fetch_optional(&mut *tx)
         .await?;
     let how = src.consent_source().with_detail("consent_source", json!(c.source)).with_detail("as_of", json!(as_of)).with_detail("only_own", json!(c.only_own));
-    crate::features::people::consent::record_written_in(&mut tx, src.account_id, &before, &[profile_id], &how).await?;
+    let recorded = crate::features::people::consent::record_written_in(&mut tx, src.account_id, &before, &[profile_id], &how).await?;
+    // What committed, not what the statement wrote: a retained block or a held-back opt-in decides.
+    let now: Option<String> = sqlx::query_scalar(&format!("SELECT {col} FROM profiles WHERE id = $1")).bind(profile_id).fetch_optional(&mut *tx).await?;
     tx.commit().await?;
-    let Some((before, after, fresh, own)) = row else { return Ok(String::new()) };
+    if !recorded.held_back.is_empty() {
+        return Err(AppError::Internal(anyhow::anyhow!("consent history couldn't be written for this opt-in; the delivery will be tried again")));
+    }
+    let Some((before, mut after, fresh, own)) = row else { return Ok(String::new()) };
+    if let Some(n) = now {
+        after = n;
+    }
     if !fresh {
         return Ok(format!("; kept {label} as it is (a newer preference from this app was already applied)"));
     }

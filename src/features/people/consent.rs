@@ -51,6 +51,9 @@ pub struct ConsentSource {
     pub ip: Option<String>,
     pub user_agent: Option<String>,
     pub detail: Map<String, Value>,
+    /// The caller holds `privacy.manage`: it may lift an ad opt-out a property says (see
+    /// [`ads_opted_out_by_properties`]). Forms, integrations and imports never may.
+    pub privacy: bool,
 }
 
 impl Default for ConsentSource {
@@ -61,20 +64,22 @@ impl Default for ConsentSource {
 
 impl ConsentSource {
     pub fn new(method: &'static str, via: &'static str) -> Self {
-        Self { method, via, actor_user_id: None, form_id: None, message_id: None, ip: None, user_agent: None, detail: Map::new() }
+        Self { method, via, actor_user_id: None, form_id: None, message_id: None, ip: None, user_agent: None, detail: Map::new(), privacy: false }
     }
 
     /// A dashboard request (the signed-in member) or a REST API call (an API key).
     pub fn from_ctx(ctx: &Ctx) -> Self {
+        let privacy = crate::features::team::access::allows(ctx, crate::features::team::access::Perm::Privacy);
         match (ctx.via_api_key, ctx.user_id) {
-            (false, Some(user)) => Self { actor_user_id: Some(user), ..Self::new("dashboard", "dashboard") },
-            _ => Self::new("api", "api"),
+            (false, Some(user)) => Self { actor_user_id: Some(user), privacy, ..Self::new("dashboard", "dashboard") },
+            _ => Self { privacy, ..Self::new("api", "api") },
         }
     }
 
     /// A call through the MCP server.
     pub fn mcp(ctx: &Ctx) -> Self {
-        Self { actor_user_id: ctx.user_id, ..Self::new("mcp", "mcp") }
+        let privacy = crate::features::team::access::allows(ctx, crate::features::team::access::Perm::Privacy);
+        Self { actor_user_id: ctx.user_id, privacy, ..Self::new("mcp", "mcp") }
     }
 
     /// A sign-up form submission.
@@ -397,11 +402,13 @@ pub fn suppression_rank(r: Option<&str>) -> u8 {
 }
 
 /// Whether going from `before` (None: a new profile's defaults) to `after` makes the person more
-/// reachable on any channel. Such changes must be recorded or not happen at all.
+/// reachable on any channel. Such changes must be recorded or not happen at all. A change that adds
+/// or keeps a restriction is never one, even when it replaces another restriction (a complaint
+/// recorded over a hard bounce): only lifting a suppression, or a more reachable consent, loosens.
 pub fn loosens(before: Option<&ConsentState>, after: &ConsentState) -> bool {
     [Channel::Email, Channel::Sms].into_iter().any(|ch| {
         let (old_c, old_s) = before.map(|b| (b.consent(ch), b.suppressed(ch))).unwrap_or(("never_subscribed", None));
-        consent_rank(after.consent(ch)) > consent_rank(old_c) || suppression_rank(after.suppressed(ch)) < suppression_rank(old_s)
+        consent_rank(after.consent(ch)) > consent_rank(old_c) || (old_s.is_some() && after.suppressed(ch).is_none())
     }) || (before.is_some_and(|b| b.ads_opt_out) && !after.ads_opt_out)
         || (before.is_some_and(|b| b.marketing_hold) && !after.marketing_hold)
 }
@@ -511,12 +518,14 @@ pub async fn snapshot_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]
 /// apply any suppression record kept for a deleted person with their final addresses (a retained
 /// unsubscribe or a stronger block beats what was written). As one batch: a failed history write
 /// fails the batch when anyone in it became more reachable.
-pub async fn record_written_in(conn: &mut PgConnection, account_id: Uuid, before: &std::collections::HashMap<Uuid, ConsentState>, ids: &[Uuid], src: &ConsentSource) -> AppResult<()> {
+pub async fn record_written_in(conn: &mut PgConnection, account_id: Uuid, before: &std::collections::HashMap<Uuid, ConsentState>, ids: &[Uuid], src: &ConsentSource) -> AppResult<Written> {
+    let mut out = Written::default();
     if ids.is_empty() {
-        return Ok(());
+        return Ok(out);
     }
     let after = snapshot_in(conn, account_id, ids).await?;
     let (mut loosening, mut tightening) = (Vec::new(), Vec::new());
+    let mut loosened: Vec<Uuid> = Vec::new();
     for id in ids {
         let Some(a) = after.get(id) else { continue };
         let b = before.get(id);
@@ -526,13 +535,83 @@ pub async fn record_written_in(conn: &mut PgConnection, account_id: Uuid, before
         let rows = diff_rows(account_id, *id, b, a, src);
         if loosens(b, a) {
             loosening.extend(rows);
+            loosened.push(*id);
         } else {
             tightening.extend(rows);
         }
     }
-    save_rows(conn, loosening, false).await?;
+    // The opt-ins' history rows on a savepoint of their own: if they can't be written, those
+    // profiles keep only the restrictive part of the write (each channel the stricter of before and
+    // after), so a failed opt-in row never rolls back an opt-out in the same batch. The caller is
+    // told who was held back, so it can try the opt-ins again.
+    if !loosening.is_empty() {
+        let mut sp = conn.begin().await?;
+        match insert_rows(&mut sp, &loosening, false).await {
+            Ok(()) => sp.commit().await?,
+            Err(e) => {
+                sp.rollback().await?;
+                tracing::error!(account = %account_id, profiles = loosened.len(), error = %e, "couldn't write consent history for opt-ins; kept only their restrictive changes");
+                for id in &loosened {
+                    let a = &after[id];
+                    let base = before.get(id).cloned().unwrap_or_else(|| ConsentState { email_consent: "never_subscribed".into(), sms_consent: "never_subscribed".into(), email_suppressed_reason: None, sms_suppressed_reason: None, ads_opt_out: false, marketing_hold: false, ..a.clone() });
+                    let safe = restrictive_part(&base, a);
+                    write_state(conn, account_id, *id, &safe, src).await?;
+                    tightening.extend(diff_rows(account_id, *id, before.get(id), &safe, src));
+                }
+                out.held_back = loosened;
+            }
+        }
+    }
     save_rows(conn, tightening, true).await?;
     super::privacy::apply_tombstones_many_in(conn, account_id, ids, src).await?;
+    Ok(out)
+}
+
+/// What [`record_written_in`] did.
+#[derive(Debug, Default)]
+pub struct Written {
+    /// Profiles whose more-reachable changes were undone because their history couldn't be written
+    /// (their restrictive changes stand). Try those again.
+    pub held_back: Vec<Uuid>,
+}
+
+/// The restrictive part of going from `before` to `after`: each channel's stricter consent and
+/// stronger suppression, and either flag that was on. Addresses are `after`'s.
+fn restrictive_part(before: &ConsentState, after: &ConsentState) -> ConsentState {
+    use super::merge::{stricter_consent, stronger_suppression};
+    ConsentState {
+        email: after.email.clone(),
+        phone_number: after.phone_number.clone(),
+        email_consent: stricter_consent(&before.email_consent, &after.email_consent).to_string(),
+        sms_consent: stricter_consent(&before.sms_consent, &after.sms_consent).to_string(),
+        email_suppressed_reason: stronger_suppression(before.email_suppressed_reason.clone(), after.email_suppressed_reason.clone()),
+        sms_suppressed_reason: stronger_suppression(before.sms_suppressed_reason.clone(), after.sms_suppressed_reason.clone()),
+        ads_opt_out: before.ads_opt_out || after.ads_opt_out,
+        marketing_hold: before.marketing_hold || after.marketing_hold,
+    }
+}
+
+/// Write a profile's consent columns as `s` says (no history; the caller records it).
+async fn write_state(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, s: &ConsentState, src: &ConsentSource) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE profiles SET email_consent = $3, sms_consent = $4, email_suppressed_reason = $5, sms_suppressed_reason = $6,
+                ads_opt_out = $7,
+                ads_opt_out_at = CASE WHEN ads_opt_out IS DISTINCT FROM $7 THEN now() ELSE ads_opt_out_at END,
+                ads_opt_out_source = CASE WHEN ads_opt_out IS DISTINCT FROM $7 THEN $8 ELSE ads_opt_out_source END,
+                marketing_hold = $9, updated_at = now()
+         WHERE id = $1 AND account_id = $2",
+    )
+    .bind(profile_id)
+    .bind(account_id)
+    .bind(&s.email_consent)
+    .bind(&s.sms_consent)
+    .bind(&s.email_suppressed_reason)
+    .bind(&s.sms_suppressed_reason)
+    .bind(s.ads_opt_out)
+    .bind(src.method)
+    .bind(s.marketing_hold)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -569,15 +648,17 @@ pub async fn set_consent(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch: Ch
 }
 
 /// Suppress a channel for a reason (hard_bounce, complaint, manual), in the caller's transaction.
-/// `overwrite` replaces another reason (a bounce or complaint does; a manual suppression never
-/// replaces one). `unsubscribe` also sets the channel's consent to unsubscribed. Returns the state
+/// `overwrite` replaces a weaker reason (a bounce or complaint replaces a manual suppression; a
+/// complaint never replaces a hard bounce, and a manual suppression never replaces anything). `unsubscribe` also sets the channel's consent to unsubscribed. Returns the state
 /// before, when anything changed.
 #[allow(clippy::too_many_arguments)]
 pub async fn suppress_in(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, ch: Channel, reason: &str, overwrite: bool, unsubscribe: bool, src: &ConsentSource) -> sqlx::Result<Option<ConsentState>> {
     let Some(before) = lock(conn, account_id, profile_id).await? else { return Ok(None) };
     let mut after = before.clone();
     let current = before.suppressed(ch);
-    if current.is_none() || (overwrite && current != Some(reason)) {
+    // The stronger block is kept: a complaint never replaces a hard bounce, a manual suppression
+    // never replaces either.
+    if current.is_none() || (overwrite && suppression_rank(Some(reason)) > suppression_rank(current)) {
         after.set_suppressed(ch, Some(reason.to_string()));
     }
     if unsubscribe {
@@ -667,6 +748,33 @@ pub async fn set_ads_opt_out_in(conn: &mut PgConnection, account_id: Uuid, profi
     Ok(apply(conn, account_id, profile_id, &before, &after, src).await?)
 }
 
+/// The properties ad audiences read as an opt-out (`features::audiences::sync::opted_out_sql`).
+pub const AD_PROPERTY_KEYS: &[&str] = &["ads_opt_out", "do_not_sell", "gpc", "ads_consent"];
+
+/// The same decision as `features::audiences::sync::opted_out_sql` makes from properties alone: an
+/// `ads_opt_out`, `do_not_sell` or `gpc` value that isn't false-like, or an `ads_consent` that is.
+pub fn ads_opted_out_by_properties(props: &Value) -> bool {
+    let text = |k: &str| -> Option<String> {
+        match props.get(k)? {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        }
+        .map(|t| t.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n' | '\u{c}')).to_lowercase())
+    };
+    let false_like = |t: &str| matches!(t, "false" | "0" | "no" | "");
+    ["ads_opt_out", "do_not_sell", "gpc"].iter().any(|k| text(k).is_some_and(|t| !false_like(&t))) || text("ads_consent").is_some_and(|t| false_like(&t))
+}
+
+/// A profile write that would lift an ad opt-out its properties said (before: opted out, after: not)
+/// needs `privacy.manage` (the caller's [`ConsentSource::privacy`]).
+pub fn check_ad_properties(before: &Value, after: &Value) -> AppResult<()> {
+    if ads_opted_out_by_properties(before) && !ads_opted_out_by_properties(after) && !current_source().privacy {
+        return Err(AppError::Forbidden("This would undo the person's ad opt-out (a do-not-sell, GPC or ad consent property). Only an owner or admin can change that.".into()));
+    }
+    Ok(())
+}
+
 /// Keys a custom property can't use: they'd shadow real consent, suppression, privacy or identity
 /// fields for anything that reads properties.
 pub fn is_reserved_property(key: &str) -> bool {
@@ -723,11 +831,17 @@ pub async fn after_upsert(conn: &mut PgConnection, account_id: Uuid, before: Opt
 /// A profile's email or phone number changed (`before` was read with [`lock`] in this transaction):
 /// record the old and new address, and void double opt-in confirmations waiting for an email address
 /// the profile no longer has (a confirmation is for the address it was sent to).
-pub(crate) async fn note_address_change(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, before: &ConsentState, after: &ConsentState, src: &ConsentSource) -> sqlx::Result<()> {
+pub(crate) async fn note_address_change(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, before: &ConsentState, after: &ConsentState, src: &ConsentSource) -> AppResult<()> {
     let mut rows = Vec::new();
     for ch in [Channel::Email, Channel::Sms] {
         if before.address(ch) != after.address(ch) {
             rows.push(history_row(&Change { account_id, profile_id, channel: ch.as_str(), field: "address", old: before.address(ch), new: after.address(ch), address: after.address(ch) }, src));
+            // A block stays with its address: an unsubscribe, STOP, bounce, complaint or manual
+            // suppression on the address that left is kept as a one-way code, as an erasure keeps
+            // it, so the address brings its block back wherever it's added again.
+            if let Some(old) = before.address(ch) {
+                super::privacy::retain_address_in(conn, account_id, ch, old, before).await?;
+            }
         }
     }
     if before.email != after.email {
@@ -739,7 +853,7 @@ pub(crate) async fn note_address_change(conn: &mut PgConnection, account_id: Uui
             .await?;
     }
     // An address change on its own makes nobody more reachable (consent rows decide that).
-    save_rows(conn, rows, true).await
+    Ok(save_rows(conn, rows, true).await?)
 }
 
 /// After an email or phone number on a profile was changed directly (not through the upsert), in the

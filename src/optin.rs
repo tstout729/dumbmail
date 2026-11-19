@@ -342,6 +342,11 @@ pub async fn status(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
 /// link is used up in the same transaction that subscribes them, so a failure leaves it usable.
 pub async fn confirm(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
     let mut tx = state.db.begin().await?;
+    // The one lock order (features::people): the profile first, then its confirmation.
+    let owner: Option<(Uuid, Uuid)> = sqlx::query_as("SELECT account_id, profile_id FROM optin_confirmations WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?;
+    if let Some((account_id, profile_id)) = owner {
+        sqlx::query("SELECT id FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).execute(&mut *tx).await?;
+    }
     let row: Option<(Uuid, Uuid, Uuid, Value, String)> = sqlx::query_as(
         "UPDATE optin_confirmations SET confirmed_at = now()
          WHERE id = $1 AND confirmed_at IS NULL AND voided_at IS NULL AND created_at >= now() - make_interval(days => $2)

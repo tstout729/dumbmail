@@ -226,6 +226,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             // Consent history and a deleted person's suppression record, in this transaction; then
             // the language, the webhook and linked-identifier conflicts once it's committed.
             Ok(u) => {
+                // An ad opt-out a property said is only lifted by someone allowed to (features::people).
+                if let Some(e) = &existing {
+                    crate::features::people::consent::check_ad_properties(&e.properties, &u.profile.properties)?;
+                }
                 let mut u = crate::features::people::consent::after_upsert(&mut tx, account_id, consent_before.as_ref(), u).await?;
                 tx.commit().await?;
                 if let Some(l) = &locale {

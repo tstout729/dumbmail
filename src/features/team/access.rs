@@ -635,7 +635,8 @@ pub static CORE_ROUTES: &[RouteRule] = &[
     rule("POST", "/api/profiles/import", AudienceWrite),
     rule("GET", "/api/profiles/{id}", ProfilesRead),
     rule("PATCH", "/api/profiles/{id}", AudienceWrite),
-    rule("DELETE", "/api/profiles/{id}", AudienceWrite),
+    // Deleting a profile is a full erasure (features::people::privacy): admins and the owner.
+    rule("DELETE", "/api/profiles/{id}", Privacy),
     rule("GET", "/api/lists", AudienceRead),
     rule("POST", "/api/lists", AudienceWrite),
     rule("GET", "/api/lists/{id}", AudienceRead),
@@ -730,7 +731,9 @@ pub fn tool_perm(name: &str, args: &Value) -> Option<Perm> {
         return Some(match args["type"].as_str().unwrap_or("") {
             "campaign" => CampaignManage,
             "flow" => FlowEdit,
-            "segment" | "list" | "profile" => AudienceWrite,
+            "segment" | "list" => AudienceWrite,
+            // A full erasure (features::people::privacy).
+            "profile" => Privacy,
             "template" | "image" => ContentWrite,
             "form" => FormsWrite,
             // Unknown types are refused by the tool itself; still require the strongest write.

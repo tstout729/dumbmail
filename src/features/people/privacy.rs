@@ -85,6 +85,57 @@ pub async fn write_tombstones(conn: &mut PgConnection, account_id: Uuid, salt: &
     Ok(n)
 }
 
+/// Keep the blocks `s` (a profile's state while it had the address) holds for one address that is
+/// leaving the profile (an edit or a merge), as an erasure keeps them.
+pub async fn retain_address_in(conn: &mut PgConnection, account_id: Uuid, ch: Channel, address: &str, s: &ConsentState) -> AppResult<()> {
+    let reasons: Vec<(&'static str, String, String)> = tombstone_reasons(s).into_iter().filter(|(c, a, _)| *c == ch.as_str() && a == address).collect();
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    let salt = salt_in(conn, account_id).await?;
+    for (channel, address, reason) in reasons {
+        sqlx::query("INSERT INTO suppression_tombstones (account_id, channel, address_hash, reason) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+            .bind(account_id)
+            .bind(channel)
+            .bind(address_hash(&salt, channel, &address))
+            .bind(&reason)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Why a test to this destination must not go (features::people): an address or number that is
+/// suppressed or unsubscribed on any profile here, or retained for one that was erased or that the
+/// address left. None: it may go.
+pub async fn test_blocked(db: &PgPool, account_id: Uuid, ch: Channel, to: &str) -> AppResult<Option<&'static str>> {
+    let normalized = match ch {
+        Channel::Email => normalize_email(to),
+        Channel::Sms => normalize_phone(to),
+    };
+    let to = normalized.as_deref().unwrap_or(to);
+    let live: bool = match ch {
+        Channel::Email => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND email = $2 AND (email_suppressed_reason IS NOT NULL OR email_consent = 'unsubscribed'))"),
+        Channel::Sms => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND phone_number = $2 AND (sms_suppressed_reason IS NOT NULL OR sms_consent = 'unsubscribed'))"),
+    }
+    .bind(account_id)
+    .bind(to)
+    .fetch_one(db)
+    .await?;
+    if live {
+        return Ok(Some("suppressed"));
+    }
+    let salt: Option<String> = sqlx::query_scalar("SELECT salt FROM privacy_salts WHERE account_id = $1").bind(account_id).fetch_optional(db).await?;
+    let Some(salt) = salt else { return Ok(None) };
+    let retained: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM suppression_tombstones WHERE account_id = $1 AND channel = $2 AND address_hash = $3)")
+        .bind(account_id)
+        .bind(ch.as_str())
+        .bind(address_hash(&salt, ch.as_str(), to))
+        .fetch_one(db)
+        .await?;
+    Ok(retained.then_some("suppressed"))
+}
+
 /// Let go of one retained record (the person's own verified opt-in, or a manual suppression lifted
 /// by hand), so the next upsert doesn't bring it back.
 pub async fn forget_tombstone_in(conn: &mut PgConnection, account_id: Uuid, ch: Channel, address: &str, reason: &str) -> sqlx::Result<()> {
@@ -159,6 +210,18 @@ struct Doomed {
     state: ConsentState,
 }
 
+/// The first step of every erasure, before any profile is locked (the one lock order: the account's
+/// erasure marker, then profiles in id order, then their other rows). Stamps the marker, so an export
+/// publishing its file waits for this erasure and then sees it (see `erased_since`). Calling it again
+/// in the same transaction is harmless.
+pub async fn begin_erasure_in(conn: &mut PgConnection, account_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO privacy_erasures (account_id, erased_at) VALUES ($1, clock_timestamp()) ON CONFLICT (account_id) DO UPDATE SET erased_at = clock_timestamp()")
+        .bind(account_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Who an erasure removed: (id, email, phone number, external id), for the callers' webhooks.
 pub type ErasedPerson = (Uuid, Option<String>, Option<String>, Option<String>);
 
@@ -176,11 +239,7 @@ pub async fn erase_people_in(conn: &mut PgConnection, account_id: Uuid, ids: &[U
     if ids.is_empty() {
         return Ok((removed, Vec::new()));
     }
-    // First, so an export job publishing its file waits for this and then sees it (see `erased_since`).
-    sqlx::query("INSERT INTO privacy_erasures (account_id, erased_at) VALUES ($1, clock_timestamp()) ON CONFLICT (account_id) DO UPDATE SET erased_at = clock_timestamp()")
-        .bind(account_id)
-        .execute(&mut *conn)
-        .await?;
+    begin_erasure_in(conn, account_id).await?;
     let doomed: Vec<Doomed> = sqlx::query_as(&format!("SELECT id, external_id, {} FROM profiles WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE", consent::STATE_COLS))
         .bind(account_id)
         .bind(ids)
@@ -289,6 +348,9 @@ pub async fn ensure_erasure_marker(db: &PgPool, account_id: Uuid) -> sqlx::Resul
 /// Whether anyone in the account was erased after `since`. Locks the marker row (for share), so an
 /// erasure running right now finishes first; call it in the transaction that publishes a file.
 pub async fn erased_since(conn: &mut PgConnection, account_id: Uuid, since: DateTime<Utc>) -> sqlx::Result<bool> {
+    // The marker row exists first, so an account's first erasure, inserting it right now, is waited
+    // for too (the insert waits on that uncommitted row).
+    sqlx::query("INSERT INTO privacy_erasures (account_id, erased_at) VALUES ($1, 'epoch') ON CONFLICT DO NOTHING").bind(account_id).execute(&mut *conn).await?;
     let at: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT erased_at FROM privacy_erasures WHERE account_id = $1 FOR SHARE").bind(account_id).fetch_optional(&mut *conn).await?;
     Ok(at.is_some_and(|t| t >= since))
 }
@@ -333,15 +395,38 @@ pub fn file_url(id: Uuid) -> String {
 }
 
 /// A ready file for download, if it belongs to this account and hasn't expired.
-pub async fn file(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<(String, String, String, Vec<u8>)> {
+/// The largest download served (stored files are far smaller; past this the download stops with an error).
+pub const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+/// A ready file's kind, name and type, and its chunk numbers, without reading any of its bytes: the
+/// caller checks the permission for the kind before streaming (see `people::file_perm`).
+pub async fn file_meta(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<(String, String, String, Vec<i32>)> {
     let meta: Option<(String, String, String)> = sqlx::query_as("SELECT kind, filename, content_type FROM people_files WHERE id = $1 AND account_id = $2 AND ready AND expires_at > now()")
         .bind(id)
         .bind(account_id)
         .fetch_optional(db)
         .await?;
     let (kind, name, ct) = meta.ok_or_else(|| AppError::NotFound("This download has expired or doesn't exist. Downloads last 7 days.".into()))?;
-    let chunks: Vec<Vec<u8>> = sqlx::query_scalar("SELECT bytes FROM people_file_chunks WHERE file_id = $1 ORDER BY seq").bind(id).fetch_all(db).await?;
-    Ok((kind, name, ct, chunks.concat()))
+    let seqs: Vec<i32> = sqlx::query_scalar("SELECT seq FROM people_file_chunks WHERE file_id = $1 ORDER BY seq").bind(id).fetch_all(db).await?;
+    Ok((kind, name, ct, seqs))
+}
+
+/// One chunk of a file (empty if it went away meanwhile: an erasure, an expiry).
+pub async fn file_chunk(db: &PgPool, id: Uuid, seq: i32) -> sqlx::Result<Vec<u8>> {
+    Ok(sqlx::query_scalar("SELECT bytes FROM people_file_chunks WHERE file_id = $1 AND seq = $2").bind(id).bind(seq).fetch_optional(db).await?.unwrap_or_default())
+}
+
+/// A whole file, for tests and small reads (checks nothing; the HTTP route uses [`file_meta`]).
+pub async fn file(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<(String, String, String, Vec<u8>)> {
+    let (kind, name, ct, seqs) = file_meta(db, account_id, id).await?;
+    let mut out = Vec::new();
+    for seq in seqs {
+        out.extend(file_chunk(db, id, seq).await?);
+        if out.len() > MAX_DOWNLOAD_BYTES {
+            return Err(AppError::bad("this file is too large to download"));
+        }
+    }
+    Ok((kind, name, ct, out))
 }
 
 // ---------- Requests ----------
@@ -536,27 +621,59 @@ impl ChunkWriter {
     }
 }
 
+/// The most earlier addresses and merged-profile ids listed per profile.
+const FORMER_MAX: i64 = 1_000;
+/// The most form sign-ups and double opt-in confirmations listed per profile.
+const SIGNUPS_MAX: i64 = 10_000;
+
 /// What a profile's sections hold, counted before anything is written, so the top of the file can
-/// say whether it's complete.
+/// say exactly which sections were cut at their limit ("complete" means none was).
 struct Counts {
     history: i64,
     events: i64,
     messages: i64,
     notes: i64,
+    former: i64,
+    merged: i64,
+    forms: i64,
+    confirmations: i64,
+}
+
+impl Counts {
+    /// (section, rows held, the most included).
+    fn sections(&self) -> [(&'static str, i64, i64); 8] {
+        [
+            ("consent_history", self.history, EXPORT_MAX_ROWS),
+            ("events", self.events, EXPORT_MAX_ROWS),
+            ("messages", self.messages, EXPORT_MAX_ROWS),
+            ("internal_notes", self.notes, EXPORT_MAX_ROWS),
+            ("former_identifiers", self.former, FORMER_MAX),
+            ("merged_from_profiles", self.merged, FORMER_MAX),
+            ("form_submissions", self.forms, SIGNUPS_MAX),
+            ("double_opt_in_confirmations", self.confirmations, SIGNUPS_MAX),
+        ]
+    }
 }
 
 async fn counts(db: &PgPool, account_id: Uuid, pid: Uuid) -> AppResult<Counts> {
-    let c: (i64, i64, i64, i64) = sqlx::query_as(
+    let c: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM consent_events WHERE account_id = $1 AND profile_id = $2),
                 (SELECT count(*) FROM events WHERE account_id = $1 AND profile_id = $2),
                 (SELECT count(*) FROM messages WHERE account_id = $1 AND profile_id = $2 AND NOT is_test),
-                (SELECT count(*) FROM profile_notes WHERE account_id = $1 AND profile_id = $2)",
+                (SELECT count(*) FROM profile_notes WHERE account_id = $1 AND profile_id = $2),
+                (SELECT count(*) FROM (SELECT DISTINCT channel, address FROM consent_events WHERE account_id = $1 AND profile_id = $2 AND address IS NOT NULL
+                   AND address IS DISTINCT FROM (SELECT email FROM profiles WHERE id = $2) AND address IS DISTINCT FROM (SELECT phone_number FROM profiles WHERE id = $2)
+                   AND channel IN ('email', 'sms')) x),
+                (SELECT count(DISTINCT detail->>'merged_profile_id') FROM consent_events WHERE account_id = $1 AND profile_id = $2 AND method = 'merge' AND detail ? 'merged_profile_id'),
+                (SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.account_id = $1 AND e.profile_id = $2 AND m.name = 'Subscribed to List' AND e.properties ? 'form_id')
+                  + (SELECT count(*) FROM consent_events WHERE account_id = $1 AND profile_id = $2 AND method = 'form'),
+                (SELECT count(*) FROM optin_confirmations WHERE account_id = $1 AND profile_id = $2)",
     )
     .bind(account_id)
     .bind(pid)
     .fetch_one(db)
     .await?;
-    Ok(Counts { history: c.0, events: c.1, messages: c.2, notes: c.3 })
+    Ok(Counts { history: c.0, events: c.1, messages: c.2, notes: c.3, former: c.4, merged: c.5, forms: c.6, confirmations: c.7 })
 }
 
 /// The HTML page, built alongside the JSON (each table bounded).
@@ -649,11 +766,11 @@ async fn build_export(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     for pid in &ids {
         all_counts.push(counts(db, account_id, *pid).await.map_err(|e| anyhow::anyhow!(e.public_message()))?);
     }
-    let cut: Vec<&str> = all_counts
+    let cut: Vec<String> = all_counts
         .iter()
-        .flat_map(|c| [("consent_history", c.history), ("events", c.events), ("messages", c.messages), ("internal_notes", c.notes)])
-        .filter(|(_, n)| *n > EXPORT_MAX_ROWS)
-        .map(|(k, _)| k)
+        .flat_map(|c| c.sections())
+        .filter(|(_, n, max)| n > max)
+        .map(|(k, n, max)| format!("{k} ({max} of {n})"))
         .collect();
     let mut w = ChunkWriter::new(json_id);
     w.push("{\"exported_at\":");
@@ -666,7 +783,7 @@ async fn build_export(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     w.value(&json!(if cut.is_empty() {
         "Everything held about this person.".to_string()
     } else {
-        format!("Not complete: at most {EXPORT_MAX_ROWS} rows of each kind are included per profile, and these had more: {}.", cut.join(", "))
+        format!("Not complete: these sections were cut at their limit (included of held): {}.", cut.join(", "))
     }));
     w.push(",\"profiles\":[");
     let mut html = Html { out: String::new(), tz };
@@ -688,7 +805,7 @@ async fn build_export(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         s = esc(&subject),
         a = esc(&account.name),
         now = Utc::now().with_timezone(&tz).format("%b %-d, %Y %-I:%M %p %Z"),
-        warn = if cut.is_empty() { String::new() } else { format!("<p><strong>Not complete:</strong> at most {EXPORT_MAX_ROWS} rows of each kind are included per profile, and these had more: {}.</p>", esc(&cut.join(", "))) },
+        warn = if cut.is_empty() { String::new() } else { format!("<p><strong>Not complete:</strong> these sections were cut at their limit (included of held): {}.</p>", esc(&cut.join(", "))) },
     );
     let page = format!("{head}{}</body></html>", html.out);
     for (seq, part) in page.as_bytes().chunks(CHUNK_BYTES).enumerate() {
@@ -729,17 +846,19 @@ async fn export_profile(state: &AppState, account_id: Uuid, pid: Uuid, c: &Count
     // Addresses and profiles this person had before (from their consent history and merges).
     let former: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT channel, address, max(occurred_at) FROM consent_events WHERE account_id = $1 AND profile_id = $2 AND address IS NOT NULL
-           AND address IS DISTINCT FROM $3 AND address IS DISTINCT FROM $4 AND channel IN ('email', 'sms') GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 1000",
+           AND address IS DISTINCT FROM $3 AND address IS DISTINCT FROM $4 AND channel IN ('email', 'sms') GROUP BY 1, 2 ORDER BY 3 DESC LIMIT $5",
     )
     .bind(account_id)
     .bind(pid)
     .bind(profile["email"].as_str())
     .bind(profile["phone_number"].as_str())
+    .bind(FORMER_MAX)
     .fetch_all(db)
     .await?;
-    let merged: Vec<String> = sqlx::query_scalar("SELECT DISTINCT detail->>'merged_profile_id' FROM consent_events WHERE account_id = $1 AND profile_id = $2 AND method = 'merge' AND detail ? 'merged_profile_id' LIMIT 1000")
+    let merged: Vec<String> = sqlx::query_scalar("SELECT DISTINCT detail->>'merged_profile_id' FROM consent_events WHERE account_id = $1 AND profile_id = $2 AND method = 'merge' AND detail ? 'merged_profile_id' LIMIT $3")
         .bind(account_id)
         .bind(pid)
+        .bind(FORMER_MAX)
         .fetch_all(db)
         .await?;
     let lists: Vec<Value> = detail["lists"].as_array().map(|a| a.iter().map(|l| json!({"id": l["id"], "name": l["name"]})).collect()).unwrap_or_default();
@@ -815,10 +934,11 @@ async fn export_profile(state: &AppState, account_id: Uuid, pid: Uuid, c: &Count
          UNION ALL
          SELECT ce.form_id::text, f.name, ce.occurred_at, 'consent_' || ce.channel FROM consent_events ce LEFT JOIN forms f ON f.id = ce.form_id
           WHERE ce.account_id = $1 AND ce.profile_id = $2 AND ce.method = 'form'
-         ORDER BY 3 DESC LIMIT 10000",
+         ORDER BY 3 DESC LIMIT $3",
     )
     .bind(account_id)
     .bind(pid)
+    .bind(SIGNUPS_MAX)
     .fetch_all(db)
     .await?;
     w.push(",\"form_submissions\":");
@@ -829,12 +949,14 @@ async fn export_profile(state: &AppState, account_id: Uuid, pid: Uuid, c: &Count
         html.row(&cells);
     }
     html.out.push_str("</table>");
+    html.more(forms.len().min(HTML_ROWS), forms.len() as i64);
     let confirmations: Vec<(String, Option<String>, String, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT l.name, f.name, o.email, o.created_at, o.confirmed_at FROM optin_confirmations o JOIN lists l ON l.id = o.list_id
-         LEFT JOIN forms f ON f.id = o.form_id WHERE o.account_id = $1 AND o.profile_id = $2 ORDER BY o.created_at DESC LIMIT 10000",
+         LEFT JOIN forms f ON f.id = o.form_id WHERE o.account_id = $1 AND o.profile_id = $2 ORDER BY o.created_at DESC LIMIT $3",
     )
     .bind(account_id)
     .bind(pid)
+    .bind(SIGNUPS_MAX)
     .fetch_all(db)
     .await?;
     w.push(",\"double_opt_in_confirmations\":");

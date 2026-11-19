@@ -105,7 +105,7 @@ export function SuppressionsPage() {
         <Notice tone="gray" icon={<Info />} title="Only suppressions added by hand can be lifted.">
           Bounced addresses, spam complaints and people who unsubscribed themselves stay suppressed. Only the person can subscribe again, with one of your sign-up forms or by texting START.
           {list.data && list.data.deleted_profiles_suppressed > 0
-            ? ` ${pluralize(list.data.deleted_profiles_suppressed, "deleted profile")} also stay suppressed through a one-way code of their address, in case they're imported again.`
+            ? ` ${pluralize(list.data.deleted_profiles_suppressed, "address")} no longer on a profile (deleted people, or addresses that were changed) also stay blocked through a one-way code, in case they come back.`
             : ""}
         </Notice>
       </div>

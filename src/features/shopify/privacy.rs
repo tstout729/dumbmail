@@ -266,6 +266,8 @@ async fn clean_profiles(db: &PgPool, account_id: Uuid, shop: &str, ids: &[Uuid],
     // Deleted through the one erasure (features::people::privacy), so reviews, push devices, object
     // links and stored exports go with them and an unsubscribe is kept as a one-way code.
     let mut tx = db.begin().await?;
+    // The one lock order: the erasure marker before any profile.
+    crate::features::people::privacy::begin_erasure_in(&mut tx, account_id).await?;
     let doomed: Vec<Uuid> = sqlx::query_scalar(
         "SELECT p.id FROM profiles p WHERE p.account_id = $1 AND p.id = ANY($2)
            AND EXISTS (SELECT 1 FROM shopify_created_profiles c WHERE c.account_id = $1 AND c.profile_id = p.id AND c.shop_domain = $3)
@@ -283,8 +285,11 @@ async fn clean_profiles(db: &PgPool, account_id: Uuid, shop: &str, ids: &[Uuid],
     .bind(upto)
     .fetch_all(&mut *tx)
     .await?;
-    crate::features::people::privacy::erase_in(&mut tx, account_id, &doomed).await?;
+    // A test can hold the erasure here, with the profiles locked (see tests/people.rs).
+    crate::features::reviews::hooks::point("shopify_erase", account_id).await?;
+    let (_, people) = crate::features::people::privacy::erase_people_in(&mut tx, account_id, &doomed).await?;
     tx.commit().await?;
+    crate::features::people::privacy::tell_deleted(db, account_id, &people).await;
     Ok(())
 }
 

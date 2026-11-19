@@ -8,6 +8,7 @@ import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib
 import { toast } from "../../lib/toast";
 import { ConsentTimeline, ProfileSidePanels } from "../../features/people/ProfilePanels";
 import { ProfileObjects } from "../../features/objects/ProfileObjects";
+import { useCan } from "../../features/team/api";
 
 export function ProfileDetailPage() {
   const { id = "" } = useParams();
@@ -48,6 +49,8 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const remove = useDeleteProfile();
+  // Deleting a profile erases it fully (and the account's stored exports): admins and the owner.
+  const canDelete = useCan("privacy.manage");
   const navigate = useNavigate();
   const tz = account.timezone;
   const title = fullName(profile) || profile.email || profile.phone_number || "Anonymous profile";
@@ -78,9 +81,11 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
         }
         actions={
           <>
-            <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
-              Delete
-            </Button>
+            {canDelete ? (
+              <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
+                Delete
+              </Button>
+            ) : null}
             {!editing ? (
               <Button icon={<Pencil className="size-3.5" />} onClick={() => setEditing(true)}>
                 Edit
@@ -222,7 +227,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
       {confirmDelete ? (
         <ConfirmDialog
           title="Delete this profile?"
-          body="Their events, messages and consent history are deleted too. This can't be undone. If they had unsubscribed, they stay unsubscribed if they're imported again."
+          body="Their events, messages, reviews and consent history are deleted too, and your stored export files (they may include this person). This can't be undone. If they had unsubscribed or were suppressed, they stay that way if they're imported again."
           confirmLabel="Delete profile"
           danger
           loading={remove.isPending}

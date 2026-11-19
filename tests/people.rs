@@ -1541,3 +1541,333 @@ async fn erasure_and_merge_cover_main_modules_tables() {
     assert_eq!(left, 0, "push tokens and Shopify's mapping are personal data");
     h.cleanup().await;
 }
+
+// ---------- Final review (items 1–11) ----------
+
+async fn profile_state(h: &Harness, email: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT email_consent, email_suppressed_reason FROM profiles WHERE email = $1").bind(email).fetch_one(&h.state.db).await.unwrap()
+}
+
+/// Item 1: a block stays with its address. When an address leaves a profile, its unsubscribe, STOP,
+/// bounce, complaint or manual suppression is kept, and comes back wherever the address is added
+/// again, including as a Gmail spelling of the same inbox.
+#[tokio::test]
+async fn a_block_stays_with_its_address() {
+    let mut h = harness!();
+    h.signup().await;
+    let db = h.state.db.clone();
+    // A bounced Gmail address is replaced on its profile.
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "bounced@gmail.com", "email_consent": "subscribed"}))).await;
+    sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce' WHERE id = $1::uuid").bind(p["id"].as_str().unwrap()).execute(&db).await.unwrap();
+    h.ok("PATCH", &format!("/api/profiles/{}", p["id"].as_str().unwrap()), Some(json!({"email": "fresh@x.test"}))).await;
+    // It comes back as a dotted, +tagged googlemail spelling of the same inbox: the bounce comes too.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "B.ounced+promo@googlemail.com", "email_consent": "subscribed"}))).await;
+    let (_, sup) = profile_state(&h, "b.ounced+promo@googlemail.com").await;
+    assert_eq!(sup.as_deref(), Some("hard_bounce"), "a bounced inbox can't come back as an alias");
+
+    // An unsubscribe and a manual suppression stay with their addresses too.
+    let u = h.ok("POST", "/api/profiles", Some(json!({"email": "unsub@x.test", "email_consent": "unsubscribed"}))).await;
+    h.ok("PATCH", &format!("/api/profiles/{}", u["id"].as_str().unwrap()), Some(json!({"email": "unsub-new@x.test"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "unsub@x.test", "email_consent": "subscribed"}))).await;
+    assert_eq!(profile_state(&h, "unsub@x.test").await.0, "unsubscribed");
+    h.ok("POST", "/api/people/suppressions", Some(json!({"addresses": ["manual@x.test"], "confirm": true}))).await;
+    let m = pid(&h, "manual@x.test").await;
+    h.ok("PATCH", &format!("/api/profiles/{m}"), Some(json!({"email": "manual-new@x.test"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "manual@x.test"}))).await;
+    assert_eq!(profile_state(&h, "manual@x.test").await.1.as_deref(), Some("manual"));
+
+    // A STOP stays with its number.
+    let s = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550301", "sms_consent": "unsubscribed"}))).await;
+    h.ok("PATCH", &format!("/api/profiles/{}", s["id"].as_str().unwrap()), Some(json!({"phone_number": "+15035550302"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550301", "sms_consent": "subscribed"}))).await;
+    let sms: String = sqlx::query_scalar("SELECT sms_consent FROM profiles WHERE phone_number = '+15035550301'").fetch_one(&db).await.unwrap();
+    assert_eq!(sms, "unsubscribed");
+    h.cleanup().await;
+}
+
+/// Item 2: a test goes nowhere an address is blocked, retained or current, whether or not a profile
+/// has it now; HELP is still answered on a suppressed number.
+#[tokio::test]
+async fn test_sends_respect_retained_and_current_blocks() {
+    let mut h = signed!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let ours = h.claim_number().await;
+    let gone = h.ok("POST", "/api/profiles", Some(json!({"email": "gone@x.test", "email_consent": "unsubscribed"}))).await;
+    h.ok("DELETE", &format!("/api/profiles/{}", gone["id"].as_str().unwrap()), None).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>x</p>"}]}}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["gone@x.test"]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(h.state.email.sent().iter().all(|m| m.to != "gone@x.test"), "a deleted person who unsubscribed gets no test");
+
+    // HELP from a manually suppressed number still gets the fixed answer.
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550401", "sms_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/people/suppressions", Some(json!({"addresses": ["+15035550401"], "confirm": true}))).await;
+    text_in(&h, "help-1", "+15035550401", &ours, "HELP").await;
+    h.drain().await;
+    assert!(h.state.sms.sent().iter().any(|m| m.to == "+15035550401"), "HELP is answered");
+    h.cleanup().await;
+}
+
+/// Item 3: a complaint after a hard bounce keeps the bounce, and is saved even when its history row
+/// can't be written.
+#[tokio::test]
+async fn a_restriction_replacing_another_survives_a_failed_history_write() {
+    let mut h = harness!();
+    h.signup().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "bc@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    send_campaign(&mut h, &list["id"]).await;
+    ses(&h, "bc@x.test", "Permanent").await;
+    sqlx::query("CREATE FUNCTION fail_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'history is down'; END $$").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_history BEFORE INSERT ON consent_events FOR EACH ROW EXECUTE FUNCTION fail_history()").execute(&h.state.db).await.unwrap();
+    ses(&h, "bc@x.test", "Complaint").await;
+    assert_eq!(profile_state(&h, "bc@x.test").await, ("unsubscribed".to_string(), Some("hard_bounce".to_string())), "the stronger block stays, the unsubscribe is saved");
+    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'people_consent_history'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(waiting, 1, "its history row is written later");
+    h.cleanup().await;
+}
+
+/// Item 3: in a batch (an import page), an opt-in whose history row can't be written never rolls
+/// back an opt-out in the same batch; the opt-in is held back to be tried again.
+#[tokio::test]
+async fn a_failed_opt_in_history_row_never_rolls_back_an_opt_out_in_the_same_batch() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let a: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "in@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let b: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "out@x.test", "email_consent": "subscribed"}))).await["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("CREATE FUNCTION fail_optins() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.new_value = 'subscribed' THEN RAISE EXCEPTION 'down'; END IF; RETURN NEW; END $$").execute(&db).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_optins BEFORE INSERT ON consent_events FOR EACH ROW EXECUTE FUNCTION fail_optins()").execute(&db).await.unwrap();
+    use dumbmail::features::people::consent;
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM profiles WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind([a, b]).execute(&mut *tx).await.unwrap();
+    let before = consent::snapshot_in(&mut tx, acct, &[a, b]).await.unwrap();
+    sqlx::query("UPDATE profiles SET email_consent = CASE WHEN id = $1 THEN 'subscribed' ELSE 'unsubscribed' END WHERE id = ANY($2)").bind(a).bind([a, b]).execute(&mut *tx).await.unwrap();
+    let src = dumbmail::features::people::ConsentSource::new("klaviyo_import", "system");
+    let written = consent::record_written_in(&mut tx, acct, &before, &[a, b], &src).await.expect("the batch commits");
+    tx.commit().await.unwrap();
+    assert_eq!(written.held_back, vec![a]);
+    assert_eq!(profile_state(&h, "out@x.test").await.0, "unsubscribed", "the opt-out stands");
+    assert_eq!(profile_state(&h, "in@x.test").await.0, "never_subscribed", "the opt-in waits for its history");
+    let out_row: i64 = sqlx::query_scalar("SELECT count(*) FROM consent_events WHERE profile_id = $1 AND new_value = 'unsubscribed'").bind(b).fetch_one(&db).await.unwrap();
+    assert_eq!(out_row, 1);
+    h.cleanup().await;
+}
+
+/// Item 4: a merge waits for a claimed send of any kind, and only for a real claim (a queued flow
+/// message isn't one; an abandoned claim doesn't hold it up).
+#[tokio::test]
+async fn merge_waits_for_real_claims() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let a: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "ma@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let b: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "mb@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    // A queued message without a campaign, made a moment ago: not claimed.
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status) VALUES ($1, $2, $3, 'email', 'mb@x.test', 'queued')").bind(Uuid::now_v7()).bind(acct).bind(b).execute(&db).await.unwrap();
+    // A transactional send being handed to the provider: claimed.
+    let t = Uuid::now_v7();
+    sqlx::query("INSERT INTO transactional_sends (id, account_id, profile_id, to_email, status, request_hash, request, claimed_at) VALUES ($1, $2, $3, 'mb@x.test', 'sending', 'h', '{}', now())")
+        .bind(t)
+        .bind(acct)
+        .bind(b)
+        .execute(&db)
+        .await
+        .unwrap();
+    let (s, v) = h.req("POST", "/api/people/merge", Some(json!({"keep_id": a, "merge_id": b, "confirm": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    sqlx::query("UPDATE transactional_sends SET status = 'sent' WHERE id = $1").bind(t).execute(&db).await.unwrap();
+    // A message claim long abandoned by its worker doesn't hold the merge up.
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status, claimed_at) VALUES ($1, $2, $3, 'email', 'mb@x.test', 'sending', now() - interval '1 hour')").bind(Uuid::now_v7()).bind(acct).bind(b).execute(&db).await.unwrap();
+    let merged = h.ok("POST", "/api/people/merge", Some(json!({"keep_id": a, "merge_id": b, "confirm": true}))).await;
+    assert_eq!(merged["merged"], true);
+    h.cleanup().await;
+}
+
+/// Item 5: one lock order. Shopify's customers/redact and a profile delete erasing the same person at
+/// once both finish (neither is chosen as a deadlock victim), and the person is gone.
+#[tokio::test]
+async fn shopify_redact_and_a_profile_delete_erase_the_same_person_at_once() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let shop = "acme.myshopify.com";
+    sqlx::query("INSERT INTO shopify_shops (account_id, shop_domain, status) VALUES ($1, $2, 'connected')").bind(acct).bind(shop).execute(&db).await.unwrap();
+    dumbmail::features::shopify::customers::apply(&db, acct, shop, 0, &shopify_customer(1, "both@x.test", "NOT_SUBSCRIBED"), false).await.unwrap();
+    let p: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'both@x.test'").fetch_one(&db).await.unwrap();
+    sqlx::query("INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload, shop_domain) VALUES ($1, 'r1', 'customers/redact', $2, $3)")
+        .bind(acct)
+        .bind(json!({"shop_domain": shop, "customer": {"id": 1, "email": "both@x.test"}, "orders_to_redact": []}))
+        .bind(shop)
+        .execute(&db)
+        .await
+        .unwrap();
+    // Shopify's erasure holds the profile; a profile delete starts meanwhile.
+    let pause = dumbmail::features::reviews::hooks::hold("shopify_erase", acct);
+    let state = h.state.clone();
+    let redact = tokio::spawn(async move { dumbmail::features::shopify::privacy::run(&state, acct).await });
+    pause.arrived().await;
+    let db2 = db.clone();
+    let delete = tokio::spawn(async move { dumbmail::features::people::privacy::delete_profile_fully(&db2, acct, p).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    pause.release("shopify_erase", acct);
+    redact.await.unwrap().unwrap();
+    let deleted = delete.await.unwrap();
+    assert!(deleted.is_ok(), "the delete wasn't a deadlock victim: {:?}", deleted.err().map(|e| e.public_message()));
+    let (done, attempts): (bool, i32) = sqlx::query_as("SELECT done_at IS NOT NULL, attempts FROM shopify_webhooks WHERE webhook_id = 'r1'").fetch_one(&db).await.unwrap();
+    assert!(done && attempts == 0, "the redact finished first time");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE id = $1").bind(p).fetch_one(&db).await.unwrap();
+    assert_eq!(left, 0);
+    h.cleanup().await;
+}
+
+/// Item 7: deleting a profile anywhere is a full erasure and needs privacy.manage; the MCP delete
+/// tool erases like the rest (a blocked address stays blocked if it comes back).
+#[tokio::test]
+async fn deleting_a_profile_anywhere_is_a_full_erasure() {
+    use dumbmail::features::team::access::{self, Perm};
+    assert_eq!(access::tool_perm("delete", &json!({"type": "profile"})), Some(Perm::Privacy));
+    let mut h = harness!();
+    h.signup().await;
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await["key"].as_str().unwrap().to_string();
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "mcpgone@x.test", "email_consent": "unsubscribed"}))).await;
+    mcp(&h, &key, "delete", json!({"type": "profile", "id": p["id"]})).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "mcpgone@x.test", "email_consent": "subscribed"}))).await;
+    assert_eq!(profile_state(&h, "mcpgone@x.test").await.0, "unsubscribed", "the MCP delete kept the unsubscribe");
+    h.cleanup().await;
+}
+
+/// Item 8: an ad opt-out survives a merge (by the flag or a property) and can't be lifted through a
+/// property by someone without privacy.manage; the Rust check matches the ad audiences' SQL.
+#[tokio::test]
+async fn ad_opt_outs_survive_merges_and_property_edits() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let keep = h.ok("POST", "/api/profiles", Some(json!({"email": "keep@x.test", "email_consent": "subscribed", "properties": {"gpc": false}}))).await;
+    let other = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550501", "properties": {"gpc": true}}))).await;
+    h.ok("POST", "/api/people/merge", Some(json!({"keep_id": keep["id"], "merge_id": other["id"], "confirm": true}))).await;
+    let out: bool = sqlx::query_scalar("SELECT ads_opt_out FROM profiles WHERE email = 'keep@x.test'").fetch_one(&db).await.unwrap();
+    assert!(out, "the merged-away profile's GPC opt-out stays");
+
+    // A property opt-out can't be lifted by a source without privacy.manage (here an integration).
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "dns@x.test", "properties": {"do_not_sell": "yes"}}))).await;
+    let res = dumbmail::features::people::with_source(
+        dumbmail::features::people::ConsentSource::new("integration", "system"),
+        dumbmail::audience::upsert_profile(&db, acct, &dumbmail::audience::ProfileInput { email: Some("dns@x.test".into()), properties: Some(serde_json::from_value(json!({"do_not_sell": "no"})).unwrap()), ..Default::default() }),
+    )
+    .await;
+    assert!(res.is_err(), "refused");
+    let still: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE id = $1::uuid").bind(p["id"].as_str().unwrap()).fetch_one(&db).await.unwrap();
+    assert_eq!(still["do_not_sell"], "yes");
+    // The owner may.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "dns@x.test", "properties": {"do_not_sell": "no"}}))).await;
+
+    // The Rust check and the SQL agree.
+    use dumbmail::features::people::consent::ads_opted_out_by_properties;
+    for props in [
+        json!({}), json!({"gpc": true}), json!({"gpc": false}), json!({"gpc": " No "}), json!({"do_not_sell": 1}), json!({"do_not_sell": 0}), json!({"ads_opt_out": "yes"}),
+        json!({"ads_opt_out": ""}), json!({"ads_consent": false}), json!({"ads_consent": "true"}), json!({"ads_consent": null}), json!({"gpc": {}}), json!({"do_not_sell": "\tFALSE\n"}),
+    ] {
+        let q = format!("SELECT {} FROM (SELECT $1::jsonb AS properties, false AS ads_opt_out) p", dumbmail::features::audiences::sync::opted_out_sql("p"));
+        let sql: bool = sqlx::query_scalar(&q).bind(&props).fetch_one(&db).await.unwrap();
+        assert_eq!(ads_opted_out_by_properties(&props), sql, "{props}");
+    }
+    h.cleanup().await;
+}
+
+/// Item 9: a report export (batched or scheduled) made while someone was erased is thrown away, and
+/// a personal export says which capped sections were cut.
+#[tokio::test]
+async fn exports_after_an_erasure_and_honest_limits() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let e = h.ok("POST", "/api/reports/exports", Some(json!({"kind": "suppressions"}))).await;
+    let id: Uuid = e["id"].as_str().unwrap().parse().unwrap();
+    // An erasure commits after the export started (its rows may already be read).
+    sqlx::query("INSERT INTO privacy_erasures (account_id, erased_at) VALUES ($1, now() + interval '1 second') ON CONFLICT (account_id) DO UPDATE SET erased_at = EXCLUDED.erased_at").bind(acct).execute(&db).await.unwrap();
+    sqlx::query("DELETE FROM jobs WHERE kind = 'reports_export'").execute(&db).await.unwrap();
+    dumbmail::features::reports::exports::run_batch(&h.state, id).await.unwrap();
+    let v = h.ok("GET", &format!("/api/reports/exports/{id}"), None).await;
+    assert_eq!(v["status"], "failed", "{v}");
+    let started = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let stored = dumbmail::features::reports::exports::store_file(&h.state, acct, "report", json!({}), "r.csv", b"a,b\n", started).await;
+    assert!(stored.is_err(), "a scheduled report built before the erasure isn't kept");
+
+    // A personal export with more earlier addresses than it lists says so at the top.
+    let p: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "many@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query(
+        "INSERT INTO consent_events (id, account_id, profile_id, channel, field, old_value, new_value, method, address)
+         SELECT gen_random_uuid(), $1, $2, 'email', 'address', NULL, 'x', 'api', 'old' || i || '@x.test' FROM generate_series(1, 1001) i",
+    )
+    .bind(acct)
+    .bind(p)
+    .execute(&db)
+    .await
+    .unwrap();
+    let started = h.ok("POST", "/api/people/privacy/export", Some(json!({"email": "many@x.test"}))).await;
+    h.drain().await;
+    let r = h.ok("GET", &format!("/api/people/privacy/requests/{}", started["request_id"].as_str().unwrap()), None).await;
+    let json_file = r["files"].as_array().unwrap().iter().find(|f| f["name"].as_str().unwrap_or("").ends_with(".json")).cloned().unwrap();
+    let fid: Uuid = json_file["url"].as_str().unwrap().rsplit('/').next().unwrap().parse().unwrap();
+    let (_, _, _, bytes) = dumbmail::features::people::privacy::file(&db, acct, fid).await.unwrap();
+    let doc: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(doc["complete"], false, "{}", doc["note"]);
+    assert!(doc["note"].as_str().unwrap().contains("former_identifiers (1000 of 1001)"), "{}", doc["note"]);
+    h.cleanup().await;
+}
+
+/// Item 10: an integration's "subscribed" is reported from what committed: a retained unsubscribe
+/// leaves no "Subscribed to Email Marketing" event.
+#[tokio::test]
+async fn integrations_report_what_committed() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let gone = h.ok("POST", "/api/profiles", Some(json!({"email": "back@x.test", "email_consent": "unsubscribed"}))).await;
+    h.ok("DELETE", &format!("/api/profiles/{}", gone["id"].as_str().unwrap()), None).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "back@x.test"}))).await;
+    use dumbmail::features::integrations::actions;
+    let src = actions::Source { integration_id: Uuid::now_v7(), account_id: acct, name: "Bookings".into(), contacts_opted_in: false, delivery: None, metrics: vec![], ledger: None, redact: vec![] };
+    let raw = vec![json!({"type": "upsert_profile", "email": "back@x.test", "consent": [{"channel": "email", "subscribed": true, "source": "Booking form checkbox"}]})];
+    let acts = actions::parse(&Value::Array(raw.clone()), false).unwrap();
+    let (out, err) = actions::apply(&h.state, &src, &acts, &raw, &Default::default(), &Default::default(), false).await;
+    assert!(err.is_none(), "{err:?}");
+    let subscribed: i64 = sqlx::query_scalar("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Subscribed to Email Marketing'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(subscribed, 0, "nothing claims a subscription that didn't stick: {:?}", serde_json::to_value(&out).ok());
+    h.cleanup().await;
+}
+
+/// Item 11: a batch that fails for a passing reason runs again from the committed cursor instead of
+/// failing the whole action.
+#[tokio::test]
+async fn a_bulk_batch_that_hits_a_passing_error_is_tried_again() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    sqlx::query("INSERT INTO profiles (id, account_id, email) SELECT gen_random_uuid(), $1, 'r' || i || '@x.test' FROM generate_series(1, 1203) i").bind(acct).execute(&db).await.unwrap();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "All"}))).await;
+    // The second batch's insert fails once with a serialization conflict.
+    sqlx::query("CREATE SEQUENCE fail_once").execute(&db).await.unwrap();
+    sqlx::query("CREATE FUNCTION fail_second() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('fail_once') = 2 THEN RAISE EXCEPTION 'conflict' USING ERRCODE = '40001'; END IF; RETURN NULL; END $$").execute(&db).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_second BEFORE INSERT ON list_members FOR EACH STATEMENT EXECUTE FUNCTION fail_second()").execute(&db).await.unwrap();
+    let job = bulk(&mut h, json!({"action": "add_to_list", "list_id": list["id"], "selection": {"q": "@x.test"}})).await;
+    for _ in 0..10 {
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'people_bulk'").execute(&db).await.unwrap();
+        h.drain().await;
+    }
+    let done = h.ok("GET", &format!("/api/people/bulk/{}", job["id"].as_str().unwrap()), None).await;
+    assert_eq!(done["status"], "done", "{done}");
+    let members: i64 = sqlx::query_scalar("SELECT count(*) FROM list_members WHERE list_id = $1::uuid").bind(list["id"].as_str().unwrap()).fetch_one(&db).await.unwrap();
+    assert_eq!(members, 1203);
+    h.cleanup().await;
+}

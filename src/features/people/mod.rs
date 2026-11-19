@@ -98,9 +98,13 @@ pub fn bulk_perms(action: &str) -> &'static [Perm] {
     }
 }
 
-fn require_bulk(ctx: &Ctx, action: &str) -> AppResult<()> {
-    for p in bulk_perms(action) {
+fn require_bulk(ctx: &Ctx, b: &bulk::BulkBody) -> AppResult<()> {
+    for p in bulk_perms(&b.action) {
         access::require(ctx, *p)?;
+    }
+    // A property ad audiences read as an opt-out changes only with privacy.manage.
+    if matches!(b.action.as_str(), "set_property" | "clear_property") && b.key.as_deref().is_some_and(|k| consent::AD_PROPERTY_KEYS.contains(&k.trim().to_ascii_lowercase().as_str())) {
+        access::require(ctx, Perm::Privacy)?;
     }
     Ok(())
 }
@@ -353,7 +357,7 @@ async fn audit_merge(s: &AppState, ctx: &Ctx, b: &merge::MergeBody, out: &Value)
 
 /// Start (or preview) a bulk action, with the action's own permission checked first.
 async fn start_bulk(s: &AppState, ctx: &Ctx, b: &bulk::BulkBody, src: &ConsentSource) -> AppResult<Value> {
-    require_bulk(ctx, &b.action)?;
+    require_bulk(ctx, b)?;
     let out = bulk::start(s, ctx.account_id, b, src).await?;
     if b.confirm && out["id"].is_string() {
         let id = out["id"].as_str().unwrap_or_default().to_string();
@@ -403,10 +407,39 @@ async fn requests_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<PageQue
     Ok(Json(json!({"data": data, "total": total})))
 }
 
+/// A stored file, streamed chunk by chunk. Its kind is checked against the caller's permission from
+/// its metadata before a single byte is read, and the stream stops at `MAX_DOWNLOAD_BYTES`.
 async fn file_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Response> {
-    let (kind, name, ct, bytes) = privacy::file(&s.db, ctx.account_id, id).await?;
+    let (kind, name, ct, seqs) = privacy::file_meta(&s.db, ctx.account_id, id).await?;
     access::require(&ctx, file_perm(&kind))?;
-    Ok(download(&name, &ct, bytes))
+    let db = s.db.clone();
+    let stream = futures_util::stream::unfold((0usize, 0usize), move |(i, sent)| {
+        let db = db.clone();
+        let seqs = seqs.clone();
+        async move {
+            let seq = *seqs.get(i)?;
+            let item = match privacy::file_chunk(&db, id, seq).await {
+                Ok(b) if sent + b.len() > privacy::MAX_DOWNLOAD_BYTES => Err(std::io::Error::other("file too large to download")),
+                Ok(b) => Ok(axum::body::Bytes::from(b)),
+                Err(e) => Err(std::io::Error::other(e)),
+            };
+            let size = item.as_ref().map(|b| b.len()).unwrap_or(0);
+            // After an error the stream ends (the next index is past the end).
+            let next = if item.is_err() { seqs.len() } else { i + 1 };
+            Some((item, (next, sent + size)))
+        }
+    });
+    let safe: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
+    Ok((
+        [
+            (header::CONTENT_TYPE, ct),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{safe}\"")),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 // ---------- MCP ----------

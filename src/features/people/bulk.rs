@@ -214,7 +214,14 @@ pub async fn start(state: &AppState, account_id: Uuid, b: &BulkBody, src: &Conse
     let mut qb = QueryBuilder::new("INSERT INTO bulk_action_targets (bulk_id, seq, profile_id) SELECT ");
     qb.push_bind(id).push(", (row_number() OVER (ORDER BY p.id))::int, p.id");
     push_selection(&mut qb, account_id, &b.selection, seg.as_ref());
+    // The cap is kept by the statement that saves the set (more may have matched since the count).
+    qb.push(" ORDER BY p.id LIMIT ").push_bind(MAX_PROFILES + 1);
     let saved = qb.build().execute(&mut *tx).await?.rows_affected() as i64;
+    if saved > MAX_PROFILES {
+        drop(tx);
+        return Ok(json!({"dry_run": true, "count": saved, "action": b.action, "destructive": destructive, "set_id": null,
+            "note": format!("Nothing changed. More than {MAX_PROFILES} profiles match, more than a bulk action can cover; narrow the selection.")}));
+    }
     let expires: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("UPDATE bulk_actions SET total = $2 WHERE id = $1 RETURNING expires_at").bind(id).bind(saved as i32).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(json!({
@@ -357,10 +364,35 @@ pub async fn recent(db: &PgPool, account_id: Uuid, limit: i64) -> AppResult<Vec<
 pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let Some(id) = payload["bulk_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
     if let Err(e) = run_batch(state, id).await {
+        // A passing database hiccup (a deadlock, a serialization conflict, a lost connection): the
+        // batch rolled back whole, so the same batch runs again from the committed cursor, a few times.
+        let attempt = payload["attempt"].as_u64().unwrap_or(0);
+        if transient(&e) && attempt < RETRIES {
+            tracing::warn!(bulk = %id, attempt, error = ?e, "bulk batch failed for a passing reason; trying it again");
+            let wait = chrono::Duration::seconds(5 * 2i64.pow(attempt as u32));
+            crate::jobs::enqueue_background(&state.db, JOB, json!({"bulk_id": id, "attempt": attempt + 1}), Some(chrono::Utc::now() + wait)).await?;
+            return Ok(());
+        }
         tracing::error!(bulk = %id, error = ?e, "bulk action failed");
         fail(&state.db, id, &e.public_message()).await?;
     }
     Ok(())
+}
+
+/// How often a batch that failed for a passing reason is tried again.
+const RETRIES: u64 = 5;
+
+/// A failure worth trying again: the database was busy, deadlocked or briefly unreachable.
+fn transient(e: &AppError) -> bool {
+    match e {
+        AppError::Busy(_) => true,
+        AppError::Internal(a) => match a.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Protocol(_)) => true,
+            Some(sqlx::Error::Database(d)) => d.code().is_some_and(|c| matches!(c.as_ref(), "40001" | "40P01" | "55P03" | "57014" | "53300") || c.starts_with("08")),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 async fn fail(db: &PgPool, id: Uuid, msg: &str) -> sqlx::Result<()> {
