@@ -30,7 +30,8 @@ CREATE TABLE screenings (
     verdict      text NOT NULL CHECK (verdict IN ('pass', 'review', 'block')),
     reasons      jsonb NOT NULL DEFAULT '[]',
     signals      jsonb NOT NULL DEFAULT '{}',
-    source       text NOT NULL CHECK (source IN ('rules', 'ai', 'operator')),
+    -- `existing`: content that was already live when screening started (recorded once, no check).
+    source       text NOT NULL CHECK (source IN ('rules', 'ai', 'operator', 'existing')),
     model        text,
     input_tokens  integer,
     output_tokens integer,

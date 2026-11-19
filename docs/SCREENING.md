@@ -21,7 +21,9 @@ Also while an account isn't approved:
 - Flow notifications go only to the account's members; while it's blocked, to nobody.
 - An account in review because of an engagement pause: its flow email waits (up to 3 days, like any flow message) instead of being skipped by the pause; campaigns stop as the pause stops them.
 
-Push isn't held for a pending or in-review account; a blocked account sends no push. Transactional email has its own restricted mode.
+WhatsApp follows the standing exactly like texts: campaigns, flow steps, inbox and keyword replies, tests (which go only to a team member's verified number) and its own final claim. Its opt-out answers always go; its sign-up confirmation goes before approval only in DumbMail's own wording. The text of a WhatsApp template, filled with the message's values, is screened like any message.
+
+Push isn't held for a pending or in-review account; a blocked account sends no push. Transactional email has its own restricted mode; a store's hub sign-in codes (a person asked for one) go from pending and in-review accounts, and not from a blocked one.
 
 The standing is read twice: early, from the account the send started with, and again in the statement that makes the final claim before the provider is called (an email's last check, a text's claim, a push's claim; a test email checks again that it goes to a current member). A message past that claim has been handed to the provider and can't be recalled.
 
@@ -94,7 +96,11 @@ Each message version gets its own fingerprint, and sending checks what it's abou
 
 The same content is judged once: relaunching or rescheduling it unchanged uses the earlier verdict and costs nothing. A pass the rules gave alone while Claude couldn't be reached is judged again the next time.
 
-If the model can't be reached for an established account (approved, at least 1,000 real emails over at least 14 days, no pause in the last 30 days), the rules decide and the send goes ahead, and the campaign's screening says it was checked by rules only. For any other account the content is held for a person.
+Content that was already live when screening started is recorded as passed (source `existing`), once, when the server starts after the upgrade, with no check: approved accounts' live flows (their steps, with the saved blocks and language versions they use) and their scheduled or sending campaigns. Nothing that was running waits or is held; any later edit is checked as usual.
+
+**No API key set** (no `ANTHROPIC_API_KEY` on the server at all) isn't an outage: an approved account's content is judged by the rules alone and goes out if they pass (a rules review or block still holds it). A new account's first check still goes to a person. The operator page says when no key is set.
+
+If a key is set but the model can't be reached for an established account (approved, at least 1,000 real emails over at least 14 days, no pause in the last 30 days), the rules decide and the send goes ahead, and the campaign's screening says it was checked by rules only. For any other account the content is held for a person.
 
 Sending waits for the check: everything (rendering, the checks, the notices) within 45 seconds; the dashboard shows "Checking your email…".
 

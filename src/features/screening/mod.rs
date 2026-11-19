@@ -42,7 +42,7 @@ use crate::state::AppState;
 
 pub use content::{before_flow_edit, before_flow_live, before_launch, before_saved_block_edit, content_changed};
 pub use domains::check_domain;
-pub use gate::{final_stop, in_flow_run, notification_stop_sql, send_gate, standing_sql, stop_if_held, test_email_stop, tests_only_to_members, FinalStop, BLOCKED, NOT_APPROVED};
+pub use gate::{blocks_transactional, final_stop, inbox_reply_allowed, whatsapp_stop, in_flow_run, notification_stop_sql, send_gate, standing_sql, stop_if_held, test_email_stop, tests_only_to_members, FinalStop, BLOCKED, NOT_APPROVED};
 pub use imports::check_import;
 pub use standing::Standing;
 
@@ -146,6 +146,13 @@ impl Feature for Module {
         if tick.is_multiple_of(180) {
             crate::jobs::enqueue_background(&state.db, engagement::JOB, serde_json::json!({}), None).await?;
         }
+        Ok(())
+    }
+
+    /// Content already live when screening started is recorded as passed (see
+    /// `content::record_existing`).
+    async fn after_start(&self, state: &AppState) -> anyhow::Result<()> {
+        content::record_existing(state).await?;
         Ok(())
     }
 

@@ -155,7 +155,7 @@ impl Collected {
 /// [`for_model`]). Over-long text is marked, not cut.
 fn variant(channel: &str, c: &Value, label: &str, language: &str) -> (Value, bool) {
     let mut col = Collected::default();
-    let (subject, preview) = if channel == "sms" {
+    let (subject, preview) = if channel == "sms" || channel == "whatsapp" {
         let body = c["body"].as_str().unwrap_or("");
         col.text.push(body.to_string());
         for m in BARE_URL.find_iter(body) {
@@ -230,6 +230,11 @@ async fn with_saved_blocks(state: &AppState, account_id: Uuid, content: &Value) 
 
 /// Every variant of one message: its default text and each language version.
 async fn variants(state: &AppState, account: &Account, channel: &str, content: &Value, label: &str) -> AppResult<Vec<(Value, bool)>> {
+    if channel == "whatsapp" {
+        // A WhatsApp message is its template's text filled with the message's own values.
+        let text = whatsapp_text(state, account, content).await;
+        return Ok(vec![variant("whatsapp", &json!({"body": text}), label, "")]);
+    }
     let content = with_saved_blocks(state, account.id, content).await?;
     let (_, mut langs) = crate::features::translations::fields::languages(&content);
     if let Some(b) = content.get("blocks") {
@@ -243,6 +248,20 @@ async fn variants(state: &AppState, account: &Account, channel: &str, content: &
         out.push(variant(channel, &crate::features::translations::fields::localize(&content, &l, &own), label, &l));
     }
     Ok(out)
+}
+
+/// A WhatsApp message's text: its template filled with the message's values (and a sample person),
+/// or the template's own text when it can't be filled.
+async fn whatsapp_text(state: &AppState, account: &Account, content: &Value) -> String {
+    use crate::features::whatsapp::{content as wa, templates};
+    let Ok(c) = wa::parse(content) else { return String::new() };
+    let Some(tid) = c.template_id else { return String::new() };
+    let Ok(t) = templates::get(&state.db, account.id, tid).await else { return String::new() };
+    let ctx = crate::render::context(account, None, None, "");
+    match wa::render(&t, &c, &ctx, None) {
+        Ok(r) => r.text,
+        Err(_) => serde_json::to_string(&t).unwrap_or_default(),
+    }
 }
 
 /// What a check is about.
@@ -291,7 +310,7 @@ fn steps(def: &Value) -> BTreeMap<String, (String, Value)> {
         .into_iter()
         .filter_map(|n| {
             let channel = match n.kind.as_str() {
-                "email" | "sms" => n.kind.clone(),
+                "email" | "sms" | "whatsapp" => n.kind.clone(),
                 "review_request" => n.data.get("channel").and_then(|c| c.as_str()).unwrap_or("email").to_string(),
                 _ => return None,
             };
@@ -504,6 +523,14 @@ pub async fn check(state: &AppState, account: &Account, m: &Material, deadline: 
                 let est = established(state, account.id).await?;
                 signals["model"] = json!({"unavailable": e.describe(), "established": est});
                 match e {
+                    // No key configured at all isn't an outage: an approved account's content is
+                    // judged by the rules alone.
+                    NoJudgment::NotConfigured if standing::of(state, account) == Standing::Approved => {
+                        if rules_verdict == Verdict::Pass {
+                            reasons.push("Checked by our rules only: this server has no AI check set up.".into());
+                        }
+                        rules_verdict
+                    }
                     NoJudgment::Unavailable(_) if est => {
                         if rules_verdict == Verdict::Pass {
                             reasons.push("Checked by our rules only: our AI check couldn't be reached, and your account's sending history let it go ahead.".into());
@@ -963,6 +990,67 @@ pub async fn campaign_at_send(state: &AppState, account: &Account, c: &CampaignR
             Ok(AtSend::Wait(Utc::now() + chrono::Duration::seconds(60), "content not checked"))
         }
     }
+}
+
+/// When screening starts (each start, after the migrations; idempotent): content approved
+/// accounts already have live is recorded as passed, with source `existing` and no model call, so
+/// nothing that runs today waits or is held. Live flows (their current steps, with the saved
+/// blocks and language versions they use) and campaigns that are scheduled or sending, each only
+/// if it has no content screening yet. Later edits are checked as usual. Returns how many.
+pub async fn record_existing(state: &AppState) -> anyhow::Result<usize> {
+    if !super::on(state) {
+        return Ok(0);
+    }
+    let mut done = 0;
+    let flows: Vec<FlowRow> = sqlx::query_as(
+        "SELECT f.* FROM flows f JOIN accounts a ON a.id = f.account_id
+         WHERE a.sending_review = 'approved' AND a.closed_at IS NULL AND f.status = 'live'
+           AND NOT EXISTS (SELECT 1 FROM screenings s WHERE s.account_id = f.account_id AND s.kind = 'content' AND s.subject_id = f.id)
+         ORDER BY f.id LIMIT 20000",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let campaigns: Vec<CampaignRow> = sqlx::query_as(
+        "SELECT c.* FROM campaigns c JOIN accounts a ON a.id = c.account_id
+         WHERE a.sending_review = 'approved' AND a.closed_at IS NULL AND c.status IN ('scheduled', 'sending') AND c.channel <> 'push'
+           AND NOT EXISTS (SELECT 1 FROM screenings s WHERE s.account_id = c.account_id AND s.kind = 'content' AND s.subject_id = c.id)
+         ORDER BY c.id LIMIT 20000",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut accounts: HashMap<Uuid, Account> = HashMap::new();
+    let items: Vec<(Uuid, Either<'_>)> = flows.iter().map(|f| (f.account_id, Either::Flow(f))).chain(campaigns.iter().map(|c| (c.account_id, Either::Campaign(c)))).collect();
+    for (account_id, m) in items {
+        if let std::collections::hash_map::Entry::Vacant(e) = accounts.entry(account_id) {
+            e.insert(crate::campaigns::load_account(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?);
+        }
+        let account = &accounts[&account_id];
+        let material = match m {
+            Either::Flow(f) => flow_material(state, account, f, &steps(&f.definition)).await,
+            Either::Campaign(c) => campaign_material(state, account, c).await,
+        };
+        let Ok(material) = material else { continue };
+        if material.messages.is_empty() {
+            continue;
+        }
+        let mut row = New::rules("content", Verdict::Pass, &[], json!({"existing": true}));
+        row.source = "existing";
+        row.subject = Some(material.subject);
+        row.subject_id = Some(material.subject_id);
+        row.subject_name = Some(material.name.clone());
+        row.part_hashes = material.parts.clone();
+        standing::record(&state.db, account_id, row).await?;
+        done += 1;
+    }
+    if done > 0 {
+        tracing::info!(recorded = done, "sender screening: content already live recorded as passed");
+    }
+    Ok(done)
+}
+
+enum Either<'a> {
+    Flow(&'a FlowRow),
+    Campaign(&'a CampaignRow),
 }
 
 const TOO_BIG_WAIT: &str = "Our automatic check couldn't finish in time, so a person will look at this.";

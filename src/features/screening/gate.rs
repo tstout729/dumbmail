@@ -78,7 +78,7 @@ fn run_key(spec: &SendSpec<'_>) -> String {
 
 /// The send path's early check, before the email pause check. Some(outcome): don't send.
 pub async fn send_gate(state: &AppState, spec: &SendSpec<'_>, to: &str, conversational: Option<&'static str>) -> AppResult<Option<Outcome>> {
-    if !super::on(state) || !matches!(spec.channel, "email" | "sms") {
+    if !super::on(state) || !matches!(spec.channel, "email" | "sms" | "whatsapp") {
         return Ok(None);
     }
     let st = standing::of(state, spec.account);
@@ -165,6 +165,27 @@ async fn skip(state: &AppState, spec: &SendSpec<'_>, to: &str, reason: &str) -> 
     let id = match spec.message_id {
         Some(mid) => {
             let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status IN ('queued', 'sending')").bind(mid).bind(reason).execute(&state.db).await?.rows_affected();
+            // An id a flow keeps with its run (push, WhatsApp) may have no row yet: write it skipped.
+            let n = if n > 0 {
+                n
+            } else {
+                sqlx::query(
+                    "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'skipped', $9) ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(mid)
+                .bind(spec.account.id)
+                .bind(spec.profile.id)
+                .bind(spec.channel)
+                .bind(spec.campaign_id)
+                .bind(spec.flow_id)
+                .bind(spec.flow_node_id)
+                .bind(to)
+                .bind(reason)
+                .execute(&state.db)
+                .await?
+                .rows_affected()
+            };
             (n > 0).then_some(mid)
         }
         None => {
@@ -234,6 +255,46 @@ pub fn final_stop(standing: &str, spec: &SendSpec<'_>, conversational: Option<&s
     Some(FinalStop::Skip(reason))
 }
 
+/// WhatsApp's final claim (`whatsapp::send`), from the standing it just read, by the message's
+/// kind there: `marketing` (campaigns, flows, tests) or a conversational kind. Tests already go
+/// only to members' verified numbers. Of the conversational kinds, an opt-out confirmation always
+/// goes; a sign-up confirmation goes before approval only in DumbMail's own wording; replies the
+/// account writes wait.
+pub fn whatsapp_stop(standing: &str, kind: &str, is_test: bool, campaign: bool, flow: bool, body: &str) -> Option<FinalStop> {
+    let st = Standing::parse(Some(standing));
+    if st == Standing::Approved || kind == "optout_confirmation" {
+        return None;
+    }
+    let reason = if st == Standing::Blocked { BLOCKED } else { NOT_APPROVED };
+    if st == Standing::Blocked {
+        return Some(FinalStop::Skip(reason));
+    }
+    if kind == "marketing" {
+        return if is_test {
+            None
+        } else if flow && !campaign {
+            Some(FinalStop::Defer(Utc::now() + chrono::Duration::minutes(FLOW_RETRY_MINUTES)))
+        } else {
+            Some(FinalStop::Skip(reason))
+        };
+    }
+    (!(kind == "confirmation" && WA_CONFIRMATION.captures(body).is_some_and(|c| !LINKISH.is_match(&c[1])))).then_some(FinalStop::Skip(reason))
+}
+
+/// WhatsApp's own confirmations (`whatsapp::inbox`): a sign-up with no custom reply, or START.
+static WA_CONFIRMATION: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"^(?:Thanks! You're subscribed to WhatsApp messages from (.{1,120})\.|You're subscribed to WhatsApp messages from (?:.{1,120}) again\.) Reply STOP to unsubscribe\.$").unwrap()
+});
+static LINKISH: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(?i)https?:|www\.|@|[a-z0-9-]+\.[a-z]{2,}|\d{5,}").unwrap());
+
+/// An inbox reply the account writes (texts, WhatsApp): refused, saying why, until it's approved.
+pub fn inbox_reply_allowed(state: &AppState, account: &Account) -> AppResult<()> {
+    match standing::of(state, account) {
+        Standing::Approved => Ok(()),
+        st => Err(AppError::Conflict(format!("Not sent. {}", standing::hold_message(st)))),
+    }
+}
+
 /// A test email's final check (tests have no other last check): while the account isn't approved
 /// it may only reach a current member, and from a blocked account nothing goes. Some(reason): don't.
 pub async fn test_email_stop(state: &AppState, spec: &SendSpec<'_>, to: &str) -> AppResult<Option<&'static str>> {
@@ -254,6 +315,12 @@ pub async fn test_email_stop(state: &AppState, spec: &SendSpec<'_>, to: &str) ->
         _ if !member => Some(NOT_APPROVED),
         _ => None,
     })
+}
+
+/// Whether the account's standing stops even transactional email it sends itself (a hub sign-in
+/// code): only when it's blocked.
+pub fn blocks_transactional(state: &AppState, account: &Account) -> bool {
+    standing::of(state, account) == Standing::Blocked
 }
 
 // ---------- Campaigns ----------
@@ -342,6 +409,15 @@ mod tests {
         assert!(!fixed_compliance("confirmation", "Acme VIP: Here's 20% off! Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."));
         assert!(fixed_compliance("help", "anything"));
         assert!(!fixed_compliance("keyword_reply", d));
+        // WhatsApp: the account's own words wait; its fixed confirmations and opt-out answers don't.
+        assert_eq!(whatsapp_stop("pending", "reply", false, false, false, "hi"), Some(FinalStop::Skip(NOT_APPROVED)));
+        assert_eq!(whatsapp_stop("pending", "keyword_reply", false, false, false, "hi"), Some(FinalStop::Skip(NOT_APPROVED)));
+        assert_eq!(whatsapp_stop("pending", "confirmation", false, false, false, "Thanks! You're subscribed to WhatsApp messages from Acme. Reply STOP to unsubscribe."), None);
+        assert!(whatsapp_stop("pending", "confirmation", false, false, false, "Free crypto at evil.test! Reply STOP to unsubscribe.").is_some());
+        assert_eq!(whatsapp_stop("blocked", "optout_confirmation", false, false, false, ""), None);
+        assert_eq!(whatsapp_stop("pending", "marketing", true, true, false, ""), None, "tests go to members' verified numbers");
+        assert!(matches!(whatsapp_stop("review", "marketing", false, false, true, ""), Some(FinalStop::Defer(_))));
+        assert_eq!(whatsapp_stop("blocked", "marketing", true, true, false, ""), Some(FinalStop::Skip(BLOCKED)));
         // Nothing at all while blocked.
         assert!(conversational_gate(Standing::Blocked, "help", "x").unwrap().is_some());
         assert!(conversational_gate(Standing::Pending, "help", "x").unwrap().is_none());

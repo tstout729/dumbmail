@@ -83,7 +83,9 @@ pub struct Judgment {
 /// Why there's no judgment. Each is short and safe to store.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoJudgment {
-    /// No key, the service failing, too slow, cut off or unreadable: "model unavailable".
+    /// No ANTHROPIC_API_KEY on this server at all (not an outage).
+    NotConfigured,
+    /// The service failing, too slow, cut off or unreadable: "model unavailable".
     Unavailable(String),
     /// The model declined to look at it: a person checks it.
     Refused,
@@ -94,6 +96,7 @@ pub enum NoJudgment {
 impl NoJudgment {
     pub fn describe(&self) -> String {
         match self {
+            NoJudgment::NotConfigured => "no ANTHROPIC_API_KEY set".into(),
             NoJudgment::Unavailable(c) => format!("model unavailable ({c})"),
             NoJudgment::Refused => "the model declined to judge it".into(),
             NoJudgment::OverDailyLimit => format!("over {DAILY_CALLS} AI checks today"),
@@ -151,7 +154,7 @@ async fn take_daily(state: &AppState, account_id: Uuid) -> sqlx::Result<bool> {
 /// waiting on the API.
 pub async fn judge(state: &AppState, account_id: Uuid, task: &str, material: &Value, deadline: Duration) -> Result<Judgment, NoJudgment> {
     let Some(key) = state.cfg.anthropic_api_key.as_deref().filter(|k| !k.trim().is_empty()) else {
-        return Err(NoJudgment::Unavailable("no ANTHROPIC_API_KEY set".into()));
+        return Err(NoJudgment::NotConfigured);
     };
     let user = format!("<customer_material>\n{}\n</customer_material>", serde_json::to_string(material).unwrap_or_default().replace("</customer_material>", "<\\/customer_material>"));
     let body = json!({

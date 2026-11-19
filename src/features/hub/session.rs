@@ -235,9 +235,10 @@ pub enum Requested {
 }
 
 /// Whether the store may email a code now. The send itself also refuses while sending is paused.
-/// Once sender screening is on `main`, an account it has blocked sends no code here either.
-pub fn may_send_code(account: &Account) -> bool {
-    account.closed_at.is_none() && account.sending_paused_at.is_none()
+/// An account sender screening has blocked sends none (pending and in-review accounts may: the
+/// code is transactional, to a person who asked for it).
+pub fn may_send_code(state: &AppState, account: &Account) -> bool {
+    account.closed_at.is_none() && account.sending_paused_at.is_none() && !crate::features::screening::blocks_transactional(state, account)
 }
 
 /// Ask for a code for `email`. Writes the row (and its send job) whether or not the address is
@@ -254,7 +255,7 @@ pub async fn request_code(state: &AppState, account: &Account, email: &str, ip: 
     }
     let profile_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND email = $2").bind(account.id).bind(&email).fetch_optional(&mut *tx).await?;
     let id = Uuid::now_v7();
-    let hash = profile_id.filter(|_| may_send_code(account)).map(|_| code_hash(state, id, &code_for(state, id)));
+    let hash = profile_id.filter(|_| may_send_code(state, account)).map(|_| code_hash(state, id, &code_for(state, id)));
     // The limits are checked in the statement that writes the row, under the locks above.
     let written: Option<Uuid> = sqlx::query_scalar(
         &format!("INSERT INTO hub_codes (id, account_id, profile_id, email_hash, ip_hash, code_hash, expires_at, generation)
@@ -354,9 +355,10 @@ pub async fn run_send_code(state: &AppState, payload: &Value) -> anyhow::Result<
          WHERE c.id = $1 AND c.used_at IS NULL AND c.expires_at > now()
            AND c.id = (SELECT n.id FROM hub_codes n WHERE n.account_id = c.account_id AND n.email_hash = c.email_hash ORDER BY n.created_at DESC LIMIT 1)
            AND c.generation = {}
-           AND s.enabled AND a.closed_at IS NULL AND a.sending_paused_at IS NULL
+           AND s.enabled AND a.closed_at IS NULL AND a.sending_paused_at IS NULL AND {} <> 'blocked'
            AND p.email IS NOT NULL AND p.email_suppressed_reason IS NULL",
-        generation_sql("p.id")
+        generation_sql("p.id"),
+        crate::features::screening::standing_sql(state, "a")
     ))
     .bind(id)
     .fetch_optional(&state.db)
@@ -367,7 +369,7 @@ pub async fn run_send_code(state: &AppState, payload: &Value) -> anyhow::Result<
         return Ok(());
     }
     let account = crate::campaigns::load_account(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    if !may_send_code(&account) {
+    if !may_send_code(state, &account) {
         return Ok(());
     }
     let Some(from_email) = account.from_email.clone() else { return Ok(()) };

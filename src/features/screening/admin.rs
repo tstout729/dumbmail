@@ -46,10 +46,11 @@ async fn list_h(State(state): State<AppState>, headers: HeaderMap) -> AppResult<
     )
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(json!({
-        "accounts": accounts,
-        "notes": ["Opens are always tracked on DumbMail campaign email, so no campaign is left out of the open-rate checks."],
-    })))
+    let mut notes = vec!["Opens are always tracked on DumbMail campaign email, so no campaign is left out of the open-rate checks."];
+    if state.cfg.anthropic_api_key.as_deref().is_none_or(|k| k.trim().is_empty()) {
+        notes.push("No ANTHROPIC_API_KEY is set: approved accounts' content is judged by the rules alone (a rules review or block still holds it), and every new account's first check comes here for a person.");
+    }
+    Ok(Json(json!({"accounts": accounts, "notes": notes})))
 }
 
 #[derive(Deserialize)]

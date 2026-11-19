@@ -1216,3 +1216,91 @@ async fn item11_failed_mail_lookups_are_unknown() {
     assert_eq!((verdict.as_str(), checked), ("review", 20));
     h.cleanup().await;
 }
+
+// ---------- Rulings: nothing live waits after deploy; no key isn't an outage ----------
+
+#[tokio::test]
+async fn ruling1_content_live_at_deploy_sends_at_once_and_later_edits_are_checked() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    // Live before screening started (turned on and scheduled directly, with no check).
+    let f = h
+        .ok("POST", "/api/flows", Some(json!({"name": "W", "trigger": {"type": "metric", "metric": "Joined"}, "definition": {"entry": "e", "nodes": [
+            {"id": "e", "type": "email", "content": {"subject": "Welcome", "blocks": [{"type": "text", "html": "<p>Thanks for joining.</p>"}]}, "next": null}]}})))
+        .await;
+    let fid = f["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE flows SET status = 'live' WHERE id = $1::uuid").bind(&fid).execute(&h.state.db).await.unwrap();
+    let cid = campaign(&mut h, "Fall", soap(), &["ann@x.test"]).await;
+    sqlx::query("UPDATE campaigns SET status = 'scheduled', send_at = now() + interval '1 day' WHERE id = $1::uuid").bind(&cid).execute(&h.state.db).await.unwrap();
+    // The deploy step (once; running it again records nothing more).
+    let n = dumbmail::features::screening::content::record_existing(&h.state).await.unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(dumbmail::features::screening::content::record_existing(&h.state).await.unwrap(), 0, "idempotent");
+    let src: Vec<String> = sqlx::query_scalar("SELECT source FROM screenings WHERE kind = 'content'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(src, vec!["existing".to_string(), "existing".to_string()]);
+    // Both send at once, with no model call.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "new@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Joined", "profile": {"email": "new@x.test"}}))).await;
+    h.drain().await;
+    assert!(h.state.email.sent().iter().any(|m| m.to == "new@x.test"), "the live flow sends at once");
+    sqlx::query("UPDATE campaigns SET send_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&cid).execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    assert!(h.state.email.sent().iter().any(|m| m.to == "ann@x.test"), "the scheduled campaign sends at once");
+    assert!(calls.lock().unwrap().is_empty());
+    // An edit afterwards is checked as usual.
+    sqlx::query("UPDATE flows SET definition = jsonb_set(definition, '{nodes,0,content,blocks,0,html}', '\"<p>New words.</p>\"') WHERE id = $1::uuid").bind(&fid).execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/profiles", Some(json!({"email": "next@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Joined", "profile": {"email": "next@x.test"}}))).await;
+    h.drain().await;
+    assert_eq!(calls.lock().unwrap().len(), 1, "the edited content was checked");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn ruling2_with_no_key_an_approved_accounts_content_is_judged_by_the_rules() {
+    let (mut h, calls) = screened!(false);
+    h.signup().await;
+    approve_directly(&h).await;
+    let cid = campaign(&mut h, "Fall", soap(), &["ann@x.test"]).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert!(h.state.email.sent().iter().any(|m| m.to == "ann@x.test"), "a rules pass goes out");
+    let src: String = sqlx::query_scalar("SELECT source FROM screenings WHERE kind = 'content'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(src, "rules");
+    // A rules review still holds it.
+    let cid = campaign(&mut h, "Re: our call", "<p>Following up.</p>", &["bob@x.test"]).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(standing(&h).await, "approved");
+    assert!(calls.lock().unwrap().is_empty());
+    // The operator page says so.
+    let (_, _, list) = h.raw("GET", "/admin/screening", &[("authorization", ADMIN)], "").await;
+    assert!(list.contains("No ANTHROPIC_API_KEY is set"), "{list}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn ruling2_with_no_key_a_pending_accounts_first_check_goes_to_a_person() {
+    let (mut h, _) = screened!(false);
+    h.signup().await;
+    verify_domain(&h, "acme.test").await;
+    let r = answers(&mut h, "We make handmade soap.").await;
+    assert_eq!(r["status"], "review");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn ruling2_a_key_with_claude_failing_keeps_the_established_rule() {
+    let Some((mut h, _, down)) = screened_down(true).await else { return };
+    h.signup().await;
+    approve_directly(&h).await;
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Not established (no sending history): held for a person.
+    let cid = campaign(&mut h, "Fall", soap(), &["ann@x.test"]).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("A person is checking this"), "{v}");
+    h.cleanup().await;
+}
