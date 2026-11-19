@@ -1,0 +1,27 @@
+{
+  "description": "An api_url that isn't Eventbrite's API is never followed",
+  "doc": "https://www.eventbrite.com/platform/docs/webhooks (example payload; config fields from the same page)",
+  "expect": [
+    {
+      "message": "the webhook doesn't point at Eventbrite's API",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_url": "https://evil.example/v3/orders/1234567890/",
+      "config": {
+        "action": "order.placed",
+        "endpoint_url": "https://dumbmail.example/webhooks/in/x",
+        "user_id": "1548223516143",
+        "webhook_id": "157236"
+      }
+    },
+    "settings": {
+      "event_ids": [
+        "123456",
+        "12345"
+      ]
+    }
+  }
+}

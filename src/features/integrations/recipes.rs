@@ -159,7 +159,9 @@ mod tests {
             if !m["pull"].is_null() {
                 super::super::pull::PullConfig::parse(&m["pull"]).unwrap_or_else(|e| panic!("{}: {}", r.key, e.public_message()));
                 // A recipe's lookups name the part of the vendor's API they stay in.
-                if !m["pull"]["fetch"].is_null() {
+                // ShipStation's API host serves only its API, from the root (/shipments, /orders):
+                // its declared paths are the narrowing there.
+                if !m["pull"]["fetch"].is_null() && r.key != "shipstation" {
                     assert!(m["pull"]["fetch"]["prefix"].as_str().is_some_and(|p| p.len() > 1), "{}: fetch needs a prefix narrower than /", r.key);
                 }
             }
@@ -185,6 +187,7 @@ mod tests {
             all().iter().map(|r| (r.key.clone(), metric_names(&r.manifest["metrics"], true))).filter(|(_, m)| !m.is_empty()).collect();
         let want: std::collections::BTreeMap<String, Vec<String>> = [
             ("bigcommerce", "Placed Order"),
+            ("eventbrite", "Placed Order"),
             ("guesty", "Reservation Confirmed"),
             ("hostaway", "Reservation Confirmed"),
             ("paddle", "Placed Order"),

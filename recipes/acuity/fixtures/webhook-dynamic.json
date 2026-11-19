@@ -1,0 +1,21 @@
+{
+  "description": "A webhook created through the API names the event appointment.rescheduled",
+  "doc": "https://developers.acuityscheduling.com/page/webhooks-webhooks-webhooks (form-encoded body; example \"action=changed&id=13&calendarID=1&appointmentTypeID=13\")",
+  "expect": [
+    {
+      "context": {
+        "action": "rescheduled"
+      },
+      "type": "next_request",
+      "url": "/api/v1/appointments/54321"
+    }
+  ],
+  "input": {
+    "payload": {
+      "action": "appointment.rescheduled",
+      "appointmentTypeID": "1",
+      "calendarID": "27238",
+      "id": "54321"
+    }
+  }
+}

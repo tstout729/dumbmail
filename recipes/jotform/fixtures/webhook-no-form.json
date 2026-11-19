@@ -1,0 +1,33 @@
+{
+  "description": "form_id not set: the submission isn't looked up",
+  "doc": "https://www.jotform.com/answers/1211524-receiving-webhooks-from-jotform and https://www.jotform.com/answers/321875-webhook-access-to-the-submissionid-value (multipart fields formID, submissionID, rawRequest; shown here as the form the webhook is stored as; personal data replaced)",
+  "expect": [
+    {
+      "message": "set form_id in the integration's settings to the form to record",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "formID": "31751954731962",
+      "formTitle": "Contact Us",
+      "ip": "203.0.113.7",
+      "pretty": "Name:Bart Example, Your Message:My door code is 2468, Email:bart.example@example.com",
+      "rawRequest": "{\"q3_name\": {\"first\": \"Bart\", \"last\": \"Example\"}, \"q4_message\": \"My door code is 2468\", \"q5_email\": \"bart.example@example.com\", \"q6_consent\": [\"Yes, send me emails\"], \"q7_interest\": \"Surfing\"}",
+      "submissionID": "237955080346633702",
+      "type": "WEB",
+      "username": "johnsmith",
+      "webhookURL": "https://dumbmail.example/webhooks/in/x"
+    },
+    "settings": {
+      "consent_field": "6",
+      "consent_value": "Yes, send me emails",
+      "copy_fields": [
+        "7",
+        "3"
+      ],
+      "email_field": "5",
+      "form_id": ""
+    }
+  }
+}

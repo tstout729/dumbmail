@@ -1,0 +1,89 @@
+{
+  "description": "An hourly check page: each confirmed arrival is looked up again (the row's own balance isn't evidence); an id that isn't one is skipped",
+  "doc": "https://developers.cloudbeds.com/reference/get_getreservations-2 (fields as documented; personal data replaced)",
+  "expect": [
+    {
+      "query": {
+        "propertyID": "12345",
+        "reservationID": "31415926"
+      },
+      "type": "lookup",
+      "url": "/api/v1.3/getReservation"
+    },
+    {
+      "query": {
+        "propertyID": "12345",
+        "reservationID": "27182818"
+      },
+      "type": "lookup",
+      "url": "/api/v1.3/getReservation"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "page": "1"
+      }
+    }
+  ],
+  "input": {
+    "page": 1,
+    "payload": {
+      "count": 3,
+      "data": [
+        {
+          "adults": "2",
+          "balance": 0,
+          "children": "1",
+          "dateCreated": "2026-11-01T15:04:11Z",
+          "dateModified": "2026-11-10T09:30:00Z",
+          "endDate": "2026-11-21",
+          "guestID": "55501",
+          "guestName": "Robin Example",
+          "mealPlans": "",
+          "origin": "booking engine",
+          "profileID": "p1",
+          "propertyID": "12345",
+          "reservationID": "31415926",
+          "sourceID": "s-1",
+          "sourceName": "Website",
+          "startDate": "2026-11-19",
+          "status": "confirmed",
+          "thirdPartyIdentifier": ""
+        },
+        {
+          "adults": "1",
+          "balance": 150,
+          "children": "0",
+          "dateCreated": "2026-11-02T10:00:00Z",
+          "dateModified": "2026-11-02T10:00:00Z",
+          "endDate": "2026-11-22",
+          "guestID": "55509",
+          "guestName": "Kit Example",
+          "mealPlans": "",
+          "origin": "channel",
+          "profileID": "p2",
+          "propertyID": "12345",
+          "reservationID": "27182818",
+          "sourceID": "ss-2-1",
+          "sourceName": "Booking.com",
+          "startDate": "2026-11-20",
+          "status": "confirmed",
+          "thirdPartyIdentifier": "BKG-1"
+        },
+        {
+          "propertyID": "12345",
+          "reservationID": "../evil",
+          "status": "confirmed"
+        }
+      ],
+      "success": true,
+      "total": 3
+    },
+    "source": "pull",
+    "state": {
+      "from": "2026-11-16",
+      "page": "1",
+      "to": "2026-11-24"
+    }
+  }
+}

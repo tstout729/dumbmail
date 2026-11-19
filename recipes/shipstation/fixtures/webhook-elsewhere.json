@@ -1,0 +1,21 @@
+{
+  "description": "A resource_url that isn't ShipStation's is never followed",
+  "doc": "https://help.shipstation.com/hc/en-us/articles/360025856252-ShipStation-Webhooks (example payload)",
+  "expect": [
+    {
+      "message": "the webhook doesn't point at ShipStation's shipments",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "resource_type": "SHIP_NOTIFY",
+      "resource_url": "https://evil.example/shipments?batchId=1"
+    },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
+    }
+  }
+}

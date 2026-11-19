@@ -85,6 +85,23 @@ pub struct FetchRules {
     /// lookup is refused unless its path, once rendered and normalised, does too. Default `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// Requests an hour this integration's lookups may make (1 to 10,000), when the recipe declares
+    /// it: counted in the database from the requests sent. A lookup over it waits for room (it isn't
+    /// refused and uses up none of its tries). Without it there's no hourly limit.
+    pub per_hour: Option<u32>,
+    /// Requests a minute this integration's credentials may make (the app's documented rate, e.g.
+    /// ShipStation's 40). A lookup over it waits for room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_minute: Option<u32>,
+    /// A header in which the app gives the seconds until its rate window resets (ShipStation's
+    /// `X-Rate-Limit-Reset`), read after a 429 when there's no `Retry-After`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_header: Option<String>,
+    /// What makes two lookups the same while they wait: `record` (default: the path and query;
+    /// a second callback's context replaces the first's) or `record_and_context` (each context is
+    /// its own piece of work, so one never replaces another).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 fn default_fetch_id() -> String {
@@ -111,7 +128,24 @@ impl FetchRules {
         if self.id.len() > 100 || !self.id.starts_with('^') || !self.id.ends_with('$') || regex::Regex::new(&self.id).is_err() {
             return Err(AppError::bad("fetch id must be an anchored pattern (^…$) of up to 100 characters"));
         }
+        if self.per_hour.is_some_and(|n| !(1..=10_000).contains(&n)) {
+            return Err(AppError::bad("fetch per_hour must be 1 to 10000"));
+        }
+        if self.per_minute.is_some_and(|n| !(1..=600).contains(&n)) {
+            return Err(AppError::bad("fetch per_minute must be 1 to 600"));
+        }
+        if self.reset_header.as_ref().is_some_and(|h| h.is_empty() || h.len() > 64 || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+            return Err(AppError::bad("fetch reset_header must be a header name"));
+        }
+        if self.identity.as_deref().is_some_and(|i| i != "record" && i != "record_and_context") {
+            return Err(AppError::bad("fetch identity is record or record_and_context"));
+        }
         Ok(())
+    }
+
+    /// Whether each context is its own piece of work (see `identity`).
+    pub fn context_is_identity(&self) -> bool {
+        self.identity.as_deref() == Some("record_and_context")
     }
 
     /// The lookup a script asked for, if these rules allow it: a `GET` of a declared path and
@@ -123,7 +157,10 @@ impl FetchRules {
         let url = next.url.as_deref().ok_or("a webhook's fetch needs a url (a path)")?;
         let id = regex::Regex::new(&self.id).map_err(|_| "the fetch id pattern isn't valid".to_string())?;
         let segs: Vec<&str> = url.split('/').collect();
-        if !url.starts_with('/') || url.contains('?') || url.contains('#') || url.contains('%') || url.contains('\\') || segs.iter().skip(1).any(|s| s.is_empty() || *s == "." || *s == "..") {
+        // A plain path: no empty segment except a trailing slash (Eventbrite's API paths end with
+        // one), which must then be declared too.
+        let last = segs.len() - 1;
+        if !url.starts_with('/') || url.contains('?') || url.contains('#') || url.contains('%') || url.contains('\\') || segs.iter().enumerate().skip(1).any(|(i, s)| (s.is_empty() && i != last) || *s == "." || *s == "..") {
             return Err(format!("fetch path {:?} isn't a plain path", url.chars().take(100).collect::<String>()));
         }
         // The prefix, rendered, must itself be a plain path, and the lookup must sit under it.
@@ -150,7 +187,11 @@ impl FetchRules {
         let mut query = Map::new();
         for (k, v) in next.query.iter().flatten() {
             let text = plain(v).ok_or_else(|| format!("fetch query {k:?} must be text"))?;
-            if !self.query.iter().any(|q| q == k) || !text.split(',').all(|part| id.is_match(part)) {
+            // A declared `key=value` allows exactly that value (Eventbrite's `expand=refund_requests`);
+            // a declared `key` allows ids.
+            let fixed = self.query.iter().any(|q| q.split_once('=').is_some_and(|(qk, qv)| qk == k && qv == text));
+            let as_id = self.query.iter().any(|q| q == k) && text.split(',').all(|part| id.is_match(part));
+            if !fixed && !as_id {
                 return Err(format!("fetch query {k:?} isn't allowed (or its value isn't an id)"));
             }
             query.insert(k.clone(), Value::String(text));
@@ -814,7 +855,7 @@ async fn read(res: reqwest::Response, place: &str) -> AppResult<Response> {
     if res.status().is_redirection() {
         return Err(AppError::bad(format!("{place} answered with a redirect (HTTP {status}); redirects aren't followed, so use the final address")));
     }
-    let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining", "x-rate-limit-time-reset-ms", "x-rate-limit-requests-left"];
+    let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining", "x-rate-limit-time-reset-ms", "x-rate-limit-requests-left", "x-rate-limit-reset"];
     let headers: Map<String, Value> = res
         .headers()
         .iter()
@@ -1079,6 +1120,36 @@ mod tests {
         }
         let rel = NextRequest { url: Some("/v1/items?page=2".into()), ..Default::default() };
         assert_eq!(build(&cfg, &rel, &v).unwrap().url, "https://api.example.com/v1/items?page=2");
+    }
+
+    #[test]
+    fn a_lookup_may_end_with_a_slash_only_where_declared() {
+        let cfg = PullConfig::parse(&json!({"url": "https://www.eventbriteapi.com/v3/orders", "fetch": {"prefix": "/v3/", "paths": ["/v3/orders/{id}/", "/v3/events/{id}/attendees/{id}/", "/v3/plain/{id}"]}})).unwrap();
+        let rules = cfg.fetch.unwrap();
+        let empty = Map::new();
+        let v = vars(&empty, &empty, &empty, false);
+        let ask = |url: &str| rules.allow(&NextRequest { url: Some(url.into()), ..Default::default() }, &v);
+        assert!(ask("/v3/orders/123/").is_ok());
+        assert!(ask("/v3/events/9/attendees/12/").is_ok());
+        assert!(ask("/v3/orders/123").is_err(), "the declared path has the slash");
+        assert!(ask("/v3/plain/7/").is_err(), "this one doesn't");
+        assert!(ask("/v3/plain/7").is_ok());
+        assert!(ask("/v3/orders//").is_err());
+        assert!(ask("/v3//orders/123/").is_err());
+    }
+
+    #[test]
+    fn a_declared_query_value_is_allowed_exactly() {
+        let cfg = PullConfig::parse(&json!({"url": "https://www.eventbriteapi.com/v3/orders", "fetch": {"prefix": "/v3/", "paths": ["/v3/orders/{id}/"], "query": ["expand=refund_requests", "page"]}})).unwrap();
+        let rules = cfg.fetch.unwrap();
+        let empty = Map::new();
+        let v = vars(&empty, &empty, &empty, false);
+        let ask = |k: &str, val: &str| rules.allow(&NextRequest { url: Some("/v3/orders/1/".into()), query: Some(obj(json!({k: val}))), ..Default::default() }, &v);
+        assert!(ask("expand", "refund_requests").is_ok());
+        assert!(ask("expand", "attendees").is_err(), "only the declared value");
+        assert!(ask("expand", "refund_requests,attendees").is_err());
+        assert!(ask("page", "2").is_ok());
+        assert!(ask("page", "x").is_err());
     }
 
     #[test]

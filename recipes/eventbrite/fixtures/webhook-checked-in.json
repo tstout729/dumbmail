@@ -1,0 +1,27 @@
+{
+  "description": "attendee.checked_in: fetch the attendee",
+  "doc": "https://www.eventbrite.com/platform/docs/webhooks (example payload; config fields from the same page)",
+  "expect": [
+    {
+      "type": "next_request",
+      "url": "/v3/events/12345/attendees/12345/"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_url": "https://www.eventbriteapi.com/v3/events/12345/attendees/12345/",
+      "config": {
+        "action": "attendee.checked_in",
+        "endpoint_url": "https://dumbmail.example/webhooks/in/x",
+        "user_id": "1548223516143",
+        "webhook_id": "157236"
+      }
+    },
+    "settings": {
+      "event_ids": [
+        "123456",
+        "12345"
+      ]
+    }
+  }
+}

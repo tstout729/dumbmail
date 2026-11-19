@@ -1,0 +1,136 @@
+{
+  "key": "shipstation",
+  "name": "ShipStation",
+  "category": "Shipping",
+  "description": "ShipStation shipments become Order Shipped events on the order's customer, once per shipment, for the stores you choose, with the carrier, service, tracking number and ship date. ShipStation's webhooks only point at a batch of shipments, so DumbMail fetches them, and each shipped order, with your ShipStation API key. Customers are held back from marketing: a shipment isn't consent.",
+  "metrics": [
+    "Order Shipped"
+  ],
+  "docs": [
+    "https://www.shipstation.com/docs/api/webhooks/subscribe/",
+    "https://www.shipstation.com/docs/api/models/webhook/",
+    "https://help.shipstation.com/hc/en-us/articles/360025856252-ShipStation-Webhooks",
+    "https://docs.shipstation.com/apis/shipstation-v1/openapi/shipments/list_shipments",
+    "https://www.shipstation.com/docs/api/orders/get-order/",
+    "https://www.shipstation.com/docs/api/requirements/"
+  ],
+  "signature": {
+    "type": "none"
+  },
+  "credentials": [
+    {
+      "name": "api_key",
+      "label": "ShipStation API key",
+      "help": "ShipStation → Settings → Account → API Settings. Used, with the secret, to fetch the shipments and orders a webhook points to."
+    },
+    {
+      "name": "api_secret",
+      "label": "ShipStation API secret",
+      "help": "The same page."
+    }
+  ],
+  "settings": {
+    "store_ids": []
+  },
+  "pull": {
+    "method": "GET",
+    "url": "https://ssapi.shipstation.com/shipments",
+    "auth": {
+      "type": "basic",
+      "username": "{{secret.api_key}}",
+      "password": "{{secret.api_secret}}"
+    },
+    "fetch": {
+      "prefix": "/",
+      "paths": [
+        "/shipments",
+        "/orders/{id}"
+      ],
+      "query": [
+        "batchId",
+        "storeId",
+        "storeID",
+        "page",
+        "pageSize"
+      ],
+      "id": "^[0-9]{1,20}$",
+      "context": [
+        "shipments"
+      ],
+      "identity": "record_and_context",
+      "per_minute": 40,
+      "per_hour": 2000,
+      "reset_header": "X-Rate-Limit-Reset"
+    }
+  },
+  "redact": [
+    "keep:resource_url",
+    "keep:resource_type",
+    "keep:shipments[].shipmentId",
+    "keep:shipments[].orderId",
+    "keep:shipments[].orderNumber",
+    "keep:shipments[].trackingNumber",
+    "keep:shipments[].carrierCode",
+    "keep:shipments[].serviceCode",
+    "keep:shipments[].shipDate",
+    "keep:shipments[].voided",
+    "keep:shipments[].isReturnLabel",
+    "keep:total",
+    "keep:page",
+    "keep:pages",
+    "keep:orderId",
+    "keep:orderNumber",
+    "keep:customerEmail",
+    "keep:advancedOptions.storeId"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL. Keep it private: ShipStation doesn't sign webhooks, so the URL is the secret.",
+    "In ShipStation, open Settings → Account → API Settings and save the API key and secret as the credentials api_key and api_secret.",
+    "Set store_ids in the integration's settings to the IDs of the ShipStation stores to record, for example [\"123456\"]. It's required: nothing is recorded until it's set, and orders from other stores are ignored.",
+    "In ShipStation, open Settings → Integrations → Integration Partners → Webhooks and add a webhook for On Orders Shipped (SHIP_NOTIFY; or On Items Shipped, ITEM_SHIP_NOTIFY) with the webhook URL, for one store or all, and save. Both fire when a label is created.",
+    "Create a label for a test order and check the delivery log: the webhook is followed by a fetch of the batch's shipments, then of each order.",
+    "Review the draft shipping flow and turn it on. It's a service message about the customer's own order, so it reaches people held back from marketing. Someone with two shipments labelled at the same moment gets one email, not two.",
+    "ShipStation allows 40 API requests a minute: DumbMail keeps to that, and when ShipStation says to wait, every waiting lookup waits for the time it gives. It looks up at most 2,000 records an hour for this integration. One webhook reads a batch of up to 2,500 shipments (50 pages); a bigger batch shows as a failed delivery instead of being cut short.",
+    "Addresses, items and labels are never stored: only the fields the recipe reads are kept."
+  ],
+  "flows": [
+    {
+      "name": "ShipStation: order shipped",
+      "description": "When a shipment's label is created, tells the customer their order is on its way, with the carrier and tracking number. A service message about their own order. One email per person at a time: shipments labelled together for the same person send one email.",
+      "trigger": {
+        "type": "metric",
+        "metric": "Order Shipped",
+        "key": "shipment_id"
+      },
+      "definition": {
+        "entry": "s1",
+        "settings": {
+          "service_messages": true,
+          "reentry": "always"
+        },
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "email",
+            "name": "Order shipped",
+            "next": null,
+            "content": {
+              "subject": "Your order {{ event.properties.order_number|default('') }} is on its way",
+              "preheader": "Tracking number {{ event.properties.tracking_number|default('') }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your order is on its way"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Hi {{ first_name|default('there') }}, we've shipped your order {{ event.properties.order_number|default('') }}.</p><p>Carrier: {{ event.properties.carrier|default('') }}<br>Tracking number: {{ event.properties.tracking_number|default('') }}</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

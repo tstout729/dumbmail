@@ -1,0 +1,26 @@
+{
+  "description": "reservation/created: fetch the reservation it names",
+  "doc": "https://developers.cloudbeds.com/docs/webhooks-1 (reservation/created example)",
+  "expect": [
+    {
+      "query": {
+        "propertyID": "12345",
+        "reservationID": "31415926"
+      },
+      "type": "next_request",
+      "url": "/api/v1.3/getReservation"
+    }
+  ],
+  "input": {
+    "payload": {
+      "endDate": "2020-05-21",
+      "event": "reservation/created",
+      "propertyID": 12345,
+      "propertyID_str": "12345",
+      "reservationID": "31415926",
+      "startDate": "2020-05-19",
+      "timestamp": 1611758157.431234,
+      "version": "1.0"
+    }
+  }
+}
