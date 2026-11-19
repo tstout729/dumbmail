@@ -1595,6 +1595,12 @@ async fn test_sends_respect_retained_and_current_blocks() {
     let ours = h.claim_number().await;
     let gone = h.ok("POST", "/api/profiles", Some(json!({"email": "gone@x.test", "email_consent": "unsubscribed"}))).await;
     h.ok("DELETE", &format!("/api/profiles/{}", gone["id"].as_str().unwrap()), None).await;
+    // Nobody has the address now: the retained code alone blocks it (and the hash made in SQL
+    // matches the one kept).
+    let acct = account(&h).await;
+    use dumbmail::features::people::{privacy::test_blocked, Channel};
+    assert_eq!(test_blocked(&h.state.db, acct, Channel::Email, "Gone@X.test").await.unwrap(), Some("suppressed"));
+    assert_eq!(test_blocked(&h.state.db, acct, Channel::Email, "fine@x.test").await.unwrap(), None);
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
     let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>x</p>"}]}}))).await;
     let (s, v) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["gone@x.test"]}))).await;

@@ -152,7 +152,9 @@ const EXPECTED: &[(&str, usize)] = &[
     ("campaign start", 13),
     ("schedule", 14),
     ("send now", 15),
-    ("test send", 12),
+    // +1 on purpose: a test send checks its destination against current and retained blocks
+    // (features::people::privacy::test_blocked, PR #18), in one statement.
+    ("test send", 13),
     ("flow go-live", 5),
     ("live flow edit", 2),
     ("flow email send", 26),

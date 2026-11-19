@@ -114,26 +114,24 @@ pub async fn test_blocked(db: &PgPool, account_id: Uuid, ch: Channel, to: &str) 
         Channel::Sms => normalize_phone(to),
     };
     let to = normalized.as_deref().unwrap_or(to);
-    let live: bool = match ch {
-        Channel::Email => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND email = $2 AND (email_suppressed_reason IS NOT NULL OR email_consent = 'unsubscribed'))"),
-        Channel::Sms => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND phone_number = $2 AND (sms_suppressed_reason IS NOT NULL OR sms_consent = 'unsubscribed'))"),
-    }
+    // The one-way code's key, as `address_hash` makes it; the hash itself is made in the statement
+    // (SHA-256 of salt, channel and key), so this is one query.
+    let key = if ch == Channel::Email { crate::optin::email_key(to) } else { to.trim().to_string() };
+    let col = if ch == Channel::Email { "email" } else { "phone_number" };
+    let blocked: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND {col} = $2 AND ({ch}_suppressed_reason IS NOT NULL OR {ch}_consent = 'unsubscribed'))
+             OR EXISTS (SELECT 1 FROM privacy_salts s JOIN suppression_tombstones t ON t.account_id = s.account_id AND t.channel = $3
+                         AND t.address_hash = encode(sha256(convert_to(s.salt || '|' || $3 || '|' || $4, 'UTF8')), 'hex')
+                        WHERE s.account_id = $1)",
+        ch = ch.as_str()
+    ))
     .bind(account_id)
     .bind(to)
+    .bind(ch.as_str())
+    .bind(&key)
     .fetch_one(db)
     .await?;
-    if live {
-        return Ok(Some("suppressed"));
-    }
-    let salt: Option<String> = sqlx::query_scalar("SELECT salt FROM privacy_salts WHERE account_id = $1").bind(account_id).fetch_optional(db).await?;
-    let Some(salt) = salt else { return Ok(None) };
-    let retained: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM suppression_tombstones WHERE account_id = $1 AND channel = $2 AND address_hash = $3)")
-        .bind(account_id)
-        .bind(ch.as_str())
-        .bind(address_hash(&salt, ch.as_str(), to))
-        .fetch_one(db)
-        .await?;
-    Ok(retained.then_some("suppressed"))
+    Ok(blocked.then_some("suppressed"))
 }
 
 /// Let go of one retained record (the person's own verified opt-in, or a manual suppression lifted
