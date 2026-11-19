@@ -116,8 +116,9 @@ pub const PROFILE_TABLES: &[ProfileRef] = &[
     r("reviews", "profile_id", OnMerge::Move),
     r("review_sends", "profile_id", OnMerge::Move),
     r("flow_backfill_members", "profile_id", OnMerge::MoveUnless(&["backfill_id"])),
-    // The customer hub's sign-in codes and sessions are for the merged profile's address: they end
-    // (the person signs in again). The kept profile's end too when its address changes.
+    // The customer hub: the merged profile's sign-in codes and sessions are dropped, and its session
+    // generation goes with it; the kept profile's generation is bumped by the merge (ending its own
+    // sessions), so it stays. Erasure deletes all three.
     r("hub_codes", "profile_id", OnMerge::Drop),
     r("hub_sessions", "profile_id", OnMerge::Drop),
     r("hub_generations", "profile_id", OnMerge::Drop),
@@ -372,10 +373,10 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
     // The merged state is never less restrictive than the kept one, so a failed history write can't
     // block it (see consent::record_diff).
     let saved = ConsentState { marketing_hold: held, ..r.state() };
-    // A new address on the kept profile ends its customer hub access, as an address edit does.
-    if keep.email.is_some() && keep.email != r.email {
-        crate::features::hub::end_sessions(&mut *tx, keep.id).await?;
-    }
+    // Both people's customer hub access ends (sessions, sign-in links and codes): the kept profile's
+    // identity changed, and the merged one's is going away. Before the merged profile is deleted.
+    crate::features::hub::end_sessions(&mut *tx, keep.id).await?;
+    crate::features::hub::end_sessions(&mut *tx, other.id).await?;
     consent::note_address_change(&mut tx, account_id, keep.id, &keep.state(), &saved, &src).await?;
     consent::record_diff(&mut tx, account_id, keep.id, Some(&keep.state()), &saved, &src).await?;
     // Addresses that don't survive the merge keep their suppression record, so a later import of

@@ -1877,3 +1877,69 @@ async fn a_bulk_batch_that_hits_a_passing_error_is_tried_again() {
     assert_eq!(members, 1203);
     h.cleanup().await;
 }
+
+/// Customer hub (#42) and merge: both profiles' hub sessions end in the merge transaction, even when
+/// the kept address doesn't change.
+#[tokio::test]
+async fn a_merge_ends_both_peoples_hub_sessions() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let a: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "huba@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let b: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "hubb@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    for (pid, email) in [(a, "huba@x.test"), (b, "hubb@x.test")] {
+        sqlx::query("INSERT INTO hub_sessions (id, account_id, profile_id, token_hash, email, method, expires_at) VALUES ($1, $2, $3, $4, $5, 'code', now() + interval '1 day')")
+            .bind(Uuid::now_v7())
+            .bind(acct)
+            .bind(pid)
+            .bind(format!("hash-{pid}"))
+            .bind(email)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    h.ok("POST", "/api/people/merge", Some(json!({"keep_id": a, "merge_id": b, "confirm": true}))).await;
+    // A session counts only while its generation is the person's current one (see hub::session).
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM hub_sessions s WHERE s.revoked_at IS NULL AND s.generation = COALESCE((SELECT g.generation FROM hub_generations g WHERE g.profile_id = s.profile_id), 0)",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "the kept profile's sessions end too, though its address stayed");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM hub_sessions WHERE profile_id = $1").bind(b).fetch_one(&db).await.unwrap();
+    assert_eq!(left, 0);
+    h.cleanup().await;
+}
+
+/// The unsubscribe page and the customer hub share `preferences::opt_out`: it records consent
+/// history (method `hub` from the hub), and the opt-out is saved even when the history row can't be
+/// written right away.
+#[tokio::test]
+async fn preferences_opt_out_records_history_for_the_hub_and_the_unsubscribe_page() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let p: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "hubout@x.test", "email_consent": "subscribed"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let src = dumbmail::preferences::OptOutSource { method: "hub", reason: "hub", message: None };
+    assert!(dumbmail::preferences::opt_out(&db, acct, p, "email", &src).await.unwrap());
+    let row: (String, Option<String>) = sqlx::query_as("SELECT method, new_value FROM consent_events WHERE profile_id = $1 AND channel = 'email' AND field = 'consent' ORDER BY occurred_at DESC LIMIT 1")
+        .bind(p)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(row, ("hub".to_string(), Some("unsubscribed".to_string())));
+
+    // History down: the hub's SMS opt-out is still saved, and its row waits to be written.
+    let q: Uuid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550601", "sms_consent": "subscribed"}))).await["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("CREATE FUNCTION fail_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'history is down'; END $$").execute(&db).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_history BEFORE INSERT ON consent_events FOR EACH ROW EXECUTE FUNCTION fail_history()").execute(&db).await.unwrap();
+    assert!(dumbmail::preferences::opt_out(&db, acct, q, "sms", &src).await.unwrap());
+    let sms: String = sqlx::query_scalar("SELECT sms_consent FROM profiles WHERE id = $1").bind(q).fetch_one(&db).await.unwrap();
+    assert_eq!(sms, "unsubscribed");
+    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'people_consent_history'").fetch_one(&db).await.unwrap();
+    assert_eq!(waiting, 1);
+    h.cleanup().await;
+}
