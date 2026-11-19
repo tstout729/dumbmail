@@ -1038,7 +1038,7 @@ mod tests {
     fn form_config_schema_matches_validation() {
         let schema = form_config_schema();
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 26);
+        assert_eq!(keys.len(), 27);
         for k in &keys {
             let probe = serde_json::json!({ k.as_str(): null });
             assert!(crate::forms::check_config(&probe).is_ok(), "{k} is in the schema but rejected");

@@ -287,7 +287,9 @@ struct ClaimRow {
     message_sender: Option<Uuid>,
     tester: bool,
     backoff_until: Option<DateTime<Utc>>,
-    /// Already charged on an earlier attempt (a message id is charged at most once).
+    /// Already charged on an earlier attempt (a message id is charged at most once). A retry after a
+    /// failure Meta reported later is free; retries are capped (`RETRY_WAITS`), and each one costs the
+    /// customer Meta's own fee, so a forged failure status gains nothing.
     charged: bool,
 }
 
