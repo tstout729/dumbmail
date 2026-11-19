@@ -393,6 +393,8 @@ pub enum Channel {
     Sms,
     /// Only for `can_receive` (push consent is a device's permission plus no opt-out, not a status).
     Push,
+    /// WhatsApp consent is its own, per number (see `features::whatsapp::consent`).
+    Whatsapp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -636,6 +638,9 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
             Condition::Consent { status, channel } => {
                 if *channel == Channel::Push {
                     return Err(AppError::bad("push has no consent status; use can_receive with channel push"));
+                }
+                if *channel == Channel::Whatsapp && !matches!(status.as_str(), "subscribed" | "unsubscribed" | "never_subscribed") {
+                    return Err(AppError::bad("WhatsApp consent status must be subscribed, unsubscribed or never_subscribed"));
                 }
                 if !crate::models::valid_consent(status) {
                     return Err(AppError::bad("consent status must be subscribed, unsubscribed, never_subscribed or pending"));
@@ -1268,6 +1273,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             let col = match channel {
                 Channel::Email => "p.email_consent",
                 Channel::Sms | Channel::Push => "p.sms_consent",
+                Channel::Whatsapp => crate::features::whatsapp::consent::STATUS_SQL,
             };
             qb.push(format!("({col} = ")).push_bind(status.clone()).push(")");
         }
@@ -1279,6 +1285,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
                 Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold)",
                 Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND p.sms_suppressed_reason IS NULL)",
                 Channel::Push => crate::features::push::send::REACHABLE_SQL,
+                Channel::Whatsapp => crate::features::whatsapp::consent::REACHABLE_SQL,
             });
         }
         Condition::Suppressed { value } => {
@@ -1344,9 +1351,9 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
         }
         Condition::Message { action, campaign_id, flow_id, op, within_days } => {
             let names: Vec<String> = match action {
-                MessageAction::Received => vec!["Received Email".into(), "Received SMS".into(), "Received Push".into()],
-                MessageAction::Opened => vec!["Opened Email".into()],
-                MessageAction::Clicked => vec!["Clicked Email".into(), "Clicked SMS".into(), "Clicked Push".into()],
+                MessageAction::Received => vec!["Received Email".into(), "Received SMS".into(), "Received Push".into(), "Received WhatsApp".into()],
+                MessageAction::Opened => vec!["Opened Email".into(), "Read WhatsApp".into()],
+                MessageAction::Clicked => vec!["Clicked Email".into(), "Clicked SMS".into(), "Clicked Push".into(), "Clicked WhatsApp".into()],
             };
             if *op == HasOp::HasNot {
                 qb.push("NOT ");

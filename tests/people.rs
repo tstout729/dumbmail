@@ -306,6 +306,9 @@ async fn profile_tables_cover_every_profile_column() {
         if t.on_merge == dumbmail::features::people::merge::OnMerge::Custom {
             assert!(dumbmail::features::people::merge::CUSTOM_MERGE.contains(&t.table), "{} needs merge code", t.table);
         }
+        if t.on_erase == dumbmail::features::people::merge::OnErase::Custom {
+            assert!(dumbmail::features::people::merge::CUSTOM_ERASE.contains(&t.table), "{} needs erasure code", t.table);
+        }
     }
     h.cleanup().await;
 }

@@ -310,6 +310,14 @@ pub async fn erase_people_in(conn: &mut PgConnection, account_id: Uuid, ids: &[U
             OnErase::Delete => sqlx::query(&format!("DELETE FROM {} WHERE {} = ANY($1)", t.table, t.column)).bind(&ids).execute(&mut *conn).await?.rows_affected(),
             // Bulk actions keep their count; these targets are reported as skipped.
             OnErase::Forget => sqlx::query(&format!("UPDATE {} SET {} = NULL WHERE {} = ANY($1)", t.table, t.column, t.column)).bind(&ids).execute(&mut *conn).await?.rows_affected(),
+            OnErase::Custom => match t.table {
+                // A WhatsApp opt-out stays with its number, without the person; the rest go.
+                "whatsapp_contacts" => {
+                    sqlx::query("UPDATE whatsapp_contacts SET profile_id = NULL, wa_id = NULL, user_id = NULL WHERE profile_id = ANY($1) AND consent = 'unsubscribed'").bind(&ids).execute(&mut *conn).await?;
+                    sqlx::query("DELETE FROM whatsapp_contacts WHERE profile_id = ANY($1)").bind(&ids).execute(&mut *conn).await?.rows_affected()
+                }
+                other => return Err(AppError::Internal(anyhow::anyhow!("no erasure handling for {other}"))),
+            },
         };
         count(t.table, n);
     }

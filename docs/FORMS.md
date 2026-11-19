@@ -34,6 +34,7 @@ Not per version:
 | `auto_close_seconds` | integer 0–60 | 3, or 0 when a discount code or success button is set | Popup/flyout: close the thank-you screen after this many seconds. 0 keeps it open. |
 | `confirm_message` | text, ≤ 300 | "Almost done! Check your inbox…" | Shown instead of the thank-you screen when the list uses double opt-in. |
 | `sms_consent_text` | text, ≤ 1,000 | the standard carrier disclosure | Shown next to the consent checkbox under any phone field. |
+| `whatsapp_consent_text` | text, ≤ 1,000 | none (no box) | Adds an optional second box under the phone field (on the first screen) naming WhatsApp. Ticking it subscribes that number to WhatsApp marketing, unless the number opted out on WhatsApp. See dumbmail://docs/whatsapp. |
 | `brand_color` | hex color | the account's brand color | Default button color (see `style.button_color`). |
 
 ## Fields

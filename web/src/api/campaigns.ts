@@ -1,4 +1,5 @@
 import type { PushContent } from "../features/push/types";
+import type { WhatsappContent } from "../features/whatsapp/types";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, withQuery } from "./client";
 import { keys } from "./keys";
@@ -18,7 +19,7 @@ export type CampaignInput = {
   name: string;
   channel: Channel;
   audience?: Audience;
-  content?: EmailContent | SmsContent | PushContent;
+  content?: EmailContent | SmsContent | PushContent | WhatsappContent;
 };
 /** `ab_test`: an object replaces the whole test, `null` removes it, omitted leaves it as is. */
 export type CampaignPatch = Partial<Pick<Campaign, "name" | "audience" | "content" | "ab_test">>;

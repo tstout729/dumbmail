@@ -382,6 +382,7 @@ pub const BROWSER_RESERVED_METRICS: &[&str] = &[
     "Subscribed to List", "Unsubscribed from List", "Unsubscribed", "Subscribed to SMS", "Unsubscribed from SMS",
     "Received Email", "Opened Email", "Clicked Email", "Bounced Email", "Marked Email as Spam",
     "Received SMS", "Clicked SMS", "Received SMS Reply", "Received Push", "Clicked Push",
+    "Received WhatsApp", "Read WhatsApp", "Clicked WhatsApp", "Received WhatsApp Reply", "Subscribed to WhatsApp", "Unsubscribed from WhatsApp",
 ];
 
 fn named(list: &[&str], name: &str) -> bool {

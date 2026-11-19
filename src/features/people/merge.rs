@@ -38,7 +38,12 @@ pub enum OnErase {
     Delete,
     /// Keep the row but drop the profile id (a bulk action's target, reported as skipped).
     Forget,
+    /// Handled by its own code in `privacy::erase_in` (named in `CUSTOM_ERASE`).
+    Custom,
 }
+
+/// Tables whose `OnErase::Custom` handling lives in `privacy::erase_in`.
+pub const CUSTOM_ERASE: &[&str] = &["whatsapp_contacts"];
 
 pub struct ProfileRef {
     pub table: &'static str,
@@ -122,6 +127,13 @@ pub const PROFILE_TABLES: &[ProfileRef] = &[
     r("hub_codes", "profile_id", OnMerge::Drop),
     r("hub_sessions", "profile_id", OnMerge::Drop),
     r("hub_generations", "profile_id", OnMerge::Drop),
+    // WhatsApp keeps consent per number (features::whatsapp::consent); the records follow the person.
+    r("whatsapp_conversations", "profile_id", OnMerge::Move),
+    r("whatsapp_inbound", "profile_id", OnMerge::Move),
+    r("whatsapp_consent_log", "profile_id", OnMerge::Move),
+    // On erasure a number that opted out of WhatsApp keeps that record, without the person (like a
+    // text opt-out); every other contact row goes.
+    ProfileRef { table: "whatsapp_contacts", column: "profile_id", on_merge: OnMerge::Move, on_erase: OnErase::Custom },
 ];
 
 /// Tables whose `OnMerge::Custom` handling lives in [`merge`].

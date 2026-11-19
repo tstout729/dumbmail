@@ -15,8 +15,9 @@ pub const VARIANT_FIELDS: [&str; 9] = ["headline", "body", "button_text", "image
 /// Field keys with a built-in meaning (everything else is a custom profile property).
 const STANDARD_FIELDS: [&str; 5] = ["email", "phone_number", "first_name", "last_name", "birthday"];
 /// Keys that can't be custom fields: profile columns and the sign-up request's own keys.
-const RESERVED_FIELDS: [&str; 13] =
-    ["id", "external_id", "properties", "email_consent", "sms_consent", "created_at", "updated_at", "last_event_at", "list_ids", "form_id", "variant", "step", "fields"];
+const RESERVED_FIELDS: [&str; 14] = [
+    "id", "external_id", "properties", "email_consent", "sms_consent", "whatsapp_consent", "created_at", "updated_at", "last_event_at", "list_ids", "form_id", "variant", "step", "fields",
+];
 const FIELD_TYPES: [&str; 7] = ["text", "number", "date", "select", "radio", "checkboxes", "checkbox"];
 const MAX_FIELDS: usize = 12;
 /// Longest answer saved for a text field.
@@ -59,6 +60,9 @@ const TOP: &[(&str, Rule)] = &[
     ("auto_close_seconds", Int(0, 60)),
     ("confirm_message", Text(300)),
     ("sms_consent_text", Text(1000)),
+    // Wording for an optional box naming WhatsApp under the phone field; ticking it subscribes the
+    // number to WhatsApp marketing (see features::whatsapp::consent). No wording, no box.
+    ("whatsapp_consent_text", Text(1000)),
     ("brand_color", Color),
     ("delay_seconds", Int(0, 600)),
     ("collect", Nested),

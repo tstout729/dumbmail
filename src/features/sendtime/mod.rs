@@ -112,8 +112,8 @@ async fn preview(state: &AppState, account_id: Uuid, b: PreviewBody) -> AppResul
         None => None,
     };
     let channel = b.channel.or_else(|| c.as_ref().map(|c| c.channel.clone())).unwrap_or_else(|| "email".into());
-    if !matches!(channel.as_str(), "email" | "sms" | "push") {
-        return Err(AppError::bad("channel must be email, sms or push"));
+    if !matches!(channel.as_str(), "email" | "sms" | "push" | "whatsapp") {
+        return Err(AppError::bad("channel must be email, sms, push or whatsapp"));
     }
     let audience_v = b.audience.or_else(|| c.as_ref().map(|c| c.audience.clone())).ok_or_else(|| AppError::bad("give an audience or a campaign_id"))?;
     let audience: Audience = serde_json::from_value(audience_v).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
@@ -194,7 +194,7 @@ impl Feature for Module {
         let audience = json!({"type": "object", "description": "{include: [{type: list|segment, id}], exclude: [...]}"});
         vec![
             tool("preview_send_plan", "Preview when a campaign goes out", "Estimate how many recipients get the campaign when, for its send options (or the send_options given here): 15-minute buckets with their main time zones, from a random sample of up to 2,000 recipients scaled to the audience. Also counts who smart sending would skip right now. Nothing is sent or saved.",
-                obj(json!({"campaign_id": {"type": "string"}, "send_options": send_options_schema(), "send_at": {"type": "string", "format": "date-time", "description": "When sending starts (for local_time: the day). Defaults to the campaign's schedule, or now."}, "channel": {"enum": ["email", "sms", "push"]}, "platforms": {"type": "array", "items": {"enum": ["web", "ios", "android"]}, "description": "Push: the platforms it goes to (defaults to the campaign's)."}, "audience": audience}), &[]), true, false),
+                obj(json!({"campaign_id": {"type": "string"}, "send_options": send_options_schema(), "send_at": {"type": "string", "format": "date-time", "description": "When sending starts (for local_time: the day). Defaults to the campaign's schedule, or now."}, "channel": {"enum": ["email", "sms", "push", "whatsapp"]}, "platforms": {"type": "array", "items": {"enum": ["web", "ios", "android"]}, "description": "Push: the platforms it goes to (defaults to the campaign's)."}, "audience": audience}), &[]), true, false),
             tool("get_send_progress", "Campaign send progress by time zone", "For a campaign that is sending or sent: messages per release time (with their time zones) waiting, sent, skipped by smart sending, skipped for other reasons and failed, plus the next release and skip reasons.",
                 obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), true, false),
             tool("get_send_settings", "Get SMS quiet hours", "The hours texts may go out in each recipient's own time zone (default 09:00-20:00; never wider than 08:00-21:00), using their phone number's zone (a profile time zone can only narrow it). Texts outside the window wait for it to open. sms_zone_conflict: what happens when the phone's and profile's zones never share texting hours.", obj(json!({}), &[]), true, false),
