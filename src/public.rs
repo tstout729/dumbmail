@@ -589,6 +589,10 @@ async fn client_forms(State(state): State<AppState>, Query(q): Query<KeyQuery>) 
         if let Some(launcher) = crate::features::hub::settings::launcher(&state.db, a.id).await? {
             out["hub"] = json!({"launcher": launcher});
         }
+        // The shopping agent's chat bubble, only when it's on: the snippet loads it only then.
+        if crate::features::agent::web::bubble_on(&state, &a).await {
+            out["agent"] = json!({"bubble": true});
+        }
         Ok(out)
     }
     .await;

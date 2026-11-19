@@ -211,7 +211,7 @@ async fn take_help_slot(conn: &mut PgConnection, account_id: Uuid, phone: &str) 
 }
 
 fn static_purpose(p: &str) -> Option<&'static str> {
-    ["auto_reply", "keyword_reply", "confirmation", "optin_request", "help"].into_iter().find(|k| *k == p)
+    ["auto_reply", "keyword_reply", "confirmation", "optin_request", "help", "agent_reply"].into_iter().find(|k| *k == p)
 }
 
 /// Queue an automatic text answering `rx`: written down first (its id is the message's id, so it
@@ -411,6 +411,16 @@ pub async fn run_auto_send(state: &AppState, payload: &Value) -> anyhow::Result<
     let Some(kind) = static_purpose(&row.purpose) else { return finish(state, id, "failed", Some("unknown kind")).await };
     let Ok(profile) = load_profile(&state.db, row.account_id, row.profile_id).await else { return finish(state, id, "skipped", Some("profile deleted")).await };
     let account = crate::campaigns::load_account(&state.db, row.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    // A shopping agent answer: the account and the shopper's proof are checked again now, and the
+    // conversation's fee is charged only if the provider takes the text.
+    let agent = if row.purpose == "agent_reply" { row.context["agent_conversation"].as_str().and_then(|s| s.parse::<Uuid>().ok()) } else { None };
+    if let Some(c) = agent {
+        let e = |e: AppError| anyhow::anyhow!(e.public_message());
+        if let Some(why) = crate::features::agent::delivery::before_send(state, c).await.map_err(e)? {
+            crate::features::agent::delivery::after_send(state, c, false).await.map_err(e)?;
+            return finish(state, id, "skipped", Some(why)).await;
+        }
+    }
     let content = json!({"body": row.body});
     let out = sending::send_conversational(
         state,
@@ -418,6 +428,9 @@ pub async fn run_auto_send(state: &AppState, payload: &Value) -> anyhow::Result<
         &Conversational { kind, sent_by: None, to: row.to_number.clone(), from: row.from_number.clone() },
     )
     .await;
+    if let Some(c) = agent {
+        crate::features::agent::delivery::after_send(state, c, matches!(out, Ok(Outcome::Sent(_)))).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    }
     // No texting number yet, a template error or an empty balance won't fix itself on a retry.
     match out {
         Ok(Outcome::Sent(_)) => after_sent(state, &row).await,

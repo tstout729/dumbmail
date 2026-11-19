@@ -195,6 +195,10 @@ pub struct Config {
     /// Price per 1,000 machine-translated characters on the hosted service, in dollars (0: free).
     #[arg(long, env = "PRICE_TRANSLATION_PER_1000_CHARS", default_value_t = 0.0)]
     pub price_translation_per_1000_chars: f64,
+    /// Price per shopping agent conversation on the hosted service, in dollars (0: free). Charged once
+    /// when a conversation starts (see `features::agent`).
+    #[arg(long, env = "PRICE_AGENT_CONVERSATION", default_value_t = 0.0)]
+    pub price_agent_conversation: f64,
 
     /// Ad audience sync (see docs/AD_AUDIENCES.md). A platform whose app credentials are unset shows
     /// as "not available on this server". Meta app for Facebook Login with the ads_management permission.

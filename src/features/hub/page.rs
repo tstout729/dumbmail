@@ -28,6 +28,8 @@ pub struct Frame<'a> {
     pub settings: &'a Settings,
     pub notice: Option<String>,
     pub error: Option<String>,
+    /// The shopping agent's name, when its hub chat is on (a link to it shows on the hub page).
+    pub chat: Option<String>,
 }
 
 impl<'a> Frame<'a> {
@@ -45,6 +47,7 @@ impl<'a> Frame<'a> {
             settings,
             notice: None,
             error: None,
+            chat: None,
         }
     }
 
@@ -98,7 +101,8 @@ footer{text-align:center;margin-top:24px;font-size:12px;color:#9ca3af}footer a{c
 .banner{background:#fffbeb;color:#92400e;text-align:center;font-size:13px;padding:6px}
 @media (max-width:480px){.wrap{padding:16px 12px 40px}section{padding:16px}h1{font-size:21px}dl{grid-template-columns:1fr}dt{margin-top:6px}}";
 
-fn document(f: &Frame<'_>, title: &str, body: &str) -> String {
+/// A whole hub page around `body` (also used by the shopping agent's chat page).
+pub fn document(f: &Frame<'_>, title: &str, body: &str) -> String {
     let brand = match &f.logo {
         Some(l) => format!(r#"<img src="{}" alt="{}">"#, esc(l), esc(&f.name)),
         None => format!("<span>{}</span>", esc(&f.name)),
@@ -390,6 +394,13 @@ pub fn hub_page_with(f: &Frame<'_>, v: &View, all_orders: bool) -> String {
     if nav.len() > 1 {
         let links: String = nav.iter().map(|(id, label)| format!(r##"<li><a href="#{id}">{label}</a></li>"##)).collect();
         body.push_str(&format!(r#"<nav aria-label="Sections"><ul>{links}</ul></nav>"#));
+    }
+    if let Some(name) = f.chat.as_deref().filter(|_| !f.preview) {
+        body.push_str(&format!(
+            r#"<section aria-labelledby="chat-h"><h2 id="chat-h">Questions?</h2><p class="muted" style="margin:0 0 12px">Ask {n} about our products, shipping, returns or your orders.</p><a class="btn" href="{h}">Chat with {n}</a></section>"#,
+            n = esc(name),
+            h = f.href("/chat")
+        ));
     }
     if !v.trusted {
         body.push_str(r#"<section><h2>Orders and bookings</h2><p class="empty">We can't show orders or bookings for this email address here. If you've ordered from us, contact us and we'll help.</p></section>"#);

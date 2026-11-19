@@ -245,6 +245,21 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
 /// for an address with a source (see `features::hub::data::TRUSTED_EMAIL_SQL`).
 pub const TRUSTED_EMAIL_SOURCE: &str = "api";
 
+/// The store's own write (a profile created or edited through the API, MCP or the dashboard, or a
+/// CSV import) gave this number: mark it as the store's (`phone_source`), unless an integration
+/// already did. Never called for the generic upsert that inbound texts and WhatsApp use, so a number
+/// that only ever wrote in is never the store's. The shopping agent shows a texter their orders
+/// only for a number marked so.
+pub async fn mark_phone_trusted(db: &PgPool, profile_id: Uuid, phone: Option<&str>) -> AppResult<()> {
+    let Some(phone) = phone.and_then(normalize_phone) else { return Ok(()) };
+    sqlx::query(&format!("UPDATE profiles SET phone_source = '{TRUSTED_EMAIL_SOURCE}' WHERE id = $1 AND phone_number = $2 AND phone_source IS NULL"))
+        .bind(profile_id)
+        .bind(phone)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 /// Whether writing `email` replaces a different address the profile already has.
 fn email_changes(p: &Profile, email: Option<&str>) -> bool {
     matches!((p.email.as_deref(), email), (Some(old), Some(new)) if old != new)
@@ -339,7 +354,7 @@ pub async fn fill_location_from_timezone(db: &PgPool, profile_id: Uuid, tz: &str
 
 /// Metrics only DumbMail itself records, from a real stock or price change or a confirmed request:
 /// nobody may send them, not even with an API key. Feature modules add theirs here.
-pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock", "Submitted Review", "Ready To Review", "Opened Hub", "Viewed Order in Hub"];
+pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock", "Submitted Review", "Ready To Review", "Opened Hub", "Viewed Order in Hub", "Chatted with Agent", "Agent Handed Off"];
 
 /// Metrics the server records about messages, consent and sign-ups. Flows trust them, so a browser
 /// (the public `/client/events` endpoint) may not send them. The API and MCP still may (for imports).
@@ -740,6 +755,7 @@ pub async fn import_csv(
         match upsert_profile(db, account_id, &input).await {
             Ok(u) => {
                 if u.created { out.created += 1 } else { out.updated += 1 }
+                mark_phone_trusted(db, u.profile.id, input.phone_number.as_deref()).await?;
                 ids.push(u.profile.id);
             }
             Err(e) => {

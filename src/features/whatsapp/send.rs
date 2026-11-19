@@ -746,7 +746,14 @@ async fn finish_failed(_state: &AppState, r: &ClaimRow, _message_id: Uuid, why: 
 /// The background job for a queued conversational message (keyword answers) and for retries.
 pub async fn run_job(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let Some(id) = payload["message_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
-    match hand_off(state, id, false).await {
+    let out = hand_off(state, id, false).await;
+    // A shopping agent answer: its conversation's fee is charged only when Meta took it.
+    match &out {
+        Ok(Outcome::Sent(_)) => crate::features::agent::delivery::whatsapp_outcome(state, id, true).await,
+        Ok(Outcome::Skipped(_) | Outcome::Failed(_)) | Err(_) => crate::features::agent::delivery::whatsapp_outcome(state, id, false).await,
+        Ok(Outcome::Deferred(_)) => {}
+    }
+    match out {
         // A wait at the claim (quiet hours, Meta's back-off): try again then, on the background lane.
         Ok(Outcome::Deferred(at)) => {
             let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM whatsapp_sent WHERE message_id = $1 AND handed_at IS NULL)").bind(id).fetch_one(&state.db).await?;

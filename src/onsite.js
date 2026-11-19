@@ -892,6 +892,8 @@
   var formsCache = null, showing = null, open = {}, scheduled = {}, teasers = {};
   // The customer hub's launcher setting from the same config (null: off).
   var HUB = null;
+  // The shopping agent's chat bubble from the same config (false: off).
+  var AGENT = false;
   function loadForms(cb) {
     if (formsCache) return cb(formsCache);
     fetch(BASE + "/client/forms?k=" + encodeURIComponent(KEY), { credentials: "omit" })
@@ -901,6 +903,8 @@
         formsCache = (j.data || []).map(withVersion);
         HUB = (j.hub && (j.hub.launcher === "button" || j.hub.launcher === "link")) ? j.hub : null;
         if (HUB) loadHub();
+        AGENT = !!(j.agent && j.agent.bubble);
+        if (AGENT) loadAgent();
         cb(formsCache);
       })
       .catch(function () { if (TEST) test.warn("network", "This page couldn't reach " + BASE + ". A Content-Security-Policy, firewall or ad blocker may be blocking it."); });
@@ -1134,6 +1138,18 @@
     var s = document.createElement("script");
     s.async = true;
     s.src = BASE + "/client/hub.js?k=" + encodeURIComponent(KEY);
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  // The shopping agent's chat bubble (see the Shopping agent settings in DumbMail) lives in its own
+  // small script, loaded only when the storefront config says the store turned it on.
+  var agentLoading = false;
+  function loadAgent() {
+    if (ONLY_FORM || TEST || agentLoading) return;
+    agentLoading = true;
+    var s = document.createElement("script");
+    s.async = true;
+    s.src = BASE + "/client/agent.js?k=" + encodeURIComponent(KEY);
     (document.head || document.documentElement).appendChild(s);
   }
 

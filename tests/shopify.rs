@@ -1725,8 +1725,17 @@ async fn privacy_requests_use_shopify_ids() {
     // Redact Ann, and the guest order by id: Shopify data goes; Ann's profile stays (it's on a list
     // of the account's own) without the Shopify properties; the guest's profile, made only for
     // that order, goes.
+    // The shopping agent held a copy of Ann's order in a verified conversation.
+    sqlx::query("INSERT INTO agent_conversations (id, account_id, profile_id, place, verified, system_prompt, history) VALUES ($1, $2, $3, 'hub', true, 'x', '[\"order 5001\"]')")
+        .bind(Uuid::now_v7())
+        .bind(acct)
+        .bind(ann)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
     hook(&h, "customers/redact", "r2", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1, "email": "ann@example.com"}, "orders_to_redact": [5001, 5005]})).await;
     h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM agent_conversations").await, 0, "the agent's copy of the erased order goes too");
     assert!(event(&h, "Placed Order", "order:5001").await.is_none());
     assert!(event(&h, "Placed Order", "order:5005").await.is_none());
     assert_eq!(count(&h, "SELECT count(*) FROM shopify_customers WHERE customer_id = 1").await, 0);

@@ -227,6 +227,7 @@ async fn home(State(state): State<AppState>, Path(key): Path<String>, Query(q): 
     };
     let mut f = signed_in_frame(&state, &store, &shopper, embed);
     f.notice = saved_notice(q.saved.as_deref());
+    f.chat = crate::features::agent::web::hub_chat_name(&state, &store.account).await;
     let all = q.orders.as_deref() == Some("all");
     let view = match super::data::view(&state.db, &shopper, &store.settings, all).await {
         Ok(v) => v,

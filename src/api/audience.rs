@@ -93,6 +93,8 @@ pub async fn create_profile(state: &AppState, account_id: Uuid, body: Value) -> 
     let list_ids: Vec<Uuid> = body.get("list_ids").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
     let input: ProfileInput = serde_json::from_value(body)?;
     let up = core::upsert_profile(&state.db, account_id, &input).await?;
+    // The store's own write: a number it gives here is the store's.
+    core::mark_phone_trusted(&state.db, up.profile.id, input.phone_number.as_deref()).await?;
     for l in list_ids {
         core::list_belongs(&state.db, account_id, l).await?;
         core::add_to_list(&state.db, account_id, l, &[up.profile.id]).await?;
@@ -234,6 +236,7 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
              WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent",
             source = core::TRUSTED_EMAIL_SOURCE
         );
+        let phone_set = phone.clone().flatten();
         let saved = sqlx::query_as::<_, IdentitySaved>(&q)
             .bind(id)
             .bind(email.is_some())
@@ -249,6 +252,10 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
                 AppError::Conflict(_) => taken(),
                 other => other,
             })?;
+        // A number set here is the store's.
+        if let Some(n) = phone_set.as_deref() {
+            core::mark_phone_trusted(&state.db, id, Some(n)).await?;
+        }
         // A changed address whose source was already ours: the database cleared the source with the
         // change (it can't tell the same source writing a new address); mark it again.
         if let (true, Some(e)) = (email_changes, new_email.as_deref()) {

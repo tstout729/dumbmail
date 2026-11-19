@@ -204,7 +204,10 @@ pub async fn process(state: &AppState, rx: &Received) -> AppResult<()> {
         }
         "message" => {
             store::record_reply_event(&state.db, rx, None).await?;
-            replies::default_reply(state, rx).await?;
+            // The shopping agent answers first when the store turned that on; else the default reply.
+            if !crate::features::agent::sms::take(state, rx).await? {
+                replies::default_reply(state, rx).await?;
+            }
             store::wake_waiting_flows(&state.db, rx.profile_id, rx.received_at).await?;
         }
         // "blocked": texted while opted out. Nothing happens and nothing is sent.
