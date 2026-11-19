@@ -10,16 +10,27 @@ static EMAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-
 static PHONE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\+?\d[\d\s().\-]{6,20}\d").unwrap());
 static UUIDISH: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$").unwrap());
 
-/// A web address, ending at any space, quote, bracket or invisible format character.
-static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>"')\p{Cf}]+"#).unwrap());
+/// A web address, ending at any space, quote or bracket (invisible format characters are removed
+/// from the text first, so one can't split a query off an address).
+static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>"')]+"#).unwrap());
+static FORMAT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\p{Cf}").unwrap());
+/// Backstop for what's left in free text: a `?key=value` or `#…` tail, and long token-like runs.
+static QUERY_TAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"[?#][^\s]*=[^\s]*").unwrap());
+static TOKEN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[A-Za-z0-9_\-]{16,}\b").unwrap());
 
 /// Free text with web addresses reduced as [`link`] does, email addresses as `[email]` and phone
 /// numbers as `[phone]`.
 pub fn text(s: &str) -> String {
-    let s = URL.replace_all(s, |c: &regex::Captures<'_>| {
+    let s = FORMAT.replace_all(s, "");
+    let s = URL.replace_all(&s, |c: &regex::Captures<'_>| {
         let l = link(&c[0]);
-        // An address that doesn't parse stays, with its personal parts replaced like any text.
-        if l.is_empty() { words(&c[0]) } else { l }
+        // An address that doesn't parse goes as a placeholder, never as written.
+        if l.is_empty() { "[link]".to_string() } else { l }
+    });
+    let s = QUERY_TAIL.replace_all(&s, "");
+    let s = TOKEN.replace_all(&s, |c: &regex::Captures<'_>| {
+        let t = &c[0];
+        if t.chars().any(|ch| ch.is_ascii_digit()) && t.chars().any(|ch| ch.is_ascii_alphabetic()) { ":token".to_string() } else { t.to_string() }
     });
     words(&s)
 }
@@ -69,7 +80,9 @@ mod tests {
         assert_eq!(text("Sale ends 2026-11-30, $1,299.00 off"), "Sale ends 2026-11-30, $1,299.00 off", "dates and prices stay");
         assert_eq!(text("export jane@corp.test.csv"), "export [email]");
         assert_eq!(text("Go to https://acme.test/r/a8F3k2m9Zq7Lp0Xw?t=SECRET now"), "Go to acme.test/r/:token now");
-        assert_eq!(text("https://acme.test/a\u{200B}Buy crypto now"), "acme.test/a\u{200B}Buy crypto now", "a format character ends the address");
+        assert_eq!(text("https://acme.test/a\u{200B}?t=SECRET more"), "acme.test/a more", "a format character can't split a query off");
+        assert_eq!(text("see https://[bad?t=SECRET here"), "see [link] here");
+        assert_eq!(text("code a8F3k2m9Zq7Lp0Xw and ?id=abc=SECRET"), "code :token and ");
     }
 
     #[test]
