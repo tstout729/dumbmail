@@ -113,10 +113,45 @@ pub async fn set(
         .bind(&detail)
         .execute(&mut *conn)
         .await?;
+    // The person's consent history (features::people), with the event's own time and source.
+    if let Some(old) = applied.as_deref().filter(|old| *old != status) {
+        let owner: Option<Uuid> = match profile_id {
+            Some(p) => Some(p),
+            None => sqlx::query_scalar("SELECT profile_id FROM whatsapp_contacts WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(phone).fetch_optional(&mut *conn).await?.flatten(),
+        };
+        if let Some(owner) = owner {
+            let src = history_source(source, &detail);
+            crate::features::people::consent::record_whatsapp_in(conn, account_id, &[(owner, phone.to_string(), old.to_string(), status.to_string(), at)], &src).await?;
+        }
+    }
     if applied.is_some() && status == "unsubscribed" {
         skip_queued(conn, db, account_id, Some(phone), "opted out of WhatsApp").await?;
     }
     Ok(applied.is_some_and(|old| old != status))
+}
+
+/// How a WhatsApp consent change appears in consent history: the caller's source when it set one
+/// (the API, MCP, the dashboard, an import), else what happened on WhatsApp or the form.
+fn history_source(source: &str, detail: &Value) -> crate::features::people::ConsentSource {
+    use crate::features::people::ConsentSource;
+    let current = crate::features::people::consent::current_source();
+    let base = if current.method != "other" {
+        current
+    } else if source == "form" {
+        let form = detail["form_id"].as_str().and_then(|f| f.parse().ok());
+        let s = ConsentSource::new("form", "public");
+        match form {
+            Some(f) => s.with_form(f),
+            None => s,
+        }
+    } else {
+        ConsentSource::new("whatsapp", "public")
+    };
+    let mut src = base.with_detail("whatsapp_source", json!(source));
+    if let Some(k) = detail.get("keyword") {
+        src = src.with_detail("keyword", k.clone());
+    }
+    src
 }
 
 /// Skip WhatsApp messages that haven't been handed to Meta yet: one number's (campaign and flow
@@ -156,6 +191,15 @@ pub async fn skip_queued(conn: &mut PgConnection, db: &sqlx::PgPool, account_id:
 /// every service window closes, business-scoped ids are forgotten, and queued sends are skipped. A
 /// new business account's templates are read again.
 pub async fn sender_changed(conn: &mut PgConnection, db: &sqlx::PgPool, account_id: Uuid, business_changed: bool) -> AppResult<()> {
+    // Each person who loses their subscription has it in their consent history (features::people).
+    let losing: Vec<(Uuid, String)> = sqlx::query_as("SELECT profile_id, phone_number FROM whatsapp_contacts WHERE account_id = $1 AND consent = 'subscribed' AND profile_id IS NOT NULL")
+        .bind(account_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    let now = Utc::now();
+    let changes: Vec<(Uuid, String, String, String, DateTime<Utc>)> = losing.into_iter().map(|(p, n)| (p, n, "subscribed".to_string(), "never_subscribed".to_string(), now)).collect();
+    let src = crate::features::people::ConsentSource::new("whatsapp", "system").with_detail("whatsapp_source", json!("sender_changed"));
+    crate::features::people::consent::record_whatsapp_in(conn, account_id, &changes, &src).await?;
     sqlx::query(
         "INSERT INTO whatsapp_consent_log (id, account_id, phone_number, profile_id, consent, source, detail)
          SELECT gen_random_uuid(), account_id, phone_number, profile_id, 'never_subscribed', 'dashboard', '{\"reason\": \"WhatsApp sender changed\"}'

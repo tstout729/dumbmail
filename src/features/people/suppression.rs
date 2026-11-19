@@ -59,6 +59,14 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
     .push_bind(account_id)
     .push(
         " AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent <> 'subscribed')
+            UNION ALL
+            SELECT p.id, 'whatsapp', p.phone_number, p.first_name, p.last_name, p.updated_at, 'unsubscribed'
+            FROM profiles p JOIN whatsapp_contacts wc ON wc.account_id = p.account_id AND wc.phone_number = p.phone_number AND wc.consent = 'unsubscribed'
+            WHERE p.account_id = ",
+    )
+    .push_bind(account_id)
+    .push(
+        "
          ) s
          LEFT JOIN LATERAL (
             SELECT e.occurred_at, e.method, e.message_id, e.actor_user_id FROM consent_events e
@@ -69,7 +77,9 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
          WHERE true",
     );
     if let Some(c) = q.channel.as_deref().filter(|c| !c.is_empty()) {
-        Channel::parse(c)?;
+        if c != "whatsapp" {
+            Channel::parse(c)?;
+        }
         qb.push(" AND s.channel = ").push_bind(c.to_string());
     }
     if let Some(r) = q.reason.as_deref().filter(|r| !r.is_empty()) {
@@ -113,6 +123,7 @@ fn reason_text(channel: &str, reason: &str) -> &'static str {
     match (channel, reason) {
         ("email", "unsubscribed") => "Unsubscribed from email",
         ("sms", "unsubscribed") => "Opted out of texts",
+        ("whatsapp", "unsubscribed") => "Opted out of WhatsApp",
         (_, "hard_bounce") => "Hard bounce",
         (_, "complaint") => "Spam complaint",
         (_, "manual") => "Suppressed by hand",
@@ -137,7 +148,11 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> AppRes
                 _ => "",
             };
             let suppressed = (!matches!(r.5.as_str(), "unsubscribed" | "pending" | "not_subscribed")).then_some(r.5.as_str());
-            let why_not = consent::why_not_unsuppressible(ch, suppressed, consent);
+            let why_not = if r.1 == "whatsapp" {
+                Some("This person opted out of WhatsApp messages. Only they can opt back in, on WhatsApp itself.".to_string())
+            } else {
+                consent::why_not_unsuppressible(ch, suppressed, consent)
+            };
             json!({
                 "profile_id": r.0, "channel": r.1, "address": r.2, "first_name": r.3, "last_name": r.4, "reason": r.5,
                 "reason_text": reason_text(&r.1, &r.5), "since": r.6,
@@ -151,7 +166,10 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> AppRes
          FROM profiles p WHERE p.account_id = $1 AND p.email IS NOT NULL AND {EMAIL_BLOCKED} GROUP BY 2
          UNION ALL
          SELECT 'sms', COALESCE(p.sms_suppressed_reason, CASE p.sms_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'not_subscribed' END), count(*)
-         FROM profiles p WHERE p.account_id = $1 AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent <> 'subscribed') GROUP BY 2"
+         FROM profiles p WHERE p.account_id = $1 AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent <> 'subscribed') GROUP BY 2
+         UNION ALL
+         SELECT 'whatsapp', 'unsubscribed', count(*) FROM profiles p JOIN whatsapp_contacts wc ON wc.account_id = p.account_id AND wc.phone_number = p.phone_number
+         WHERE p.account_id = $1 AND wc.consent = 'unsubscribed' HAVING count(*) > 0"
     ))
     .bind(account_id)
     .fetch_all(db)

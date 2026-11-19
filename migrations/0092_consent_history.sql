@@ -6,8 +6,9 @@ CREATE TABLE consent_events (
     id            uuid PRIMARY KEY,
     account_id    uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     profile_id    uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    -- email | sms | ads (do not sell or share) | marketing (the marketing hold, both channels)
-    channel       text NOT NULL CHECK (channel IN ('email', 'sms', 'ads', 'marketing')),
+    -- email | sms | whatsapp (consent kept per number, features::whatsapp::consent) | ads (do not
+    -- sell or share) | marketing (the marketing hold, both channels)
+    channel       text NOT NULL CHECK (channel IN ('email', 'sms', 'whatsapp', 'ads', 'marketing')),
     -- consent | suppression | opt_out (ads) | hold (marketing) | address (the email or number itself)
     field         text NOT NULL CHECK (field IN ('consent', 'suppression', 'opt_out', 'hold', 'address')),
     old_value     text,

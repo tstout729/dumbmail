@@ -1946,3 +1946,112 @@ async fn preferences_opt_out_records_history_for_the_hub_and_the_unsubscribe_pag
     assert_eq!(waiting, 1);
     h.cleanup().await;
 }
+
+// ---------- WhatsApp (#44): history, merge, erasure, retained opt-out ----------
+
+async fn wa_set(h: &Harness, acct: Uuid, phone: &str, profile: Option<Uuid>, status: &str, source: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
+    use dumbmail::features::whatsapp::consent;
+    let mut tx = h.state.db.begin().await.unwrap();
+    consent::lock(&mut tx, acct, phone).await.unwrap();
+    let changed = consent::set(&mut tx, &h.state.db, acct, phone, profile, status, source, json!({}), at).await.unwrap();
+    tx.commit().await.unwrap();
+    changed
+}
+
+async fn wa_consent(h: &Harness, phone: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT consent FROM whatsapp_contacts WHERE phone_number = $1").bind(phone).fetch_optional(&h.state.db).await.unwrap()
+}
+
+/// WhatsApp consent changes land in the person's consent history at the event's own time, keeping
+/// WhatsApp's ordering (a START older than a STOP changes nothing and records nothing), and show on
+/// the reachability card and the suppression list.
+#[tokio::test]
+async fn whatsapp_consent_is_in_the_history_and_keeps_its_order() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    sqlx::query("INSERT INTO whatsapp_settings (account_id, sender_id, verify_token, webhook_key) VALUES ($1, gen_random_uuid(), 'v', gen_random_uuid()::text)").bind(acct).execute(&db).await.unwrap();
+    let p: Uuid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550701"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let t0 = chrono::Utc::now() - chrono::Duration::minutes(10);
+    assert!(wa_set(&h, acct, "+15035550701", Some(p), "subscribed", "keyword", t0).await);
+    assert!(wa_set(&h, acct, "+15035550701", Some(p), "unsubscribed", "stop", t0 + chrono::Duration::minutes(5)).await);
+    // A START from before the STOP (delivered late) can't undo it.
+    assert!(!wa_set(&h, acct, "+15035550701", Some(p), "subscribed", "start", t0 + chrono::Duration::minutes(2)).await);
+    assert_eq!(wa_consent(&h, "+15035550701").await.as_deref(), Some("unsubscribed"));
+    type HistoryRow = (String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>);
+    let rows: Vec<HistoryRow> =
+        sqlx::query_as("SELECT method, new_value, detail->>'whatsapp_source', occurred_at FROM consent_events WHERE profile_id = $1 AND channel = 'whatsapp' ORDER BY occurred_at")
+            .bind(p)
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(rows.iter().map(|r| (r.0.as_str(), r.1.as_deref(), r.2.as_deref())).collect::<Vec<_>>(), vec![
+        ("whatsapp", Some("subscribed"), Some("keyword")),
+        ("whatsapp", Some("unsubscribed"), Some("stop")),
+    ]);
+    assert_eq!(rows[1].3.timestamp(), (t0 + chrono::Duration::minutes(5)).timestamp(), "recorded at the event's time");
+    let summary = h.ok("GET", &format!("/api/people/profiles/{p}"), None).await;
+    assert_eq!(summary["reachability"]["whatsapp"]["can_send"], false, "{summary}");
+    assert_eq!(summary["reachability"]["whatsapp"]["reasons"][0]["code"], "unsubscribed");
+    let list = h.ok("GET", "/api/people/suppressions?channel=whatsapp", None).await;
+    assert_eq!(list["total"], 1, "{list}");
+    assert_eq!(list["data"][0]["can_unsuppress"], false);
+    h.cleanup().await;
+}
+
+/// A merge moves WhatsApp records to the kept profile; each number keeps its own consent, so an
+/// opt-out on either number stays.
+#[tokio::test]
+async fn a_merge_moves_whatsapp_records_and_keeps_opt_outs() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let a: Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "wa@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let b: Uuid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550702"}))).await["id"].as_str().unwrap().parse().unwrap();
+    wa_set(&h, acct, "+15035550702", Some(b), "unsubscribed", "stop", chrono::Utc::now()).await;
+    let conv = Uuid::now_v7();
+    sqlx::query("INSERT INTO whatsapp_conversations (id, account_id, profile_id, phone_number) VALUES ($1, $2, $3, '+15035550702')").bind(conv).bind(acct).bind(b).execute(&db).await.unwrap();
+    h.ok("POST", "/api/people/merge", Some(json!({"keep_id": a, "merge_id": b, "confirm": true}))).await;
+    let owners: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT profile_id FROM whatsapp_contacts WHERE phone_number = '+15035550702' UNION ALL SELECT profile_id FROM whatsapp_conversations WHERE id = $1
+         UNION ALL SELECT DISTINCT profile_id FROM whatsapp_consent_log WHERE phone_number = '+15035550702'",
+    )
+    .bind(conv)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert!(owners.iter().all(|o| *o == Some(a)), "{owners:?}");
+    assert_eq!(wa_consent(&h, "+15035550702").await.as_deref(), Some("unsubscribed"));
+    let history: i64 = sqlx::query_scalar("SELECT count(*) FROM consent_events WHERE profile_id = $1 AND channel = 'whatsapp'").bind(a).fetch_one(&db).await.unwrap();
+    assert_eq!(history, 1, "the merged profile's WhatsApp history is copied over");
+    h.cleanup().await;
+}
+
+/// Erasing someone removes their WhatsApp records, except a WhatsApp opt-out, which stays with the
+/// number (like a text STOP): the number is still opted out when it comes back on a new profile, and
+/// a form can't subscribe it.
+#[tokio::test]
+async fn a_whatsapp_opt_out_is_retained_after_erasure() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account(&h).await;
+    let db = h.state.db.clone();
+    let out: Uuid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550703"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let sub: Uuid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550704"}))).await["id"].as_str().unwrap().parse().unwrap();
+    wa_set(&h, acct, "+15035550703", Some(out), "unsubscribed", "stop", chrono::Utc::now()).await;
+    wa_set(&h, acct, "+15035550704", Some(sub), "subscribed", "keyword", chrono::Utc::now()).await;
+    sqlx::query("INSERT INTO whatsapp_conversations (id, account_id, profile_id, phone_number) VALUES ($1, $2, $3, '+15035550703')").bind(Uuid::now_v7()).bind(acct).bind(out).execute(&db).await.unwrap();
+    h.ok("DELETE", &format!("/api/profiles/{out}"), None).await;
+    h.ok("DELETE", &format!("/api/profiles/{sub}"), None).await;
+    let kept: Vec<(String, String, Option<Uuid>)> = sqlx::query_as("SELECT phone_number, consent, profile_id FROM whatsapp_contacts ORDER BY phone_number").fetch_all(&db).await.unwrap();
+    assert_eq!(kept, vec![("+15035550703".to_string(), "unsubscribed".to_string(), None)], "the opt-out stays, without the person; the rest goes");
+    let convs: i64 = sqlx::query_scalar("SELECT count(*) FROM whatsapp_conversations").fetch_one(&db).await.unwrap();
+    assert_eq!(convs, 0);
+    // The number comes back on a new profile: still opted out, and a sign-up form can't change that.
+    let back: Uuid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550703"}))).await["id"].as_str().unwrap().parse().unwrap();
+    assert!(!dumbmail::features::whatsapp::consent::form_opt_in(&db, acct, back, "+15035550703", Uuid::now_v7()).await.unwrap());
+    assert_eq!(wa_consent(&h, "+15035550703").await.as_deref(), Some("unsubscribed"));
+    h.cleanup().await;
+}

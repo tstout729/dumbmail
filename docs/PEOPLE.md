@@ -103,6 +103,14 @@ Deleting a profile from its page (`DELETE /api/profiles/:id`), the MCP `delete` 
 
 The one-way codes (here and in the request log) are SHA-256 of the account's random salt, the channel and the address. Emails are reduced to the inbox they reach (case, a `+tag`, and for Gmail the dots and `googlemail.com`), so a bounced Gmail address can't come back as an alias. The salt is stored in the database, so someone holding a copy of the database could test guesses of an address against them. They can't be reversed without guessing.
 
+## WhatsApp
+
+WhatsApp consent is kept per number by the WhatsApp feature (`features::whatsapp::consent`, see WHATSAPP.md), which decides which change applies by when the event behind it happened (a STOP wins ties; a START older than a STOP changes nothing). Every change it applies is also in the person's consent history (`channel: whatsapp`, at the event's own time, with what happened on WhatsApp in `detail.whatsapp_source`, or the API, form or dashboard source), with the same rule for failed history writes: an opt-out is never held up, an opt-in fails with it.
+
+- The reachability card has a WhatsApp row when the account has a WhatsApp sender, and the suppression list shows WhatsApp opt-outs (they can't be lifted here; only the person can opt back in, on WhatsApp).
+- Merging moves WhatsApp conversations, inbound messages, contact rows and their log to the kept profile; consent stays with each number, so an opt-out on either number stays.
+- Erasure removes the person's WhatsApp conversations, messages and log, and every contact row except one that says unsubscribed: that stays with the number, without the person, like a text STOP, so the number is still opted out if it comes back (a sign-up form can't subscribe it).
+
 ## Do not sell or share
 
 `profiles.ads_opt_out` is a per-person "do not sell or share my personal information" flag. Changing a property ad audiences read as an opt-out (`ads_opt_out`, `do_not_sell`, `gpc`, `ads_consent`) in a way that would lift an opt-out needs `privacy.manage`, in profile saves and bulk property actions alike; forms, integrations and imports can only add one. Features that share data with ad platforms must read this column and leave flagged people out: ad audience syncs never add a flagged person, and remove one already sent on the next run (`features::audiences::sync::opted_out_sql`). An `ads_opt_out` *property* sent by another system is also read as an opt-out there; it can only restrict and never turns the flag off. Set it from the profile page, `PATCH /api/people/profiles/:id/privacy` `{ads_opt_out}`, or MCP `set_do_not_sell`.

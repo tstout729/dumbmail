@@ -487,6 +487,25 @@ pub async fn apply(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, 
     Ok(true)
 }
 
+/// WhatsApp consent changes, recorded in the caller's transaction (features::whatsapp::consent keeps
+/// the consent itself, per number, and decides which change applies). Each is (profile, number, old,
+/// new, when the event behind it happened). A change that isn't an opt-in never waits on its history
+/// row (the savepoint and retry rule); an opt-in fails with it.
+pub async fn record_whatsapp_in(conn: &mut PgConnection, account_id: Uuid, changes: &[(Uuid, String, String, String, DateTime<Utc>)], src: &ConsentSource) -> sqlx::Result<()> {
+    let (mut opt_ins, mut rest) = (Vec::new(), Vec::new());
+    for (profile_id, phone, old, new, at) in changes {
+        let mut row = history_row(&Change { account_id, profile_id: *profile_id, channel: "whatsapp", field: "consent", old: Some(old), new: Some(new), address: Some(phone) }, src);
+        row.occurred_at = *at;
+        if new == "subscribed" {
+            opt_ins.push(row);
+        } else {
+            rest.push(row);
+        }
+    }
+    save_rows(conn, opt_ins, false).await?;
+    save_rows(conn, rest, true).await
+}
+
 /// Hold someone back from marketing (`crate::marketing_hold`), or let go of their hold, and record
 /// it, in the caller's transaction. A hold never applies to someone subscribed to email (the
 /// database clears it). Returns whether it changed.
@@ -948,6 +967,7 @@ pub fn describe_change(channel: &str, field: &str, old: Option<&str>, new: Optio
     let ch = match channel {
         "email" => "Email",
         "sms" => "SMS",
+        "whatsapp" => "WhatsApp",
         "marketing" => "Marketing",
         _ => "Do not sell or share",
     };
@@ -993,6 +1013,14 @@ pub fn describe_how(method: &str, actor: Option<&str>, form: Option<&str>, subje
         "deleted_profile" => "Matched the suppression record kept for a deleted profile".into(),
         "gpc" => "Global Privacy Control signal from their browser".into(),
         "hub" => "Their account page on your site".into(),
+        "whatsapp" => match detail["whatsapp_source"].as_str() {
+            Some("stop") => "Replied STOP on WhatsApp".into(),
+            Some("start") => "Replied START on WhatsApp".into(),
+            Some("keyword") => format!("Sent a sign-up word on WhatsApp{}", detail["keyword"].as_str().map(|k| format!(" (“{k}”)")).unwrap_or_default()),
+            Some("button") => "Tapped an opt-in button on WhatsApp".into(),
+            Some("meta_opt_out" | "meta_error") => "WhatsApp said they stopped marketing messages".into(),
+            _ => "WhatsApp".into(),
+        },
         _ => "Other".into(),
     }
 }
@@ -1126,8 +1154,41 @@ pub async fn reachability(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> Ap
     if let Some(r) = s.sms_suppressed_reason.clone() {
         sms.push(reason(&r, "Someone on your team added this number to the suppression list.", latest("sms", "suppression", r.clone()).await?));
     }
+    // WhatsApp, when the account has a sender: consent is kept per number (features::whatsapp).
+    let wa: Option<(bool, Option<String>, Option<DateTime<Utc>>, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT ws.sender_id IS NOT NULL, wc.consent, wc.unreachable_at, wc.consent_source, wc.consent_at FROM whatsapp_settings ws
+         LEFT JOIN whatsapp_contacts wc ON wc.account_id = ws.account_id AND wc.phone_number = $2 WHERE ws.account_id = $1",
+    )
+    .bind(account_id)
+    .bind(&s.phone_number)
+    .fetch_optional(db)
+    .await?;
+    let whatsapp = match wa {
+        Some((true, consent, unreachable, how, at)) => {
+            let mut r = Vec::new();
+            if s.phone_number.is_none() {
+                r.push(reason("no_address", "There's no phone number on this profile.", None));
+            }
+            match consent.as_deref() {
+                Some("subscribed") => {}
+                Some("unsubscribed") => r.push(reason(
+                    "unsubscribed",
+                    "They opted out of WhatsApp messages (the opt-out stays with the number). Only they can opt back in, on WhatsApp itself.",
+                    Some(json!({"since": at, "how": how})),
+                )),
+                _ if s.phone_number.is_some() => r.push(reason("not_subscribed", "They haven't agreed to WhatsApp messages on this number.", None)),
+                _ => {}
+            }
+            if unreachable.is_some() {
+                r.push(reason("not_on_whatsapp", "Messages to this number couldn't be delivered on WhatsApp several times in a row.", Some(json!({"since": unreachable}))));
+            }
+            json!({"can_send": r.is_empty(), "reasons": r})
+        }
+        _ => Value::Null,
+    };
     Ok(json!({
         "email": {"can_send": email.is_empty(), "reasons": email},
         "sms": {"can_send": sms.is_empty(), "reasons": sms},
+        "whatsapp": whatsapp,
     }))
 }

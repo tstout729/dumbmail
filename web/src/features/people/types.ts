@@ -1,11 +1,13 @@
 import type { Consent } from "../../api";
 
 export type Channel = "email" | "sms";
+/** A channel the suppression list shows (WhatsApp opt-outs are kept per number, read-only here). */
+export type ListedChannel = Channel | "whatsapp";
 
 export type ConsentEvent = {
   id: string;
-  channel: Channel | "ads";
-  field: "consent" | "suppression" | "opt_out";
+  channel: ListedChannel | "ads" | "marketing";
+  field: "consent" | "suppression" | "opt_out" | "hold" | "address";
   old_value: string | null;
   new_value: string | null;
   method: string;
@@ -25,7 +27,8 @@ export type ConsentEvent = {
 
 export type Reason = { code: string; text: string; since?: string; how?: string };
 export type ChannelReach = { can_send: boolean; reasons: Reason[] };
-export type Reachability = { email: ChannelReach; sms: ChannelReach };
+/** `whatsapp` is null when the account has no WhatsApp sender. */
+export type Reachability = { email: ChannelReach; sms: ChannelReach; whatsapp: ChannelReach | null };
 
 export type ProfileNote = { id: string; author_user_id: string | null; author: string; body: string; created_at: string };
 
@@ -44,7 +47,7 @@ export type SuppressionReason = "unsubscribed" | "hard_bounce" | "complaint" | "
 
 export type Suppression = {
   profile_id: string;
-  channel: Channel;
+  channel: ListedChannel;
   address: string;
   first_name: string | null;
   last_name: string | null;
@@ -60,11 +63,11 @@ export type Suppression = {
 export type SuppressionList = {
   data: Suppression[];
   total: number;
-  counts: { channel: Channel; reason: SuppressionReason; count: number }[];
+  counts: { channel: ListedChannel; reason: SuppressionReason; count: number }[];
   deleted_profiles_suppressed: number;
 };
 
-export type SuppressionQuery = { q?: string; channel?: Channel; reason?: SuppressionReason; from?: string; to?: string; limit?: number; offset?: number };
+export type SuppressionQuery = { q?: string; channel?: ListedChannel; reason?: SuppressionReason; from?: string; to?: string; limit?: number; offset?: number };
 
 export type BulkAction = {
   id: string;

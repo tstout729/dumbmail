@@ -62,6 +62,7 @@ export function ProfileSidePanels({ profileId, email, phone, tz }: PanelProps) {
         <div className="space-y-3">
           <ReachRow icon={<Mail className="size-3.5 text-zinc-400" />} label="Email" reach={s.reachability.email} tz={tz} />
           <ReachRow icon={<MessageSquare className="size-3.5 text-zinc-400" />} label="Text messages" reach={s.reachability.sms} tz={tz} />
+          {s.reachability.whatsapp ? <ReachRow icon={<MessageSquare className="size-3.5 text-zinc-400" />} label="WhatsApp" reach={s.reachability.whatsapp} tz={tz} /> : null}
         </div>
       </Card>
       <Card title="Privacy">
@@ -203,7 +204,7 @@ function NotesCard({ profileId, notes, tz }: { profileId: string; notes: { id: s
   );
 }
 
-const channelLabel: Record<ConsentEvent["channel"], string> = { email: "Email", sms: "SMS", ads: "Privacy" };
+const channelLabel: Record<ConsentEvent["channel"], string> = { email: "Email", sms: "SMS", whatsapp: "WhatsApp", ads: "Privacy", marketing: "Marketing" };
 
 function tone(e: ConsentEvent): string {
   const v = e.new_value;

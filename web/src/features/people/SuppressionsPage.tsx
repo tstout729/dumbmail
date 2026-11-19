@@ -32,7 +32,7 @@ import { useCan } from "../team/api";
 import { toast } from "../../lib/toast";
 import { suppressionsExportUrl, useSuppress, useSuppressions, useUnsuppress } from "./api";
 import { BulkProgress } from "./BulkActions";
-import type { Channel, Suppression, SuppressionReason, SuppressResult } from "./types";
+import type { ListedChannel, Suppression, SuppressionReason, SuppressResult } from "./types";
 
 const limit = 50;
 
@@ -62,7 +62,7 @@ export function SuppressionsPage() {
   const canExport = useCan("export");
   const { account } = useSession();
   const tz = account.timezone;
-  const [channel, setChannel] = useState<"all" | Channel>("all");
+  const [channel, setChannel] = useState<"all" | ListedChannel>("all");
   const [reason, setReason] = useState<SuppressionReason | "">("");
   const [search, setSearch] = useState("");
   const q = useDebouncedValue(search.trim(), 250);
@@ -79,7 +79,7 @@ export function SuppressionsPage() {
   const unsuppress = useUnsuppress();
   const rows = list.data?.data;
   const total = list.data?.total ?? 0;
-  const count = (c: Channel) => (list.data?.counts ?? []).filter((x) => x.channel === c).reduce((n, x) => n + x.count, 0);
+  const count = (c: ListedChannel) => (list.data?.counts ?? []).filter((x) => x.channel === c).reduce((n, x) => n + x.count, 0);
 
   return (
     <Page wide>
@@ -116,6 +116,8 @@ export function SuppressionsPage() {
           { value: "all", label: "All" },
           { value: "email", label: "Email", count: list.data ? count("email") : undefined },
           { value: "sms", label: "Text messages", count: list.data ? count("sms") : undefined },
+          // WhatsApp opt-outs are kept per number by the WhatsApp feature; shown when there are any.
+          ...(list.data && count("whatsapp") > 0 ? [{ value: "whatsapp" as const, label: "WhatsApp", count: count("whatsapp") }] : []),
         ]}
       />
       <div className="mb-3 flex flex-wrap items-end gap-2">
@@ -167,11 +169,11 @@ export function SuppressionsPage() {
               <tr key={`${r.profile_id}-${r.channel}`} className="hover:bg-zinc-50/60">
                 <Td>
                   <Link to={`/audience/profiles/${r.profile_id}`} className="whitespace-nowrap font-medium text-zinc-900 hover:underline">
-                    {r.channel === "sms" ? formatPhone(r.address) : r.address}
+                    {r.channel === "email" ? r.address : formatPhone(r.address)}
                   </Link>
                   {fullName(r) ? <div className="text-xs text-zinc-500">{fullName(r)}</div> : null}
                 </Td>
-                <Td className="text-zinc-600">{r.channel === "sms" ? "Texts" : "Email"}</Td>
+                <Td className="text-zinc-600">{r.channel === "sms" ? "Texts" : r.channel === "whatsapp" ? "WhatsApp" : "Email"}</Td>
                 <Td>
                   <Badge tone={reasonTone[r.reason]}>{r.reason_text}</Badge>
                   {r.how ? <div className="mt-0.5 text-xs text-zinc-500">{r.how}</div> : null}
@@ -215,7 +217,8 @@ export function SuppressionsPage() {
           loading={unsuppress.isPending}
           onConfirm={() =>
             unsuppress.mutate(
-              { profile_id: lifting.profile_id, channel: lifting.channel },
+              // Only hand-added email and text suppressions can be lifted (never a WhatsApp opt-out).
+              { profile_id: lifting.profile_id, channel: lifting.channel === "sms" ? "sms" : "email" },
               {
                 onSuccess: () => {
                   toast.success("Suppression lifted");
