@@ -992,6 +992,7 @@ pub fn describe_how(method: &str, actor: Option<&str>, form: Option<&str>, subje
         "privacy_request" => "Privacy request".into(),
         "deleted_profile" => "Matched the suppression record kept for a deleted profile".into(),
         "gpc" => "Global Privacy Control signal from their browser".into(),
+        "hub" => "Their account page on your site".into(),
         _ => "Other".into(),
     }
 }

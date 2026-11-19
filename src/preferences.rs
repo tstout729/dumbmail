@@ -91,6 +91,49 @@ pub async fn save(db: &PgPool, account_id: Uuid, profile_id: Uuid, keep: &HashSe
     Ok(changed)
 }
 
+/// Where an opt-out came from: the unsubscribe link in a message (with that message), or a page
+/// such as the customer hub.
+pub struct OptOutSource {
+    /// The event's `method` property (`link`, `hub`).
+    pub method: &'static str,
+    /// The webhook's reason (`unsubscribe_link`, `hub`).
+    pub reason: &'static str,
+    /// The message whose link was used: (message, campaign, flow), and whether it was a test.
+    pub message: Option<(Uuid, Option<Uuid>, Option<Uuid>, bool)>,
+}
+
+/// Unsubscribe a person from all email (`channel` "email") or all texts ("sms"): under a lock on
+/// their row, written only when it changes something, with the channel's event (`Unsubscribed`,
+/// `Unsubscribed from SMS`; none for a test message's link) and the webhook notice. Returns whether
+/// it changed anything. The unsubscribe page and the customer hub both use it.
+pub async fn opt_out(db: &PgPool, account_id: Uuid, profile_id: Uuid, channel: &str, src: &OptOutSource) -> AppResult<bool> {
+    let (ch, metric, channel) = if channel == "sms" { (crate::features::people::Channel::Sms, "Unsubscribed from SMS", "sms") } else { (crate::features::people::Channel::Email, "Unsubscribed", "email") };
+    // Through the consent helpers (features::people): the row locked, the change and its history row
+    // together, the opt-out saved even if its history row has to be written later. How it happened
+    // is the caller's consent source, or else this source's own.
+    let mut how = crate::features::people::consent::current_source();
+    if how.method == "other" {
+        how = crate::features::people::ConsentSource::new(if src.method == "hub" { "hub" } else { "unsubscribe_link" }, "public");
+        if let Some((id, ..)) = src.message {
+            how = how.with_message(id);
+        }
+    }
+    let before = crate::features::people::consent::set_consent(db, account_id, profile_id, ch, "unsubscribed", None, &how).await?;
+    let Some(before) = before else { return Ok(false) };
+    let message_id = src.message.map(|m| m.0);
+    if !src.message.is_some_and(|m| m.3) {
+        let mut props = json!({"method": src.method});
+        if let Some((id, campaign_id, flow_id, _)) = src.message {
+            props["campaign_id"] = json!(campaign_id);
+            props["flow_id"] = json!(flow_id);
+            props["message_id"] = json!(id);
+        }
+        audience::record_event(db, NewEvent { account_id, profile_id, metric, properties: props, value: None, occurred_at: None, unique_id: None, message_id }).await?;
+    }
+    crate::features::webhooks::consent_changed(db, account_id, profile_id, channel, &before, "unsubscribed", src.reason, message_id).await;
+    Ok(true)
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }

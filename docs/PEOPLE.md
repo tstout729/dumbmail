@@ -27,6 +27,7 @@ Each entry has `channel` (`email`, `sms`, `ads`, `marketing`), `field` (`consent
 | `merge` / `bulk_action` / `suppression_list` / `privacy_request` | Changes made by the tools on this page. |
 | `deleted_profile` | The profile's address matched the suppression record kept for a deleted person. |
 | `gpc` | The visitor's browser sent Global Privacy Control. |
+| `hub` | The person's account page on the business's site (an unsubscribe, or a subscribe for the address they proved with an emailed code, which counts as their own verified opt-in). |
 
 `GET /api/people/profiles/:id/consent?limit=&offset=` returns `{data, total, history_started_at}`. MCP: `get_consent_history` (by `profile_id`, `email` or `phone_number`), which also returns `reachability`.
 

@@ -213,26 +213,36 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
         if used {
             return Err(taken());
         }
+        let new_email = email.clone().flatten();
+        let email_changes = email.is_some() && before.email.is_some() && before.email != new_email;
         // The identity, and the consent that goes with the address, in one statement: a different
         // number or email (or a first one) hasn't agreed to anything, so a subscription doesn't carry
         // over to it unless this request sets that consent itself (unsubscribed and pending stay).
         // A hard bounce belonged to the old email address; a complaint stays (as in the upsert).
-        let new_email = "($2 AND p.email IS NOT NULL AND p.email IS DISTINCT FROM $3)";
+        let new_email_sql = "($2 AND p.email IS NOT NULL AND p.email IS DISTINCT FROM $3)";
         let q = format!(
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
                sms_consent = CASE WHEN $7::text IS NOT NULL THEN $7
                                   WHEN $4 AND p.phone_number IS DISTINCT FROM $5 AND p.sms_consent = 'subscribed' THEN 'never_subscribed'
                                   ELSE p.sms_consent END,
-               email_consent = CASE WHEN $9::text IS NULL AND {new_email} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END,
-               email_suppressed_reason = CASE WHEN {new_email} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
-               external_id = COALESCE($6, p.external_id), updated_at = now()
+               email_consent = CASE WHEN $9::text IS NULL AND {new_email_sql} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END,
+               email_suppressed_reason = CASE WHEN {new_email_sql} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
+               external_id = COALESCE($6, p.external_id),
+               email_source = CASE WHEN $2 AND $3::text IS NOT NULL AND (p.email IS DISTINCT FROM $3::text OR p.email_source IS NULL) THEN '{source}' ELSE p.email_source END,
+               updated_at = now()
              FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 AND account_id = $8 FOR UPDATE) old
-             WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
+             WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent",
+            source = core::TRUSTED_EMAIL_SOURCE
         );
         // In one transaction with the address change, the row locked first: the consent history sees
         // the exact before and after, and a deleted person's suppression record for the new address applies.
         let mut tx = state.db.begin().await?;
         let consent_before = crate::features::people::consent::lock(&mut tx, account_id, id).await?.ok_or_else(|| AppError::not_found("profile"))?;
+        // A new address ends the person's customer hub access (sessions, sign-in links and codes made
+        // for the old one), in this transaction.
+        if email_changes {
+            crate::features::hub::end_sessions(&mut *tx, id).await?;
+        }
         let saved = sqlx::query_as::<_, IdentitySaved>(&q)
             .bind(id)
             .bind(email.is_some())
@@ -249,6 +259,15 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
                 AppError::Conflict(_) => taken(),
                 other => other,
             })?;
+        // A changed address whose source was already ours: the database cleared the source with the
+        // change (it can't tell the same source writing a new address); mark it again.
+        if let (true, Some(e)) = (email_changes, new_email.as_deref()) {
+            sqlx::query(&format!("UPDATE profiles SET email_source = '{}' WHERE id = $1 AND email = $2 AND email_source IS NULL", core::TRUSTED_EMAIL_SOURCE))
+                .bind(id)
+                .bind(e)
+                .execute(&mut *tx)
+                .await?;
+        }
         let p = crate::features::people::consent::after_address_change(&mut tx, account_id, &consent_before, saved.profile).await?;
         tx.commit().await?;
         // The consent this write replaced, as the write itself read it.

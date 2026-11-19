@@ -427,8 +427,8 @@ impl Run<'_> {
         let mut tx: Tx = self.begin().await?;
         let res: Vec<(Uuid, Option<String>, Option<String>, String, String)> = sqlx::query_as(
             "WITH ins AS (
-                INSERT INTO profiles (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_suppressed_reason, marketing_hold, created_at)
-                SELECT k.id, $1, k.email, k.phone, k.ext, k.first, k.last, k.props, k.ec, k.sc, k.sup, k.hold, COALESCE(k.created, now())
+                INSERT INTO profiles (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_suppressed_reason, marketing_hold, created_at, email_source)
+                SELECT k.id, $1, k.email, k.phone, k.ext, k.first, k.last, k.props, k.ec, k.sc, k.sup, k.hold, COALESCE(k.created, now()), CASE WHEN k.email IS NOT NULL THEN 'klaviyo' END
                 FROM unnest($2::uuid[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::jsonb[], $9::text[], $10::text[], $11::text[], $12::bool[], $13::timestamptz[])
                      AS k(id, email, phone, ext, first, last, props, ec, sc, sup, hold, created)
                 ON CONFLICT DO NOTHING
