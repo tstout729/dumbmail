@@ -1,0 +1,27 @@
+{
+  "description": "With property_id set, a webhook for another property is ignored",
+  "doc": "https://developers.cloudbeds.com/docs/webhooks-1 (reservation/created example, another property)",
+  "expect": [
+    {
+      "message": "ignored reservation/created for another property (999)",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "endDate": "2020-05-21",
+      "event": "reservation/created",
+      "propertyID": 999,
+      "propertyID_str": "999",
+      "reservationID": "27182818",
+      "startDate": "2020-05-19",
+      "timestamp": 1611758157.431234,
+      "version": "1.0"
+    },
+    "settings": {
+      "currency": "",
+      "payment_check_days": 7,
+      "property_id": "12345"
+    }
+  }
+}

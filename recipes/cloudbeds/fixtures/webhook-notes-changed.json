@@ -1,0 +1,23 @@
+{
+  "description": "reservation/notes_changed carries the notes: ignored, and the notes are never kept",
+  "doc": "https://developers.cloudbeds.com/docs/webhooks-1 (reservation/notes_changed fields)",
+  "expect": [
+    {
+      "message": "ignored Cloudbeds event reservation/notes_changed",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "event": "reservation/notes_changed",
+      "notes": "Lockbox 4471, side gate",
+      "propertyId": "12345",
+      "reservationId": "31415926",
+      "timestamp": 1611758557.0,
+      "version": "1.0"
+    }
+  },
+  "sensitive": [
+    "Lockbox 4471"
+  ]
+}

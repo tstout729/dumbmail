@@ -1,0 +1,19 @@
+{
+  "description": "Before store_ids is set nothing is looked up",
+  "doc": "https://help.shipstation.com/hc/en-us/articles/360025856252-ShipStation-Webhooks (example payload)",
+  "expect": [
+    {
+      "message": "set store_ids in the integration's settings to the stores to record",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "resource_type": "SHIP_NOTIFY",
+      "resource_url": "https://ssapi.shipstation.com/shipments?storeID=123456&batchId=12345678"
+    },
+    "settings": {
+      "store_ids": []
+    }
+  }
+}

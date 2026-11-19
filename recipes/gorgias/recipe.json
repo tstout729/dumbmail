@@ -1,0 +1,82 @@
+{
+  "key": "gorgias",
+  "name": "Gorgias",
+  "category": "Support",
+  "description": "Gorgias tickets become events on the customer's profile: Ticket Created, Ticket Closed and Satisfaction Rated (with the score), with the ticket's subject, status and channel only, never its messages. DumbMail fetches each ticket from Gorgias's API when Gorgias says it changed. Customers are held back from marketing: a support ticket isn't consent.",
+  "metrics": [
+    "Ticket Created",
+    "Ticket Closed",
+    "Satisfaction Rated"
+  ],
+  "docs": [
+    "https://docs.gorgias.com/data-and-http-integrations/http-integrations",
+    "https://developers.gorgias.com/reference/the-tickethttpintegration-object",
+    "https://developers.gorgias.com/reference/the-ticket-object",
+    "https://developers.gorgias.com/reference/the-satisfactionsurvey-object",
+    "https://developers.gorgias.com/reference/the-integration-object"
+  ],
+  "signature": {
+    "type": "shared_secret",
+    "header": "X-Webhook-Token"
+  },
+  "signature_secret": {
+    "label": "Header value",
+    "help": "A long random value you choose, for example the output of: openssl rand -hex 24. Add it as the X-Webhook-Token header of the HTTP integration in Gorgias."
+  },
+  "credentials": [
+    {
+      "name": "email",
+      "label": "Gorgias user email",
+      "help": "The email of the Gorgias user whose API key you use."
+    },
+    {
+      "name": "api_key",
+      "label": "Gorgias API key",
+      "help": "Gorgias → Settings → REST API: the API key (base URL and username are on the same page). Used to fetch each ticket an HTTP integration request names."
+    }
+  ],
+  "settings": {},
+  "pull": {
+    "method": "GET",
+    "url": "https://your-account.gorgias.com/api/tickets",
+    "auth": {
+      "type": "basic",
+      "username": "{{secret.email}}",
+      "password": "{{secret.api_key}}"
+    },
+    "fetch": {
+      "prefix": "/api/tickets/",
+      "paths": [
+        "/api/tickets/{id}"
+      ],
+      "id": "^[0-9]{1,20}$",
+      "per_hour": 1000
+    }
+  },
+  "redact": [
+    "keep:ticket_id",
+    "keep:id",
+    "keep:subject",
+    "keep:status",
+    "keep:channel",
+    "keep:spam",
+    "keep:created_datetime",
+    "keep:closed_datetime",
+    "keep:trashed_datetime",
+    "keep:customer.email",
+    "keep:satisfaction_survey.id",
+    "keep:satisfaction_survey.score",
+    "keep:satisfaction_survey.scored_datetime"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Gorgias, open Settings → REST API. Save the username (your email) and the API key as the credentials email and api_key. In the Pull tab, change your-account in https://your-account.gorgias.com to your Gorgias account's name (the part before .gorgias.com in the base URL on the same page).",
+    "Pick a long random value and save it as the integration's signing secret.",
+    "In Gorgias, open Settings → HTTP integration → Manage → Add HTTP integration. Name it DumbMail, paste the webhook URL, method POST, and under Header add X-Webhook-Token with the same value. Tick the triggers Ticket created and Ticket updated. Request content type application/json, with this body: {\"ticket_id\": \"{{ticket.id}}\"}. Add the integration.",
+    "Create a test ticket and check the delivery log: each request is followed by a fetch of the ticket. Closing it records Ticket Closed.",
+    "Satisfaction ratings arrive only with the ticket's next update: Gorgias's HTTP integrations have no trigger for a survey answer, so a rating is recorded the next time Gorgias sends Ticket updated for that ticket (for example when it's reopened, tagged or closed again).",
+    "Only the ticket's subject, status and channel and the survey's score are kept. Messages, the survey comment and customers' names are never stored.",
+    "Customers are held back from marketing: a support ticket isn't consent."
+  ],
+  "flows": []
+}
