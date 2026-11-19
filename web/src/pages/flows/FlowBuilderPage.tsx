@@ -18,6 +18,7 @@ import { TriggerEditor } from "../../components/flows/TriggerEditor";
 import { Button, ConfirmDialog, Drawer, Modal, Page, PageHeader, Segmented, Skeleton, Stat, cx } from "../../components/ui";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { RcsReportCard } from "../../features/rcs/RcsReportCard";
 
 export function FlowBuilderPage() {
   const { id = "" } = useParams();
@@ -174,6 +175,11 @@ function FlowBuilder({ flow }: { flow: Flow }) {
               <Stat label="Open rate" value={formatPercent(stats.open_rate)} />
               <Stat label="Click rate" value={formatPercent(stats.click_rate)} />
               <Stat label="Revenue" value={formatCurrency(stats.revenue)} />
+            </div>
+          ) : null}
+          {flow.status !== "draft" && def.nodes.some((n) => n.type === "sms") ? (
+            <div className="mt-3 empty:hidden">
+              <RcsReportCard flowId={flow.id} />
             </div>
           ) : null}
           {results.data ? (

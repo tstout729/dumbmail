@@ -4,6 +4,7 @@ import type { SmsContent } from "../../api";
 import { useSession, useSmsRender } from "../../api";
 import { useDebouncedValue } from "../../lib/hooks";
 import { ShortLinkNote } from "../../features/shortLinks/ShortLinkNote";
+import { RcsPreviewSwitch, RichVersionEditor } from "../../features/rcs/RichVersion";
 import { Button, Field, Input, Textarea, cx } from "../ui";
 import { LoadTemplateDialog, SaveTemplateDialog } from "./TemplateDialogs";
 import { VariableMenu, insertAtCursor } from "./VariableMenu";
@@ -42,7 +43,7 @@ export function SmsEditor({ value, onChange, templates = true, templateName, rea
       <fieldset disabled={readOnly} className="min-w-0 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-xs font-medium text-zinc-700">Message</div>
-          <div className="flex items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             <VariableMenu onInsert={(v) => onChange({ ...value, body: insertAtCursor(ref.current, value.body, v) })} />
             <Button size="sm" variant="ghost" icon={<Languages className="size-3.5" />} onClick={() => setDialog("languages")}>
               Languages
@@ -80,8 +81,15 @@ export function SmsEditor({ value, onChange, templates = true, templateName, rea
           <Input value={value.media_url ?? ""} onChange={(e) => onChange({ ...value, media_url: e.target.value || undefined })} placeholder="https://…/image.jpg" />
         </Field>
         <p className="text-xs text-zinc-500">Include your brand name and opt-out language. Carriers require it.</p>
+        <RichVersionEditor value={value} onChange={onChange} readOnly={readOnly} />
       </fieldset>
-      <PhonePreview body={render.data?.body ?? value.body} mediaUrl={value.media_url} from={account.sms_from ?? account.name} />
+      <RcsPreviewSwitch
+        value={value}
+        render={render.data}
+        body={render.data?.body ?? value.body}
+        from={account.name}
+        sms={<PhonePreview body={render.data?.body ?? value.body} mediaUrl={value.media_url} from={account.sms_from ?? account.name} />}
+      />
       {dialog === "load" ? (
         <LoadTemplateDialog
           channel="sms"

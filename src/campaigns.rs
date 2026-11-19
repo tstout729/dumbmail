@@ -352,8 +352,11 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
         problems.extend(crate::features::push::content::problems(content));
     } else if channel == "whatsapp" {
         problems.extend(crate::features::whatsapp::content_problems(content));
-    } else if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
-        problems.push("Write the SMS message".into());
+    } else {
+        if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
+            problems.push("Write the SMS message".into());
+        }
+        problems.extend(crate::features::rcs::content_problems(content));
     }
     problems
 }

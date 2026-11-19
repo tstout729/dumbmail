@@ -12,6 +12,7 @@ import { useCampaignReport, useCancelCampaign, useDuplicateCampaign, useEstimate
 import { TimeSeriesChart } from "../../components/charts/TimeSeriesChart";
 import { EmailPreview } from "../../components/email/EmailPreview";
 import { PhonePreview } from "../../components/email/SmsEditor";
+import { RcsReportCard } from "../../features/rcs/RcsReportCard";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Modal, Notice, Page, PageHeader, Segmented, Skeleton, Stat, StatusBadge, Table, Td, Th, cx } from "../../components/ui";
 import { formatCurrency, formatDateTime, formatNumber, formatPercent, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
@@ -108,6 +109,7 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           <WhatsappReportCard campaignId={campaign.id} />
         </div>
       ) : null}
+      {campaign.channel === "sms" ? <RcsReportSlot campaignId={campaign.id} /> : null}
       <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <Card title={campaign.channel === "email" ? "Opens and clicks over time" : "Clicks over time"}>
           <TimeSeriesChart
@@ -407,4 +409,12 @@ function MetricTh({ active, children }: { active: boolean; children: string }) {
 
 function MetricTd({ active, children }: { active: boolean; children: ReactNode }) {
   return <Td className={cx("text-right tabular-nums", active && "font-semibold text-zinc-900")}>{children}</Td>;
+}
+
+function RcsReportSlot({ campaignId }: { campaignId: string }) {
+  return (
+    <div className="mt-4 empty:hidden">
+      <RcsReportCard campaignId={campaignId} />
+    </div>
+  );
 }

@@ -30,6 +30,7 @@ import {
 import { formatDate, formatPhone, formatPrice } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { TollFreeVerificationForm, verificationDefaults } from "./TollFreeVerificationForm";
+import { RcsSettingsCard } from "../../features/rcs/RcsSettingsCard";
 
 const statusLabels: Record<PhoneNumberStatus, string> = {
   active: "Active",
@@ -63,6 +64,7 @@ export function SmsPage() {
       <StatusBanner sms={sms} purchased={purchased} />
       {sms.platform_available || purchased.length > 0 ? <PlatformCard sms={sms} purchased={purchased} /> : null}
       <ByoCard sms={sms} connected={connected} />
+      {sms.from_number ? <RcsSettingsCard /> : null}
     </div>
   );
 }

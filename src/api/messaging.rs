@@ -172,13 +172,15 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         let r = render::render_email(&account, &content, &ctx, None)?;
         Ok(json!({"subject": r.subject, "preheader": r.preheader, "html": r.html, "text": r.text}))
     } else {
+        // The rich version RCS phones get (features::rcs): checked, its title filled in.
+        let rcs = crate::features::rcs::preview(&content, &ctx)?;
         let content: render::SmsContent = serde_json::from_value(content)?;
         // Links the send would shorten show as a sample short link of the real length (features::short_links).
         let sample = crate::features::short_links::send::preview(state, &account, &content.body).await?;
         let body = render::render_sms_with(&account, &content, &ctx, None, false, sample.as_ref().map(|s| s as &dyn render::SmsLinks))?;
         let (chars, segs) = crate::providers::sms::segment_count(&body);
         let short_links = sample.as_ref().map_or(0, |s| s.count_in(&body));
-        Ok(json!({"body": body, "characters": chars, "segments": segs, "short_links": short_links}))
+        Ok(json!({"body": body, "characters": chars, "segments": segs, "short_links": short_links, "rcs": rcs}))
     }
 }
 

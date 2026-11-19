@@ -375,8 +375,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // Render first so template errors never leave a half-sent message.
     enum Rendered {
         Email(OutgoingEmail),
-        /// Message, provider, and whether that provider is the customer's own account (not billed).
-        Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>, bool),
+        /// Message, provider, whether that provider is the customer's own account (not billed), and
+        /// the RCS plan when it goes as RCS (features::rcs; None: SMS as always).
+        Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>, bool, Option<crate::features::rcs::send::Plan>),
     }
     let (subject, mut rendered) = if spec.channel == "email" {
         let content: EmailContent = serde_json::from_value(content.into_owned())?;
@@ -402,6 +403,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         };
         (Some(subject), Rendered::Email(email))
     } else {
+        // The rich version, for RCS (features::rcs); SMS rendering never sees it.
+        let rich = content.get("rcs").filter(|v| !v.is_null()).map(|r| json!({"rcs": r}));
         let content: SmsContent = serde_json::from_value(content.into_owned())?;
         let (provider, mut from, own_provider) = crate::phone::sender(state, spec.account.id).await?;
         if let Some(c) = conversational {
@@ -412,15 +415,25 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .fetch_one(&state.db)
             .await?;
         let body = render::render_sms_with(spec.account, &content, &ctx, Some(&tracking), !prior_sms, short_links.as_ref().map(|s| s as &dyn render::SmsLinks))?;
-        (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider, own_provider))
+        // RCS when it's on and this phone can show this text (never for conversational replies).
+        let rcs = match conversational {
+            None => crate::features::rcs::send::plan(state, &spec, rich.as_ref().unwrap_or(&Value::Null), &ctx, &tracking, &to, content.media_url.is_some()).await?,
+            Some(_) => None,
+        };
+        (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider, own_provider, rcs))
     };
 
     // Pay-as-you-go: make sure the balance covers this message before it goes out.
     let (segments, is_mms, own_provider) = match &rendered {
-        Rendered::Sms(s, _, own) => (crate::providers::sms::segment_count(&s.body).1 as i64, s.media_url.is_some(), *own),
+        Rendered::Sms(s, _, own, _) => (crate::providers::sms::segment_count(&s.body).1 as i64, s.media_url.is_some(), *own),
         Rendered::Email(_) => (1, false, false),
     };
     let price = crate::billing::quote(state, spec.account.id, spec.channel, segments, is_mms, own_provider).await?;
+    // A text going as RCS may still end as SMS (a fallback): the balance covers the larger.
+    let price = match &rendered {
+        Rendered::Sms(_, _, _, Some(plan)) => price.max(plan.price),
+        _ => price,
+    };
     if price > 0 && crate::billing::balance(&state.db, spec.account.id).await? < price {
         if let Some(mid) = spec.message_id {
             sqlx::query("UPDATE messages SET status = 'skipped', error = 'insufficient credit' WHERE id = $1").bind(mid).execute(&state.db).await?;
@@ -496,7 +509,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         }
         return Ok(Outcome::Skipped("profile deleted"));
     };
-    if let (Some(links), Rendered::Sms(s, _, _)) = (&short_links, &mut rendered) {
+    if let (Some(links), Rendered::Sms(s, _, _, _)) = (&short_links, &mut rendered) {
         let chosen = short_ref.ok_or_else(|| AppError::Internal(anyhow::anyhow!("no free short link reference for this text")))?;
         s.body = links.with_ref(&s.body, &chosen);
     }
@@ -514,7 +527,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // that opted out), so an opt-out that committed first always wins and nothing can mark it
     // skipped after it's handed over.
     let stop = match &rendered {
-        Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational, strict).await?,
+        Rendered::Sms(s, _, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational, strict).await?,
         Rendered::Email(_) if !spec.is_test => last_check(state, &spec, p.id, message_id, &to, strict).await?,
         Rendered::Email(_) => None,
     };
@@ -546,16 +559,30 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         };
     }
     // Keep the text as sent, so the SMS inbox can show campaign, flow and reply texts in each thread.
-    if let (Rendered::Sms(s, _, _), false) = (&rendered, spec.is_test) {
+    if let (Rendered::Sms(s, _, _, _), false) = (&rendered, spec.is_test) {
         crate::features::inbox::record_sent(&state.db, spec.account.id, p.id, message_id, &s.body, s.media_url.as_deref(), conversational).await?;
     }
     let result = match &rendered {
         Rendered::Email(e) => state.email.send(e).await,
         // Bounded, so a claimed text never waits on the provider indefinitely.
-        Rendered::Sms(s, provider, _) => match tokio::time::timeout(SMS_PROVIDER_TIMEOUT, provider.send(s)).await {
-            Ok(r) => r,
-            Err(_) => Err(anyhow::anyhow!("the texting provider didn't answer within {} seconds; not sent again", SMS_PROVIDER_TIMEOUT.as_secs())),
-        },
+        Rendered::Sms(s, provider, _, rcs) => {
+            // As RCS first when planned (features::rcs::send::hand_off records, bills and reports it).
+            let handoff = match rcs {
+                Some(plan) => Some(crate::features::rcs::send::hand_off(state, &spec, plan, s, strict).await?),
+                None => None,
+            };
+            match handoff {
+                Some(crate::features::rcs::send::Handoff::Sent) => {
+                    coupons.delivered(&state.db).await;
+                    return Ok(Outcome::Sent(message_id));
+                }
+                Some(crate::features::rcs::send::Handoff::Unclear(msg)) => return Ok(Outcome::Failed(msg)),
+                Some(crate::features::rcs::send::Handoff::AsSms) | None => match tokio::time::timeout(SMS_PROVIDER_TIMEOUT, provider.send(s)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!("the texting provider didn't answer within {} seconds; not sent again", SMS_PROVIDER_TIMEOUT.as_secs())),
+                },
+            }
+        }
     };
     match result {
         Ok(provider_id) => {
