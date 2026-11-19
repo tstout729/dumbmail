@@ -1,0 +1,224 @@
+{
+  "description": "The FAQ's example money: a balance of 241.8 still due, so not paid in full",
+  "doc": "https://developers.cloudbeds.com/reference/get_getreservation-2 (fields as documented; money from the example in https://developers.cloudbeds.com/docs/reservation-faqs; personal data replaced)",
+  "expect": [
+    {
+      "email": "robin.example@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "cloudbeds_reservation": "31415926"
+      },
+      "last_name": "Example",
+      "phone_number": "+15035550142",
+      "type": "upsert_profile"
+    },
+    {
+      "as_of": "2026-11-17T17:00:00.100Z",
+      "external_id": "cloudbeds:31415926",
+      "fields": {
+        "balance": 241.8,
+        "check_in": "2026-12-03",
+        "check_out": "2026-12-05",
+        "guests": 3,
+        "nights": 2,
+        "paid_checked_at": "2026-11-17T17:00:00.100Z",
+        "paid_in_full": false,
+        "property_id": "12345",
+        "reservation_id": "31415926",
+        "source_channel": "Website",
+        "status": "confirmed",
+        "total": 241.8
+      },
+      "object_type": "cloudbeds_reservation",
+      "profiles": [
+        {
+          "email": "robin.example@example.com",
+          "relationship": "guest"
+        }
+      ],
+      "replace_links": [
+        "guest"
+      ],
+      "type": "upsert_object"
+    },
+    {
+      "metric": "Cloudbeds Reservation Confirmed",
+      "profile": {
+        "email": "robin.example@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-03",
+        "check_out": "2026-12-05",
+        "guests": 3,
+        "nights": 2,
+        "property_id": "12345",
+        "reservation_id": "31415926",
+        "source_channel": "Website",
+        "status": "confirmed"
+      },
+      "time": "2026-11-01T15:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "cloudbeds:31415926:confirmed"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": {
+        "assigned": [
+          {
+            "adults": "2",
+            "children": "1",
+            "dailyRates": [
+              {
+                "date": "2026-12-03",
+                "rate": 120.9
+              },
+              {
+                "date": "2026-12-04",
+                "rate": 120.9
+              }
+            ],
+            "endDate": "2026-12-05",
+            "guestID": "55501",
+            "guestName": "Robin Example",
+            "reservationRoomID": "9001",
+            "roomID": "101",
+            "roomName": "101",
+            "roomTotal": "241.80",
+            "roomTypeID": "77",
+            "roomTypeIsVirtual": false,
+            "roomTypeName": "Ocean View",
+            "roomTypeNameShort": "OV",
+            "startDate": "2026-12-03",
+            "subReservationID": "31415926-1"
+          }
+        ],
+        "balance": 241.8,
+        "balanceDetailed": {
+          "additionalItems": 0,
+          "grandTotal": 241.8,
+          "paid": 0,
+          "subTotal": 241.8,
+          "suggestedDeposit": "0.00",
+          "taxesFees": 0
+        },
+        "cancellation": null,
+        "cardsOnFile": [
+          {
+            "cardID": "c1",
+            "cardNumber": "4242",
+            "cardType": "visa"
+          }
+        ],
+        "customFields": [
+          {
+            "customFieldID": "2",
+            "customFieldName": "Door code",
+            "customFieldValue": "Door 3391",
+            "isActive": true,
+            "shortcode": "door"
+          }
+        ],
+        "dateCancelled": null,
+        "dateCancelledUTC": null,
+        "dateCreated": "2026-11-01T15:04:11Z",
+        "dateModified": "2026-11-10T09:30:00Z",
+        "endDate": "2026-12-05",
+        "estimatedArrivalTime": "15:00",
+        "guestEmail": "robin.example@example.com",
+        "guestList": {
+          "55501": {
+            "assignedRoom": true,
+            "companyName": null,
+            "companyTaxID": null,
+            "customFields": [
+              {
+                "customFieldID": "1",
+                "customFieldName": "Gate code",
+                "customFieldValue": "Gate 8812",
+                "isActive": true,
+                "shortcode": "gate"
+              }
+            ],
+            "guestAddress": "1 Test Street",
+            "guestAddress2": "",
+            "guestBirthdate": "1990-01-01",
+            "guestCellPhone": "+1 503 555 0142",
+            "guestCity": "Portland",
+            "guestCountry": "US",
+            "guestDocumentExpirationDate": null,
+            "guestDocumentIssueDate": null,
+            "guestDocumentIssuingCountry": "US",
+            "guestDocumentNumber": "X1234567",
+            "guestDocumentType": "passport",
+            "guestEmail": "robin.example@example.com",
+            "guestFirstName": "Robin",
+            "guestGender": "N/A",
+            "guestID": "55501",
+            "guestLastName": "Example",
+            "guestNationality": "US",
+            "guestPhone": "",
+            "guestState": "OR",
+            "guestStatus": "confirmed",
+            "guestZip": "97299",
+            "isAnonymized": false,
+            "isMainGuest": true,
+            "roomID": "101",
+            "roomName": "101",
+            "roomTypeName": "Ocean View",
+            "taxID": "TAX-998877"
+          },
+          "55502": {
+            "assignedRoom": false,
+            "guestCellPhone": "",
+            "guestEmail": "sam.companion@example.com",
+            "guestFirstName": "Sam",
+            "guestID": "55502",
+            "guestLastName": "Companion",
+            "guestNationality": "",
+            "guestPhone": "",
+            "isAnonymized": false,
+            "isMainGuest": false
+          }
+        },
+        "guestName": "Robin Example",
+        "isAnonymized": false,
+        "mealPlans": "",
+        "origin": "booking engine",
+        "propertyID": "12345",
+        "reservationID": "31415926",
+        "source": "Website",
+        "sourceID": "s-1",
+        "startDate": "2026-12-03",
+        "status": "confirmed",
+        "thirdPartyIdentifier": null,
+        "total": 241.8,
+        "unassigned": []
+      },
+      "success": true
+    },
+    "request": {
+      "method": "GET",
+      "query": [
+        [
+          "propertyID",
+          "12345"
+        ],
+        [
+          "reservationID",
+          "31415926"
+        ]
+      ],
+      "sent_at": "2026-11-17T17:00:00.100Z",
+      "url": "https://api.cloudbeds.com/api/v1.3/getReservation"
+    },
+    "response": {
+      "headers": {
+        "content-type": "application/json"
+      },
+      "received_at": "2026-11-17T17:00:00.250Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

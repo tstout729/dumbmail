@@ -1,0 +1,15 @@
+{
+  "description": "The HTTP integration's request: fetch the ticket it names",
+  "doc": "https://docs.gorgias.com/data-and-http-integrations/http-integrations (body is the template from the setup steps; {{ticket.id}} from https://developers.gorgias.com/reference/the-tickethttpintegration-object)",
+  "expect": [
+    {
+      "type": "next_request",
+      "url": "/api/tickets/4242"
+    }
+  ],
+  "input": {
+    "payload": {
+      "ticket_id": "4242"
+    }
+  }
+}

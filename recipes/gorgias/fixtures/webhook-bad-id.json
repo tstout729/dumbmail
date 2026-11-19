@@ -1,0 +1,15 @@
+{
+  "description": "A ticket_id that isn't a number is never looked up",
+  "doc": "https://docs.gorgias.com/data-and-http-integrations/http-integrations (body is the template from the setup steps; {{ticket.id}} from https://developers.gorgias.com/reference/the-tickethttpintegration-object)",
+  "expect": [
+    {
+      "message": "not the DumbMail body (see the recipe's setup steps): no ticket_id",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "ticket_id": "12/../../account"
+    }
+  }
+}

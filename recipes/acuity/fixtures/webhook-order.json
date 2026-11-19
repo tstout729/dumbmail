@@ -1,0 +1,16 @@
+{
+  "description": "order.completed (a package or gift certificate) isn't recorded",
+  "doc": "https://developers.acuityscheduling.com/docs/webhooks (form-encoded body; example \"action=changed&id=13&calendarID=1&appointmentTypeID=13\")",
+  "expect": [
+    {
+      "message": "ignored Acuity action order.completed",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "action": "order.completed",
+      "id": "881"
+    }
+  }
+}

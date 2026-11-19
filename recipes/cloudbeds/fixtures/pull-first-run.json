@@ -1,0 +1,33 @@
+{
+  "description": "The first hourly check has no window yet: it asks again for confirmed arrivals from yesterday to a week ahead",
+  "doc": "https://developers.cloudbeds.com/reference/get_getreservations-2 (fields as documented; personal data replaced)",
+  "expect": [
+    {
+      "type": "set_state",
+      "values": {
+        "from": "2026-11-16",
+        "page": "1",
+        "to": "2026-11-24"
+      }
+    },
+    {
+      "query": {
+        "checkInFrom": "2026-11-16",
+        "checkInTo": "2026-11-24",
+        "pageNumber": "1"
+      },
+      "type": "next_request"
+    }
+  ],
+  "input": {
+    "page": 1,
+    "payload": {
+      "count": 0,
+      "data": [],
+      "success": true,
+      "total": 0
+    },
+    "source": "pull",
+    "state": {}
+  }
+}

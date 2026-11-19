@@ -1,0 +1,16 @@
+{
+  "description": "An id that isn't a number is never looked up",
+  "doc": "https://developers.acuityscheduling.com/docs/webhooks (form-encoded body; example \"action=changed&id=13&calendarID=1&appointmentTypeID=13\")",
+  "expect": [
+    {
+      "message": "ignored scheduled without an appointment id",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "action": "scheduled",
+      "id": "../../me"
+    }
+  }
+}
