@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { Inbox, KeyRound, MessageSquare, Search, Settings2 } from "lucide-react";
+import { Bot, Inbox, KeyRound, MessageSquare, Search, Settings2 } from "lucide-react";
 import { Button, ButtonLink, Checkbox, EmptyState, Input, Notice, Page, PageHeader, Segmented, Skeleton, cx } from "../../components/ui";
 import { useDebouncedValue } from "../../lib/hooks";
 import { formatPhone, formatRelative, fullName } from "../../lib/format";
@@ -29,6 +29,9 @@ export function InboxPage() {
         description="Texts people send to your number, and your replies."
         actions={
           <>
+            <ButtonLink to="/inbox/agent" icon={<Bot className="size-3.5" />}>
+              Shopping agent
+            </ButtonLink>
             <ButtonLink to="/inbox/keywords" icon={<KeyRound className="size-3.5" />}>
               Keywords
             </ButtonLink>
