@@ -36,8 +36,16 @@ export function useAgentConversations(handedOff: boolean | null, enabled = true)
   });
 }
 
+/** A conversation: the newest messages first, then older pages ("Show earlier messages"). */
 export function useAgentConversation(id: string) {
-  return useQuery({ queryKey: agentKeys.conversation(id), queryFn: () => api<AgentConversationDetail>("GET", `/api/agent/conversations/${id}`), enabled: !!id, refetchInterval: 30_000 });
+  return useInfiniteQuery({
+    queryKey: agentKeys.conversation(id),
+    queryFn: ({ pageParam }) => api<AgentConversationDetail>("GET", withQuery(`/api/agent/conversations/${id}`, { before: pageParam ?? undefined })),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.older_cursor ?? undefined,
+    enabled: !!id,
+    refetchInterval: 30_000,
+  });
 }
 
 /** The settings page's test chat (a made-up shopper with a made-up order). */

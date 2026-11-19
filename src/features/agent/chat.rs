@@ -651,6 +651,10 @@ pub async fn say(state: &AppState, st: Start<'_>, message: &str, mut sink: impl 
             handed = Some(("limit".into(), "The chat reached its length limit.".into()));
             break;
         }
+        // After the shopper's orders were read, nothing streams until the answer's checks pass.
+        if used_orders {
+            stream.hold();
+        }
         let req = claude::Request { base_url: state.cfg.anthropic_api_base.as_deref(), api_key: &key, system: &system, tools: &tool_list, messages: &messages };
         let turn = claude::turn(&req, |t| {
             if let Some(shown) = stream.push(&links, t) {

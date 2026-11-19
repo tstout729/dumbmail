@@ -55,6 +55,6 @@ export type AgentConversationList = { data: AgentConversation[]; next_cursor: st
 
 export type AgentMessage = { role: "shopper" | "agent" | "note"; body: string; at: string };
 
-export type AgentConversationDetail = AgentConversation & { messages: AgentMessage[] };
+export type AgentConversationDetail = AgentConversation & { messages: AgentMessage[]; older_cursor: string | null };
 
 export type AgentTestReply = { reply: string | null; conversation: string | null; conversation_id: string | null; handed_off: boolean; refused: string | null };

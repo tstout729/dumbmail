@@ -70,9 +70,8 @@ pub fn redact_input(text: &str) -> String {
 // ---------- Out: links ----------
 
 static SCHEMED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>"'`]+"#).unwrap());
-static BARE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|co|shop|store|us|uk|ca|de|fr|es|it|nl|au|nz|ie|in|app|ai|info|biz|xyz|me|ly|gl|link|site|online|tech|club|live|page|ru|cn|top)\b(?:/[^\s<>\x22'`]*)?").unwrap()
-});
+static BARE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]{1,23}\b(?:/[^\s<>\x22'`]*)?").unwrap());
+static EMAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^[a-z0-9._%+-]+@(?:[a-z0-9-]+\.)+[a-z]{2,24}$").unwrap());
 
 /// Where links in an answer may point.
 #[derive(Debug, Clone, Default)]
@@ -127,12 +126,13 @@ impl Links {
         if SCHEMED.is_match(token) {
             return SCHEMED.replace_all(token, |c: &regex::Captures<'_>| self.keep(&c[0])).into_owned();
         }
-        let s = std::borrow::Cow::Borrowed(token);
-        // A bare domain inside an email address is the address, not a link.
-        if s.contains('@') {
-            return s.into_owned();
+        // A token that is wholly an email address is the address, not a link; anything else with a
+        // host in it (before or after an `@`) is judged as a link.
+        let core = token.trim_start_matches(['(', '[', '<', '"', '\'']).trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\'']);
+        if EMAIL.is_match(core) {
+            return token.to_string();
         }
-        BARE.replace_all(&s, |c: &regex::Captures<'_>| self.keep(&c[0])).into_owned()
+        BARE.replace_all(token, |c: &regex::Captures<'_>| self.keep(&c[0])).into_owned()
     }
 
     fn keep(&self, m: &str) -> String {
@@ -166,11 +166,15 @@ fn split_keep(text: &str) -> Vec<(usize, &str)> {
     out
 }
 
-/// Filters streamed text: whole words only, so a link split across pieces is checked whole.
+/// Filters streamed text: whole words only, so a link split across pieces is checked whole. It
+/// stops showing anything more once the text names a price, a percentage or a code, or once the
+/// turn has read the shopper's orders ([`StreamGuard::hold`]): the rest goes out only after the
+/// answer's checks pass ([`StreamGuard::finish`]).
 #[derive(Debug, Default)]
 pub struct StreamGuard {
     full: String,
     emitted: usize,
+    held: bool,
 }
 
 impl StreamGuard {
@@ -178,21 +182,34 @@ impl StreamGuard {
     pub fn push(&mut self, links: &Links, piece: &str) -> Option<String> {
         self.full.push_str(piece);
         let cut = self.full.char_indices().filter(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).next_back()?;
-        self.take(links, cut)
+        self.take(links, cut, false)
     }
 
-    /// Everything not shown yet (at the end of the answer).
+    /// Show nothing more until [`StreamGuard::finish`].
+    pub fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// Everything not shown yet (at the end of the answer, once its checks passed).
     pub fn finish(&mut self, links: &Links) -> Option<String> {
+        self.held = false;
         let n = self.full.len();
-        self.take(links, n)
+        self.take(links, n, true)
     }
 
-    fn take(&mut self, links: &Links, cut: usize) -> Option<String> {
+    fn take(&mut self, links: &Links, cut: usize, last: bool) -> Option<String> {
+        if self.held {
+            return None;
+        }
         let shown = links.filter(&self.full[..cut]);
         if shown.len() <= self.emitted {
             return None;
         }
         let out = shown[self.emitted..].to_string();
+        if !last && (PRICE.is_match(&out) || PERCENT.is_match(&out) || CODE.is_match(&out)) {
+            self.held = true;
+            return None;
+        }
         self.emitted = shown.len();
         Some(out)
     }
@@ -351,6 +368,29 @@ mod tests {
             shown.push_str(&s);
         }
         assert_eq!(shown, "Go to (link removed) now or https://acme.test/a ok");
+    }
+
+    #[test]
+    fn the_stream_holds_back_prices_codes_and_anything_after_orders() {
+        let l = Links::default();
+        let mut g = StreamGuard::default();
+        assert_eq!(g.push(&l, "It costs ").as_deref(), Some("It costs "));
+        assert_eq!(g.push(&l, "$59 today "), None, "a price waits for the checks");
+        assert_eq!(g.push(&l, "only "), None, "and so does everything after it");
+        assert_eq!(g.finish(&l).as_deref(), Some("$59 today only "));
+        let mut g = StreamGuard::default();
+        g.hold();
+        assert_eq!(g.push(&l, "Order #A100 shipped "), None);
+    }
+
+    #[test]
+    fn a_host_hidden_next_to_an_at_sign_is_still_a_link() {
+        let l = Links { hosts: vec!["acme.test".into()], urls: HashSet::new() };
+        assert!(!l.filter("go evil.com/x@a now").contains("evil.com"));
+        assert!(!l.filter("go me@evil.co/path").contains("evil.co/path"));
+        assert!(!l.filter("visit evil.shoes today").contains("evil.shoes"), "any top-level domain");
+        assert!(l.filter("mail help@gmail.com.").contains("help@gmail.com"));
+        assert!(l.filter("shop at acme.test/new").contains("acme.test/new"));
     }
 
     #[test]

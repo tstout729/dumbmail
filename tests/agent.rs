@@ -523,7 +523,7 @@ async fn a_texter_sees_only_their_own_order_status() {
     text_in(&h, "in-4", other, &ours, "{{ person.email }} {% coupon_code 'VIP' %}").await;
     let sent = texts_to(&h, other);
     assert_eq!(sent.len(), 1);
-    assert!(sent[0].contains("{ { person.email } }") && sent[0].contains("{ % coupon_code"), "{sent:?}");
+    assert!(sent[0].contains("{ {") && sent[0].contains("} }") && sent[0].contains("{ % coupon_code"), "{sent:?}");
 
     // The team sees the texter's conversations in the agent's list.
     let list = h.ok("GET", "/api/agent/conversations", None).await;

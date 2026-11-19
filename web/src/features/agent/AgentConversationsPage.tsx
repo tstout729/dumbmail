@@ -113,7 +113,9 @@ function Transcript({ id }: { id: string }) {
   const c = useAgentConversation(id);
   if (c.isPending) return <Skeleton className="m-4 h-64" />;
   if (c.error) return <div className="p-4"><InlineError message={c.error.message} /></div>;
-  const d = c.data;
+  const d = c.data.pages[0];
+  // Pages come newest first; each page is oldest to newest.
+  const messages = [...c.data.pages].reverse().flatMap((p) => p.messages);
   return (
     <div className="flex flex-col">
       <div className="flex flex-wrap items-center gap-3 border-b border-zinc-100 p-3">
@@ -151,7 +153,14 @@ function Transcript({ id }: { id: string }) {
         </div>
       ) : null}
       <div className="flex flex-col gap-2 p-4" role="log">
-        {d.messages
+        {c.hasNextPage ? (
+          <div className="self-center">
+            <Button size="sm" variant="ghost" onClick={() => void c.fetchNextPage()} loading={c.isFetchingNextPage}>
+              Show earlier messages
+            </Button>
+          </div>
+        ) : null}
+        {messages
           .filter((m) => m.role !== "note")
           .map((m, i) => (
             <div key={i} className={cx("max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm", m.role === "shopper" ? "self-start bg-zinc-100 text-zinc-900" : "self-end bg-accent-600 text-white")}>
