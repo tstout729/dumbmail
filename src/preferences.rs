@@ -91,6 +91,46 @@ pub async fn save(db: &PgPool, account_id: Uuid, profile_id: Uuid, keep: &HashSe
     Ok(changed)
 }
 
+/// Where an opt-out came from: the unsubscribe link in a message (with that message), or a page
+/// such as the customer hub.
+pub struct OptOutSource {
+    /// The event's `method` property (`link`, `hub`).
+    pub method: &'static str,
+    /// The webhook's reason (`unsubscribe_link`, `hub`).
+    pub reason: &'static str,
+    /// The message whose link was used: (message, campaign, flow), and whether it was a test.
+    pub message: Option<(Uuid, Option<Uuid>, Option<Uuid>, bool)>,
+}
+
+/// Unsubscribe a person from all email (`channel` "email") or all texts ("sms"): under a lock on
+/// their row, written only when it changes something, with the channel's event (`Unsubscribed`,
+/// `Unsubscribed from SMS`; none for a test message's link) and the webhook notice. Returns whether
+/// it changed anything. The unsubscribe page and the customer hub both use it.
+pub async fn opt_out(db: &PgPool, account_id: Uuid, profile_id: Uuid, channel: &str, src: &OptOutSource) -> AppResult<bool> {
+    let (col, metric, channel) = if channel == "sms" { ("sms_consent", "Unsubscribed from SMS", "sms") } else { ("email_consent", "Unsubscribed", "email") };
+    let before: Option<String> = sqlx::query_scalar(&format!(
+        "UPDATE profiles p SET {col} = 'unsubscribed', updated_at = now() FROM (SELECT id, {col} AS before FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE) old
+         WHERE p.id = old.id AND old.before <> 'unsubscribed' RETURNING old.before"
+    ))
+    .bind(profile_id)
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    let Some(before) = before else { return Ok(false) };
+    let message_id = src.message.map(|m| m.0);
+    if !src.message.is_some_and(|m| m.3) {
+        let mut props = json!({"method": src.method});
+        if let Some((id, campaign_id, flow_id, _)) = src.message {
+            props["campaign_id"] = json!(campaign_id);
+            props["flow_id"] = json!(flow_id);
+            props["message_id"] = json!(id);
+        }
+        audience::record_event(db, NewEvent { account_id, profile_id, metric, properties: props, value: None, occurred_at: None, unique_id: None, message_id }).await?;
+    }
+    crate::features::webhooks::consent_changed(db, account_id, profile_id, channel, &before, "unsubscribed", src.reason, message_id).await;
+    Ok(true)
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }

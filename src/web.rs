@@ -18,6 +18,11 @@ pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
         return r;
     }
     let path = uri.path().trim_start_matches('/');
+    // The customer hub's own "not found" for anything else under /hub/, never the dashboard
+    // (the hub is served on link domains, where the app shell must not appear).
+    if path.starts_with("hub/") || path == "hub" {
+        return crate::features::hub::web::not_found();
+    }
     if path.starts_with("api/") {
         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": {"code": "not_found", "message": "no such endpoint"}}))).into_response();
     }

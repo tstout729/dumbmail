@@ -80,7 +80,8 @@ async fn link_domain_guard(
     use axum::response::IntoResponse;
     let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
     let path = req.uri().path().to_string();
-    let public_ok = ["/t/", "/s/", "/u/", "/c/", "/f/", "/i/", "/e/", "/client/", "/onsite.js", "/healthz", "/webhooks/"].iter().any(|p| path.starts_with(p));
+    // `/hub/`: the customer hub, served on the store's link domain (see features::hub).
+    let public_ok = ["/t/", "/s/", "/u/", "/c/", "/f/", "/i/", "/e/", "/client/", "/onsite.js", "/healthz", "/webhooks/", "/hub/"].iter().any(|p| path.starts_with(p));
     if public_ok || host.is_empty() {
         return next.run(req).await;
     }
