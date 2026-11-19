@@ -1236,7 +1236,7 @@ async fn ruling1_content_live_at_deploy_sends_at_once_and_later_edits_are_checke
     // The deploy step (once; running it again records nothing more).
     let n = dumbmail::features::screening::content::record_existing(&h.state).await.unwrap();
     assert_eq!(n, 2);
-    assert_eq!(dumbmail::features::screening::content::record_existing(&h.state).await.unwrap(), 0, "idempotent");
+    assert_eq!(dumbmail::features::screening::content::record_existing(&h.state).await.unwrap(), 0, "once");
     let src: Vec<String> = sqlx::query_scalar("SELECT source FROM screenings WHERE kind = 'content'").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(src, vec!["existing".to_string(), "existing".to_string()]);
     // Both send at once, with no model call.

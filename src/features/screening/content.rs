@@ -231,9 +231,21 @@ async fn with_saved_blocks(state: &AppState, account_id: Uuid, content: &Value) 
 /// Every variant of one message: its default text and each language version.
 async fn variants(state: &AppState, account: &Account, channel: &str, content: &Value, label: &str) -> AppResult<Vec<(Value, bool)>> {
     if channel == "whatsapp" {
-        // A WhatsApp message is its template's text filled with the message's own values.
-        let text = whatsapp_text(state, account, content).await;
-        return Ok(vec![variant("whatsapp", &json!({"body": text}), label, "")]);
+        // A WhatsApp message is its template's text filled with the message's own values; the
+        // values as written are read too. One that can't be read is held for a person.
+        let (text, readable) = whatsapp_text(state, account, content).await;
+        let mut raw = Collected::default();
+        raw.walk(content, "");
+        let all = format!("{text}\n{}", raw.text.join("\n"));
+        let (mut v, big) = variant("whatsapp", &json!({"body": all}), label, "");
+        if let Some(links) = v["links"].as_array_mut() {
+            for (t, h) in raw.links {
+                if let Some(d) = host(&h) {
+                    links.push(json!({"text": t, "to": destination(&h), "domain": d}));
+                }
+            }
+        }
+        return Ok(vec![(v, big || !readable)]);
     }
     let content = with_saved_blocks(state, account.id, content).await?;
     let (_, mut langs) = crate::features::translations::fields::languages(&content);
@@ -250,17 +262,17 @@ async fn variants(state: &AppState, account: &Account, channel: &str, content: &
     Ok(out)
 }
 
-/// A WhatsApp message's text: its template filled with the message's values (and a sample person),
-/// or the template's own text when it can't be filled.
-async fn whatsapp_text(state: &AppState, account: &Account, content: &Value) -> String {
+/// A WhatsApp message's text: its template filled with the message's values (and a sample person).
+/// False when it can't be read (no template, or it can't be filled): a person checks it.
+async fn whatsapp_text(state: &AppState, account: &Account, content: &Value) -> (String, bool) {
     use crate::features::whatsapp::{content as wa, templates};
-    let Ok(c) = wa::parse(content) else { return String::new() };
-    let Some(tid) = c.template_id else { return String::new() };
-    let Ok(t) = templates::get(&state.db, account.id, tid).await else { return String::new() };
+    let Ok(c) = wa::parse(content) else { return (String::new(), false) };
+    let Some(tid) = c.template_id else { return (String::new(), false) };
+    let Ok(t) = templates::get(&state.db, account.id, tid).await else { return (String::new(), false) };
     let ctx = crate::render::context(account, None, None, "");
     match wa::render(&t, &c, &ctx, None) {
-        Ok(r) => r.text,
-        Err(_) => serde_json::to_string(&t).unwrap_or_default(),
+        Ok(r) => (r.text, true),
+        Err(_) => (serde_json::to_string(&t).unwrap_or_default(), false),
     }
 }
 
@@ -992,13 +1004,18 @@ pub async fn campaign_at_send(state: &AppState, account: &Account, c: &CampaignR
     }
 }
 
-/// When screening starts (each start, after the migrations; idempotent): content approved
+/// When screening starts (once, on the first start after the migration, behind a marker): content approved
 /// accounts already have live is recorded as passed, with source `existing` and no model call, so
 /// nothing that runs today waits or is held. Live flows (their current steps, with the saved
 /// blocks and language versions they use) and campaigns that are scheduled or sending, each only
 /// if it has no content screening yet. Later edits are checked as usual. Returns how many.
 pub async fn record_existing(state: &AppState) -> anyhow::Result<usize> {
     if !super::on(state) {
+        return Ok(0);
+    }
+    // Once: a marker written when it has run. Content made live after that was checked as it went.
+    let ran: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM screening_markers WHERE name = 'existing_recorded')").fetch_one(&state.db).await?;
+    if ran {
         return Ok(0);
     }
     let mut done = 0;
@@ -1042,9 +1059,8 @@ pub async fn record_existing(state: &AppState) -> anyhow::Result<usize> {
         standing::record(&state.db, account_id, row).await?;
         done += 1;
     }
-    if done > 0 {
-        tracing::info!(recorded = done, "sender screening: content already live recorded as passed");
-    }
+    sqlx::query("INSERT INTO screening_markers (name) VALUES ('existing_recorded') ON CONFLICT DO NOTHING").execute(&state.db).await?;
+    tracing::info!(recorded = done, "sender screening: content already live recorded as passed");
     Ok(done)
 }
 

@@ -278,12 +278,13 @@ pub fn whatsapp_stop(standing: &str, kind: &str, is_test: bool, campaign: bool, 
             Some(FinalStop::Skip(reason))
         };
     }
-    (!(kind == "confirmation" && WA_CONFIRMATION.captures(body).is_some_and(|c| !LINKISH.is_match(&c[1])))).then_some(FinalStop::Skip(reason))
+    let fixed = kind == "confirmation" && WA_CONFIRMATION.captures(body).is_some_and(|c| c.get(1).or(c.get(2)).is_some_and(|name| !LINKISH.is_match(name.as_str())));
+    (!fixed).then_some(FinalStop::Skip(reason))
 }
 
 /// WhatsApp's own confirmations (`whatsapp::inbox`): a sign-up with no custom reply, or START.
 static WA_CONFIRMATION: Lazy<regex::Regex> = Lazy::new(|| {
-    regex::Regex::new(r"^(?:Thanks! You're subscribed to WhatsApp messages from (.{1,120})\.|You're subscribed to WhatsApp messages from (?:.{1,120}) again\.) Reply STOP to unsubscribe\.$").unwrap()
+    regex::Regex::new(r"^(?:Thanks! You're subscribed to WhatsApp messages from (.{1,120})\.|You're subscribed to WhatsApp messages from (.{1,120}) again\.) Reply STOP to unsubscribe\.$").unwrap()
 });
 static LINKISH: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(?i)https?:|www\.|@|[a-z0-9-]+\.[a-z]{2,}|\d{5,}").unwrap());
 
@@ -414,6 +415,8 @@ mod tests {
         assert_eq!(whatsapp_stop("pending", "keyword_reply", false, false, false, "hi"), Some(FinalStop::Skip(NOT_APPROVED)));
         assert_eq!(whatsapp_stop("pending", "confirmation", false, false, false, "Thanks! You're subscribed to WhatsApp messages from Acme. Reply STOP to unsubscribe."), None);
         assert!(whatsapp_stop("pending", "confirmation", false, false, false, "Free crypto at evil.test! Reply STOP to unsubscribe.").is_some());
+        assert_eq!(whatsapp_stop("pending", "confirmation", false, false, false, "You're subscribed to WhatsApp messages from Acme again. Reply STOP to unsubscribe."), None, "the START answer");
+        assert!(whatsapp_stop("pending", "confirmation", false, false, false, "You're subscribed to WhatsApp messages from evil.test again. Reply STOP to unsubscribe.").is_some());
         assert_eq!(whatsapp_stop("blocked", "optout_confirmation", false, false, false, ""), None);
         assert_eq!(whatsapp_stop("pending", "marketing", true, true, false, ""), None, "tests go to members' verified numbers");
         assert!(matches!(whatsapp_stop("review", "marketing", false, false, true, ""), Some(FinalStop::Defer(_))));

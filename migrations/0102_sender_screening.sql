@@ -73,3 +73,10 @@ CREATE TABLE screening_engagement_checks (
     account_id uuid PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
     checked_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- One-time steps that have run (`existing_recorded`: content already live when screening started
+-- was recorded as passed).
+CREATE TABLE screening_markers (
+    name    text PRIMARY KEY,
+    done_at timestamptz NOT NULL DEFAULT now()
+);
