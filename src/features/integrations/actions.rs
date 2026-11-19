@@ -888,7 +888,7 @@ async fn after_write(state: &AppState, src: &Source, id: Uuid, created: bool, em
         // A person this integration just added, with no opt-in: keep them out of marketing until
         // they agree (an explicit consent block, a form, double opt-in). Never set on someone who existed.
         if !src.contacts_opted_in {
-            crate::marketing_hold::hold_new_profile(&state.db, src.account_id, id, &src.consent_source()).await?;
+            crate::marketing_hold::hold_new_profile(&state.db, src.account_id, id).await?;
             out.counts.held += 1;
         }
     }

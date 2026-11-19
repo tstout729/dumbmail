@@ -1,8 +1,9 @@
 //! Profile tools: consent history, the suppression list, merging duplicates, bulk actions, privacy
 //! requests (export or delete one person), "do not sell or share", and internal notes.
 //!
-//! Other features record consent changes with [`consent::record_consent_change`] (or the setters
-//! in [`consent`]), and read `profiles.ads_opt_out` for "do not sell or share". Tables keyed by a
+//! Other features change consent only through [`consent`] (`set_consent_in`, `suppress_in`,
+//! `opt_in_verified_in`, `set_hold_in`, or `snapshot_in` + `record_written_in` for set-based
+//! writes), and read `profiles.ads_opt_out` for "do not sell or share". Tables keyed by a
 //! profile id belong in [`merge::PROFILE_TABLES`] so merges and deletions cover them.
 
 pub mod bulk;

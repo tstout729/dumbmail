@@ -6,13 +6,13 @@ Nothing here can make anyone easier to reach: there's no bulk subscribe, merges 
 
 ## Consent history
 
-Every change to a person's email or SMS consent, their suppression, or their "do not sell or share" flag is recorded with what changed, when and how, in the same transaction as the change, with the profile locked so the before and after values are exact. History starts on the day this feature was installed (`history_started_at`); earlier changes weren't recorded.
+Every change to a person's email or SMS consent, their suppression, their marketing hold, their email address or phone number, or their "do not sell or share" flag is recorded with what changed, when and how, in the same transaction as the change, with the profile locked so the before and after values are exact. History starts on the day this feature was installed (`history_started_at`); earlier changes weren't recorded.
 
 Rows are never edited: the database refuses an update. Rows are deleted only with their profile: when someone is erased, and when a profile is merged away (its rows are first copied onto the kept profile with new ids and `detail.merged_from`, then the originals go with the merged profile).
 
 If a history row can't be written (the database refuses it), a change that makes the person less reachable (an unsubscribe, a STOP, a bounce or complaint, a suppression) is still saved and acknowledged: the error is logged and a background job writes the row later, with `detail.recorded_late: true` and a `recorded_at` later than `occurred_at`. A change that makes someone more reachable (a subscribe) fails as a whole instead, so it can be retried; nothing is saved without its history.
 
-Each entry has `channel` (`email`, `sms`, `ads`), `field` (`consent`, `suppression`, `opt_out`), `old_value`, `new_value`, `address` (the email or phone number then), `occurred_at`, the IP address and browser where there was one (forms, unsubscribe links), and `method`, plus readable `summary` and `how` sentences:
+Each entry has `channel` (`email`, `sms`, `ads`, `marketing`), `field` (`consent`, `suppression`, `opt_out` for "do not sell or share", `hold` for the marketing hold, `address` when the email or number itself changed, with the old and new address), `old_value`, `new_value`, `address` (the email or phone number then), `occurred_at`, the IP address and browser where there was one (forms, unsubscribe links), and `method`, plus readable `summary` and `how` sentences:
 
 | `method` | How |
 | --- | --- |
@@ -20,10 +20,10 @@ Each entry has `channel` (`email`, `sms`, `ads`), `field` (`consent`, `suppressi
 | `import` | A CSV import (dashboard, API or MCP: see `via`). |
 | `api` / `mcp` / `dashboard` | An API key, the MCP server, or a team member in the dashboard (`actor_email`). |
 | `unsubscribe_link` / `preference_page` / `one_click` | The unsubscribe page, "Unsubscribe from all" on the preference page, or a mail app's one-click unsubscribe; each names the message. |
-| `sms_keyword` | A STOP or START reply (the keyword). |
+| `sms_keyword` | A STOP, START or keyword sign-up text (the keyword, the number texted, the inbound text). |
 | `double_opt_in` | The person confirmed a double opt-in sign-up. |
 | `hard_bounce` / `spam_complaint` | Amazon SES reported a hard bounce or a spam complaint for a message. |
-| `integration` / `klaviyo_import` | Another feature's sync or import (named in `detail`). |
+| `integration` / `klaviyo_import` | A custom integration or recipe (`detail.integration`, and for its consent the vendor's `as_of` time and `only_own`), Shopify (`detail.integration: "shopify"`, the store and Shopify's state), or a Klaviyo import (`detail.import_id`). |
 | `merge` / `bulk_action` / `suppression_list` / `privacy_request` | Changes made by the tools on this page. |
 | `deleted_profile` | The profile's address matched the suppression record kept for a deleted person. |
 | `gpc` | The visitor's browser sent Global Privacy Control. |
@@ -32,18 +32,20 @@ Each entry has `channel` (`email`, `sms`, `ads`), `field` (`consent`, `suppressi
 
 ### Can they be reached?
 
-`GET /api/people/profiles/:id` returns `reachability`: for `email` and `sms`, `can_send` and every reason not (no address, unsubscribed, waiting to confirm, hard bounce, spam complaint, suppressed by hand, not subscribed to texts, account email paused), with when and how where known. It also returns the "do not sell or share" flag, the first 50 history entries and the profile's notes.
+`GET /api/people/profiles/:id` returns `reachability`: for `email` and `sms`, `can_send` and every reason not (no address, unsubscribed, waiting to confirm, hard bounce, spam complaint, suppressed by hand, held back from marketing, not subscribed to texts, account email paused), with when and how where known. It also returns the "do not sell or share" flag, the first 50 history entries and the profile's notes.
 
 ## Suppression list
 
-Everyone who can't get marketing on a channel, and why: `unsubscribed`, `hard_bounce`, `complaint`, `manual` (suppressed by hand), `pending` (email only: a double opt-in sign-up not yet confirmed) or `not_subscribed` (texts only: a phone number that never agreed to texts).
+Everyone who can't get marketing on a channel, and why: `unsubscribed`, `hard_bounce`, `complaint`, `manual` (suppressed by hand), `pending` (email only: a double opt-in sign-up not yet confirmed), `marketing_hold` (email only: added by an integration or import without an opt-in; see `crate::marketing_hold`) or `not_subscribed` (texts only: a phone number that never agreed to texts).
+
+A marketing hold is its own block, never a manual suppression: lifting a suppression and bulk actions never clear it, and it ends only when the person subscribes themselves (the database lets go of it then). Hold changes are in consent history (`channel: marketing`, `field: hold`).
 
 - `GET /api/people/suppressions?q=&channel=&reason=&from=&to=&limit=&offset=`: rows of `{profile_id, channel, address, reason, reason_text, since, how, can_unsuppress, why_not}`, plus `counts` per channel and reason and `deleted_profiles_suppressed`. `since` is when the recorded change happened; it's null for a block from before consent history started (the date filters then use the profile's last change). `from` and `to` are dates (YYYY-MM-DD) in the account's time zone. MCP: `list_suppressions`.
 - `GET /api/people/suppressions/export` (same filters): a CSV of up to 100,000 rows.
 - `POST /api/people/suppressions` `{addresses: [...], csv?: "...", confirm}`: suppress emails and phone numbers by hand (a CSV column named email or phone is read, or else the first column). Profiles are created when needed and are never subscribed. Without `confirm: true` it returns the count and the entries that aren't addresses. Up to 200 are done at once; more run as a bulk action (`bulk_action` in the response). At most 100,000 per request. MCP: `suppress_profiles`.
 - `POST /api/people/suppressions/unsuppress` `{profile_id, channel, confirm}`: lift a suppression added by hand. Bounces, complaints, a person's own unsubscribe and unconfirmed sign-ups can't be lifted (409, with the reason). Consent stays as it is. A manual suppression kept for a deleted person with that address is let go too, so it doesn't come back with the next import. MCP: `unsuppress_profile`.
 
-A suppressed phone number gets no texts at all, test sends included: every text passes the check in `sending::send`. Segments' "can receive SMS" condition leaves it out, and the "suppressed" condition matches a suppression on either channel.
+A suppressed phone number gets no texts at all, test sends and inbox replies included (a HELP reply still goes, as for a number that texted STOP): the check is part of the claim every text passes under the opt-out lock in `sending::send`, with no extra query. Segments' "can receive SMS" condition leaves it out, and the "suppressed" condition matches a suppression on either channel.
 
 ## Duplicates and merging
 
@@ -52,15 +54,15 @@ A suppressed phone number gets no texts at all, test sends included: every text 
 `POST /api/people/merge` `{keep_id, merge_id, choices, confirm}` merges `merge_id` into `keep_id` in one transaction:
 
 - Fields: the kept profile's value wins when both have one, unless `choices` says `{"<field>": "merge"}`. Fields are `email`, `phone_number`, `external_id`, `first_name`, `last_name` and `properties.<key>`. Values only the other profile has are copied.
-- Consent on each channel becomes the stricter of the two (unsubscribed, then waiting to confirm, then never subscribed, then subscribed). Suppressions carry over (the stronger one wins), and so does "do not sell or share".
-- Events, messages, list and segment memberships, flow runs, double opt-in confirmations, notes, product activity and alerts move to the kept profile; consent history is copied with `merged_from`. A campaign both profiles got keeps one link to the campaign (the other message stays in the history, unlinked). An active run of a flow the kept profile is already in is exited. A price-drop cooldown keeps the later notice, so it never gets shorter.
+- Consent on each channel becomes the stricter of the two (unsubscribed, then waiting to confirm, then never subscribed, then subscribed). Suppressions carry over (the stronger one wins), and so do "do not sell or share" and the marketing hold (held if either was; the database lets go of it if the merged email consent is subscribed).
+- Events, messages, list and segment memberships, flow runs, double opt-in confirmations, notes, product activity and alerts, texting threads (merged into one), keyword sign-up records, push devices, reviews and review requests, object links, coupon codes, Shopify's customer links, transactional sends and Klaviyo list memberships move to the kept profile (rows that would duplicate one the kept profile already has are dropped; a coupon code for a coupon the kept profile already has a code for stays given out but belongs to nobody). A keyword sign-up waiting for "Y" from a number the merged profile won't have is dropped. "Shopify created this profile" and what a Klaviyo import last wrote stay with the profile they were about, and an ad sync's staged audience is rebuilt on its next run; consent history is copied with `merged_from`. A campaign both profiles got keeps one link to the campaign (the other message stays in the history, unlinked). An active run of a flow the kept profile is already in is exited. A price-drop cooldown keeps the later notice, so it never gets shorter.
 - Messages waiting to be sent: when both profiles have one for the same campaign or flow step, one is cancelled (`skipped`, "merged into another profile"); the one kept is the one addressed to the merged profile's address. Every queued message keeps the address it was meant for, and the sender skips it ("address changed") if the profile no longer has that address. If a message to either profile is being sent at that moment, the merge is refused (409): try again in a minute.
 - Double opt-in confirmations waiting for an address the merged profile won't have are voided: clicking them says the link expired, so a confirmation sent to one address can't subscribe another.
 - Old links and provider callbacks act on the kept profile: messages move to it, so an unsubscribe link in an email sent to the merged-away address unsubscribes the kept profile (the safe direction), and a later bounce or complaint for such a message suppresses the kept profile's email.
 - An address that doesn't survive the merge keeps a suppression record if it was unsubscribed or suppressed.
 - The change is recorded in the kept profile's consent history (`method: merge`). Bulk actions that had the merged-away profile in their saved set skip it.
 
-Without `confirm: true` it returns the merged result (`result`, `fields` with conflicts, `rows_moving`) without changing anything. MCP: `merge_profiles`.
+Without `confirm: true` it returns the merged result (`result`, `fields` with conflicts, `rows_moving`) without changing anything. A merge is written to the audit log. MCP: `merge_profiles`.
 
 ## Bulk actions
 
@@ -83,19 +85,22 @@ Suppressions record consent history (`method: bulk_action`). Deletes are erasure
 
 ### Erasure
 
-Deleting a profile from its page (`DELETE /api/profiles/:id`), a bulk delete and a privacy delete all erase the same way, in one transaction:
+Deleting a profile from its page (`DELETE /api/profiles/:id`), a bulk delete, a privacy delete and Shopify's `customers/redact` (for profiles the store created) all erase the same way, through `features::people::privacy::erase_in`, in one transaction:
 
-- The profile and every row tied to it (`features::people::merge::PROFILE_TABLES`), including its consent history and notes.
+- The profile and every row tied to it (`features::people::merge::PROFILE_TABLES`), including its consent history, notes, push devices (their tokens are personal data), Shopify's customer link, object links and transactional sends. Coupon codes they were given stay used up but belong to nobody.
+- Their reviews and review photos, with the product star summaries corrected (`features::reviews::store::erase_reviews_in`).
 - Their personal exports, whichever profile they were made from (exports follow merges).
 - **Every stored export file of the account that holds more than one person**: bulk exports here and the CSV exports on the Reports page. They can't be searched cheaply for one person, they expire after 7 days anyway, and they can be made again. Exports still being written stop and throw their file away.
 - Saved bulk-action searches that name them, background history writes that carry their details, and their place in pending bulk actions.
+- Webhook endpoints get `profile.deleted` for each person once it's committed.
+- A number's text opt-out (`sms_opt_outs`) is kept: it's the carrier-level record that stops texts to that number.
 - What's kept: if they had unsubscribed or were suppressed, a salted one-way code of each address with the reason. When the address comes back (an import, an API call, a form, an address edit), the block is applied again in the same transaction, on every create and every update, and the stronger block keeps its reason (a hard bounce is never relabelled as a manual suppression). A retained unsubscribe is lifted only by the person's own verified opt-in: confirming a double opt-in sign-up from that inbox, or texting START from that number. An import, an API call or a form field that says "subscribed" isn't enough, since anyone can type an address. Bounces and complaints stay.
 
 The one-way codes (here and in the request log) are SHA-256 of the account's random salt, the channel and the address (emails reduced to the inbox they reach). The salt is stored in the database, so someone holding a copy of the database could test guesses of an address against them. They can't be reversed without guessing.
 
 ## Do not sell or share
 
-`profiles.ads_opt_out` is a per-person "do not sell or share my personal information" flag. Features that share data with ad platforms must read this column and leave flagged people out. Set it from the profile page, `PATCH /api/people/profiles/:id/privacy` `{ads_opt_out}`, or MCP `set_do_not_sell`.
+`profiles.ads_opt_out` is a per-person "do not sell or share my personal information" flag. Features that share data with ad platforms must read this column and leave flagged people out: ad audience syncs never add a flagged person, and remove one already sent on the next run (`features::audiences::sync::opted_out_sql`). An `ads_opt_out` *property* sent by another system is also read as an opt-out there; it can only restrict and never turns the flag off. Set it from the profile page, `PATCH /api/people/profiles/:id/privacy` `{ads_opt_out}`, or MCP `set_do_not_sell`.
 
 Global Privacy Control turns it on (never off): the website snippet sends `navigator.globalPrivacyControl` with events and sign-ups, and a browser's `Sec-GPC: 1` header counts too (so plain hosted form pages are covered). It's taken for the profile the request names, from any visitor, because it only ever restricts: someone who knows a person's email could opt them out of ad audiences. The dashboard (or API) can turn it off again.
 
@@ -105,7 +110,11 @@ Internal notes on a profile, never shown to the person: `GET`/`POST /api/people/
 
 ## Reserved property keys
 
-Custom properties can't use the names of consent, suppression, privacy or identity fields: `email_consent`, `sms_consent`, `email_suppressed_reason`, `sms_suppressed_reason`, `marketing_hold`, `ads_opt_out` (and its `_at`/`_source`), `id`, `email`, `phone_number`, `external_id`, or any key starting with `$`. Profile upserts and bulk property actions refuse them (400); a CSV import leaves such a column out and says so in `errors`.
+Custom properties can't use the names of consent, suppression, privacy or identity fields: `email_consent`, `sms_consent`, `email_suppressed_reason`, `sms_suppressed_reason`, `marketing_hold`, `ads_opt_out_at`, `ads_opt_out_source`, `id`, `email`, `phone_number`, `external_id`, or any key starting with `$`. Profile upserts and bulk property actions refuse them (400); a CSV import leaves such a column out and says so in `errors`. `ads_opt_out` is refused by bulk property actions; profile saves accept it as an opt-out signal (see "Do not sell or share").
+
+## Changing a profile's email address
+
+`PATCH /api/profiles/:id` with a new `email` treats it as a new address that hasn't agreed to anything, the same as an upsert that matches by another identifier: `subscribed` becomes `never_subscribed` unless the request sets `email_consent` itself (`unsubscribed` and `pending` stay), the old address's hard bounce doesn't follow it (a complaint does), double opt-in confirmations waiting for the old address are voided, and consent history records the old and new address. A deleted person's suppression record for the new address applies in the same transaction. A new phone number does the same for texts.
 
 ## How to change someone's consent
 
@@ -114,19 +123,28 @@ For other features (integrations, imports, texting). All of these are in `featur
 1. `set_consent_in(&mut tx, account_id, profile_id, Channel::Email | Channel::Sms, "unsubscribed" | "subscribed" | ..., None, &src)` sets one channel's consent. `set_consent(&db, ...)` does the same in a transaction of its own.
 2. `suppress_in(&mut tx, account_id, profile_id, channel, "hard_bounce" | "complaint" | "manual", overwrite, unsubscribe, &src)` suppresses a channel.
 3. `opt_in_verified_in(&mut tx, account_id, profile_id, channel, &src)` for the person's own verified opt-in (a double opt-in click, a START or keyword opt-in from that number). It's the only call that lifts a deleted person's retained unsubscribe.
+4. `set_hold_in(&mut tx, account_id, profile_id, hold, &src)` holds someone back from marketing or lets go (`crate::marketing_hold::hold_new_profile` calls it).
+5. A set-based writer (an import page, one statement for many rows, a profile your own `INSERT` creates): lock the rows, take `snapshot_in(&mut tx, account_id, &ids)`, write them, then `record_written_in(&mut tx, account_id, &before, &ids, &src)`. It records every change against the snapshot (a profile missing from it counts as created), voids confirmations for an email address that left, and applies retained blocks for the final addresses. The Klaviyo import, integrations, Shopify, objects, push and transactional sends do this.
 
-Each locks the profile row, writes the change and its history row, and follows the rule above for failed history writes. For anything else, `lock` the row, change a copy of the `ConsentState` and `apply` it. `src` is a `ConsentSource` saying how (`ConsentSource::new("integration", "system").with_detail("integration", json!("shopify"))`); the shared profile upsert reads it from `people::with_source(src, ...)`. Don't write the consent, suppression or opt-out columns with raw SQL: a lint test looks for such writes, but it can't see SQL built at runtime, so it isn't proof.
+Each locks the profile row, writes the change and its history row, and follows the rule above for failed history writes. For anything else, `lock` the row, change a copy of the `ConsentState` and `apply` it. `src` is a `ConsentSource` saying how (`ConsentSource::new("integration", "system").with_detail("integration", json!("shopify"))`); the shared profile upsert reads it from `people::with_source(src, ...)`. Don't write the consent, suppression, hold or opt-out columns with raw SQL outside those calls: a lint test (`consent_writes_go_through_the_history`) finds such writes, including `SET {col} =` built at runtime, outside the helpers and the listed set-based writers, but it can't see SQL assembled any other way, so it isn't proof.
 
-## Permissions (for the team-and-roles layer)
+Webhooks: the callers above still report consent changes to webhook endpoints themselves (`features::webhooks::consent_changed_in`), using the value the helper returns.
 
-Until that layer lands, every route and tool here is open to anyone signed in to the account or holding an API key. The intended mapping (REST paths relative to `/api/people`):
+## Permissions
 
-- **Audience read**: `GET /profiles/{id}`, `/profiles/{id}/consent`, `/profiles/{id}/notes`, `/suppressions`, `/duplicates`, `/bulk`, `/bulk/{id}`; tools `get_consent_history`, `list_profile_notes`, `list_suppressions`, `find_duplicate_profiles`, `get_bulk_action`. Bulk details are shown only for actions the caller may run.
-- **Audience write**: `POST /profiles/{id}/notes`, `DELETE /profiles/{id}/notes/{note_id}`, `POST /suppressions`, `POST /merge`, the permitted actions of `POST /bulk`; tools `add_profile_note`, `delete_profile_note`, `suppress_profiles`, `merge_profiles`, `start_bulk_action`. A bulk add-to-list can start list flows, so it also needs send authority.
-- **Send / admin**: `POST /suppressions/unsuppress`; tool `unsuppress_profile`.
-- **Export**: `GET /suppressions/export`, bulk exports and their downloads. `GET /files/{id}` must check the permission for the file's kind (`privacy_export` or `bulk_export`).
-- **Privacy (admin or owner, or an explicit grant)**: `PATCH /profiles/{id}/privacy`, `POST /privacy/export`, `POST /privacy/delete`, `GET /privacy/requests`, `GET /privacy/requests/{id}`, personal-file downloads and bulk delete; tools `set_do_not_sell`, `export_person_data`, `delete_person_data`, `list_privacy_requests`.
-- Content-only roles get none of these.
+Declared in `features::people` (`ROUTES`, `TOOL_RULES`), checked by `team::access`. REST paths are relative to `/api/people`:
+
+| Needs | Routes | Tools |
+| --- | --- | --- |
+| `profiles.read` | `GET /profiles/{id}`, `/profiles/{id}/consent`, `/profiles/{id}/notes`, `/suppressions`, `/duplicates`, `/bulk`, `/bulk/{id}` | `get_consent_history`, `list_profile_notes`, `list_suppressions`, `find_duplicate_profiles`, `get_bulk_action` |
+| `audience.write` | `POST /profiles/{id}/notes`, `DELETE /profiles/{id}/notes/{note_id}`, `POST /suppressions`, `POST /merge`, `POST /bulk` | `add_profile_note`, `delete_profile_note`, `suppress_profiles`, `merge_profiles`, `start_bulk_action` |
+| `campaigns.send` | `POST /suppressions/unsuppress` (it makes someone reachable again) | `unsuppress_profile` |
+| `export` | `GET /suppressions/export`, `GET /files/{id}` for a bulk export | |
+| `privacy.manage` (admins and the owner) | `PATCH /profiles/{id}/privacy`, `POST /privacy/export`, `POST /privacy/delete`, `GET /privacy/requests`, `GET /privacy/requests/{id}`, `GET /files/{id}` for a personal export | `set_do_not_sell`, `export_person_data`, `delete_person_data`, `list_privacy_requests` |
+
+A bulk action also needs what it does: `add_to_list` needs `flows.live` (it can start list flows), `export` needs `export`, `delete` needs `privacy.manage`. Bulk details show an export's download link only to callers with `export`. API keys: `privacy.manage` needs the `audience` write scope. Content-only roles get none of these.
+
+Merges, bulk actions, suppressions, lifted suppressions, privacy exports and deletions, and "do not sell or share" changes are written to the audit log (`people.merge`, `people.bulk_action`, `people.suppress`, `people.unsuppress`, `people.privacy_export`, `people.privacy_delete`, `people.do_not_sell`).
 
 ## For other features
 

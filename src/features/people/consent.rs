@@ -677,10 +677,18 @@ pub fn is_reserved_property(key: &str) -> bool {
     key.starts_with('$') || RESERVED.contains(&key.trim().to_ascii_lowercase().as_str())
 }
 
-/// Refuse custom properties with reserved keys.
+/// [`is_reserved_property`] for profile saves (API, MCP, CSV, forms, integrations). An
+/// `ads_opt_out` property stays allowed there: ad audiences read it as an opt-out signal from other
+/// systems (see `features::audiences`), and it can only restrict, never undo the profile's own
+/// flag. Bulk property writes still refuse it.
+pub fn is_reserved_profile_property(key: &str) -> bool {
+    is_reserved_property(key) && !key.trim().eq_ignore_ascii_case("ads_opt_out")
+}
+
+/// Refuse custom properties with reserved keys on a profile save.
 pub fn check_property_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> AppResult<()> {
     for k in keys {
-        if is_reserved_property(k) {
+        if is_reserved_profile_property(k) {
             return Err(AppError::bad(format!("{k:?} can't be used as a custom property: it's a reserved field")));
         }
     }

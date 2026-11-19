@@ -673,7 +673,7 @@ pub async fn import_csv(
     };
     let roles: Vec<Option<&str>> = headers.iter().map(|h| role(h)).collect();
     let mut out = ImportResult { created: 0, updated: 0, skipped: 0, errors: Vec::new() };
-    for (h, _) in headers.iter().zip(&roles).filter(|(h, r)| r.is_none() && crate::features::people::consent::is_reserved_property(h)) {
+    for (h, _) in headers.iter().zip(&roles).filter(|(h, r)| r.is_none() && crate::features::people::consent::is_reserved_profile_property(h)) {
         out.errors.push(format!("column {h:?} was left out: consent, suppression and identity fields can't be set as custom properties"));
     }
     let mut ids = Vec::new();
@@ -708,7 +708,7 @@ pub async fn import_csv(
                     input.extra.insert(k.to_string(), json!(val));
                 }
                 _ => {
-                    if let Some(h) = headers.get(j).filter(|h| !crate::features::people::consent::is_reserved_property(h)) {
+                    if let Some(h) = headers.get(j).filter(|h| !crate::features::people::consent::is_reserved_profile_property(h)) {
                         let v = match val {
                             "true" | "TRUE" => json!(true),
                             "false" | "FALSE" => json!(false),

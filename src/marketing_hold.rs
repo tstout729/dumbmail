@@ -36,10 +36,12 @@ pub fn push_campaign_filter(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) 
 
 /// Hold a profile that was just created by a source without an opt-in. Never call this for a
 /// profile that already existed. A subscribed profile is never held (the trigger clears it). The
-/// hold is recorded in the profile's consent history (`features::people::consent::set_hold_in`).
-pub async fn hold_new_profile(db: &sqlx::PgPool, account_id: Uuid, profile_id: Uuid, src: &crate::features::people::ConsentSource) -> sqlx::Result<()> {
+/// hold is recorded in the profile's consent history (`features::people::consent::set_hold_in`),
+/// attributed to the caller's consent source (`features::people::with_source`).
+pub async fn hold_new_profile(db: &sqlx::PgPool, account_id: Uuid, profile_id: Uuid) -> sqlx::Result<()> {
+    let src = crate::features::people::consent::current_source();
     let mut tx = db.begin().await?;
-    crate::features::people::consent::set_hold_in(&mut tx, account_id, profile_id, true, src).await?;
+    crate::features::people::consent::set_hold_in(&mut tx, account_id, profile_id, true, &src).await?;
     tx.commit().await
 }
 

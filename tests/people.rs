@@ -1248,9 +1248,18 @@ async fn gpc_and_reserved_property_keys() {
         let (s, v) = h.req("POST", "/api/profiles", Some(json!({"email": "k@x.test", "properties": props}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     }
-    let (s, _) = h.req("POST", "/api/profiles", Some(json!({"email": "k@x.test", "ads_opt_out": false}))).await;
+    let (s, _) = h.req("POST", "/api/profiles", Some(json!({"email": "k@x.test", "sms_suppressed_reason": null}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email,ads_opt_out,city\nk@x.test,false,Portland\n", "permission_confirmed": true}))).await;
+    // An `ads_opt_out` property from another system is an opt-out signal ad audiences read; it can't
+    // turn the profile's own flag off, and a bulk property write can't set it.
+    let o = h.ok("POST", "/api/profiles", Some(json!({"email": "o@x.test", "properties": {"ads_opt_out": false}}))).await;
+    h.ok("PATCH", &format!("/api/people/profiles/{}/privacy", o["id"].as_str().unwrap()), Some(json!({"ads_opt_out": true}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "o@x.test", "properties": {"ads_opt_out": false}}))).await;
+    let flag: bool = sqlx::query_scalar("SELECT ads_opt_out FROM profiles WHERE email = 'o@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert!(flag, "a property never undoes the flag");
+    let (s, _) = h.req("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": "ads_opt_out", "value": false, "selection": {"profile_ids": [o["id"]]}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email,sms_consent_reason,email_suppressed_reason,city\nk@x.test,,manual,Portland\n", "permission_confirmed": true}))).await;
     assert_eq!(imp["created"], 1, "{imp}");
     let props: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE email = 'k@x.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(props, json!({"city": "Portland"}), "the reserved column is left out");
@@ -1426,7 +1435,7 @@ async fn marketing_hold_is_its_own_block() {
     let src = dumbmail::features::people::ConsentSource::new("integration", "system");
     let a = h.ok("POST", "/api/profiles", Some(json!({"email": "held@x.test"}))).await;
     let aid: Uuid = a["id"].as_str().unwrap().parse().unwrap();
-    dumbmail::marketing_hold::hold_new_profile(&db, acct, aid, &src).await.unwrap();
+    dumbmail::features::people::with_source(src, dumbmail::marketing_hold::hold_new_profile(&db, acct, aid)).await.unwrap();
     assert!(rows_for(&h, "held@x.test").await.contains(&("integration".into(), "marketing:hold".into(), Some("on".into()))));
 
     let list = h.ok("GET", "/api/people/suppressions?reason=marketing_hold", None).await;
