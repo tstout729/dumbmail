@@ -260,7 +260,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "push" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" | "review_request" => vec!["next"],
+            "delay" | "email" | "sms" | "push" | "whatsapp" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" | "review_request" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -287,7 +287,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                     return Err(AppError::bad(format!("delay {} unit must be minutes, hours or days", n.id)));
                 }
             }
-            "email" | "sms" | "push" => need("content")?,
+            "email" | "sms" | "push" | "whatsapp" => need("content")?,
             "review_request" => crate::features::reviews::check_step(&n.id, &n.data)?,
             "condition" => {
                 need("condition")?;
@@ -301,6 +301,9 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
             }
             "update_profile" => need("properties")?,
             "wait_for_reply" => {
+                if !matches!(n.str("channel"), None | Some("sms" | "whatsapp")) {
+                    return Err(AppError::bad(format!("wait for reply {} channel must be sms or whatsapp", n.id)));
+                }
                 let amount = n.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                 let unit = match n.str("unit") {
                     Some("minutes") => 60.0,
@@ -1303,7 +1306,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     o.remove("_waited");
                 }
             }
-            "email" | "sms" | "push" => {
+            "email" | "sms" | "push" | "whatsapp" => {
                 // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
                 // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
@@ -1315,9 +1318,9 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     };
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
                     let content = crate::features::campaigns_plus::utm::for_flow_step(&account, &flow, node.str("name"), &node.kind, content);
-                    // A push step's message id is stored with the run (under its claim) before it's sent, so
+                    // A push or WhatsApp step's message id is stored with the run (under its claim) before it's sent, so
                     // a re-run of the visit finds that message instead of sending a second one.
-                    let message_id = if node.kind == "push" {
+                    let message_id = if node.kind == "push" || node.kind == "whatsapp" {
                         match push_message_id(&state.db, &hold, &node_id, &mut context).await? {
                             Some(id) => Some(id),
                             None => return Ok(()),
@@ -1403,7 +1406,13 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                 // A deadline that can't be read counts nothing after the wait began.
                 let deadline = at("_reply_until").unwrap_or(since);
                 let now = Utc::now();
-                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                // Only a reply on the step's own channel counts (texts unless it says WhatsApp).
+                let replied = if node.str("channel") == Some("whatsapp") {
+                    crate::features::whatsapp::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await
+                } else {
+                    crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await
+                }
+                .map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 if !replied && now < deadline {
                     // Woken before the deadline without a reply inside the wait: keep waiting.
                     wait_until(&state.db, &hold, &node_id, &context, deadline).await?;

@@ -297,11 +297,13 @@ async fn totals(state: &AppState, run: &Run, account_id: Uuid, s: &Settings, sin
                 count(*) FILTER (WHERE {CREDITED}), COALESCE(sum(value) FILTER (WHERE {CREDITED}), 0)::float8,
                 COALESCE(sum(value) FILTER (WHERE campaign_id IS NOT NULL), 0)::float8, COALESCE(sum(value) FILTER (WHERE flow_id IS NOT NULL), 0)::float8,
                 COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'email'), 0)::float8, COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'sms'), 0)::float8,
-                COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'push'), 0)::float8
+                COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'push'), 0)::float8,
+                COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'whatsapp'), 0)::float8
          FROM ({PREVIEW_SQL} AND e.occurred_at >= $8) x"
     );
     let mut tx = run.tx(state).await?;
-    let (orders, revenue, att_orders, att_rev, camp, flow, email, sms, push): (i64, f64, i64, f64, f64, f64, f64, f64, f64) = sqlx::query_as(&sql)
+    type Totals = (i64, f64, i64, f64, f64, f64, f64, f64, f64, f64);
+    let (orders, revenue, att_orders, att_rev, camp, flow, email, sms, push, whatsapp): Totals = sqlx::query_as(&sql)
         .bind(account_id)
         .bind(&s.conversion_metrics)
         .bind(s.count_opens)
@@ -316,7 +318,7 @@ async fn totals(state: &AppState, run: &Run, account_id: Uuid, s: &Settings, sin
     tx.commit().await?;
     Ok(json!({
         "conversions": orders, "revenue": revenue, "attributed_conversions": att_orders, "attributed_revenue": att_rev,
-        "campaign_revenue": camp, "flow_revenue": flow, "email_revenue": email, "sms_revenue": sms, "push_revenue": push,
+        "campaign_revenue": camp, "flow_revenue": flow, "email_revenue": email, "sms_revenue": sms, "push_revenue": push, "whatsapp_revenue": whatsapp,
     }))
 }
 

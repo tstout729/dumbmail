@@ -105,6 +105,7 @@ export type AttributionTotals = {
   email_revenue: number;
   sms_revenue: number;
   push_revenue: number;
+  whatsapp_revenue: number;
 };
 
 export type AttributionPreview = {

@@ -22,6 +22,8 @@ import { CheckPanel } from "../../features/content/CheckPanel";
 import { SmsEditor } from "../../components/email/SmsEditor";
 import { PushEditor } from "../../features/push/PushEditor";
 import type { PushContent } from "../../features/push/types";
+import { WhatsappEditor } from "../../features/whatsapp/WhatsappEditor";
+import type { WhatsappContent } from "../../features/whatsapp/types";
 import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
@@ -134,14 +136,15 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
 
   const email = isEmail(current.content, campaign.channel) ? current.content : null;
   const push = campaign.channel === "push" ? (current.content as PushContent) : null;
-  const sms = email || push ? null : (current.content as SmsContent);
+  const whatsapp = campaign.channel === "whatsapp" ? (current.content as WhatsappContent) : null;
+  const sms = email || push || whatsapp ? null : (current.content as SmsContent);
   // Every version's sender must be on a verified domain.
   const domainVerified = versions.every((v) => {
     const c = versionContent(current, v);
     return isVerifiedSender(sending.data, (isEmail(c, campaign.channel) && c.from_email) || account.from_email);
   });
   const shown = versionContent(current, version);
-  const editVersion = (content: EmailContent | SmsContent | PushContent) => setDraft(withVersionContent(current, version, content));
+  const editVersion = (content: EmailContent | SmsContent | PushContent | WhatsappContent) => setDraft(withVersionContent(current, version, content));
 
   // Each version's own checks; with a test they're labelled "Version B: …".
   const versionChecks = versions.flatMap((v) => {
@@ -156,6 +159,9 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
     if (campaign.channel === "push") {
       const p = content as PushContent;
       return [{ ok: (p.title ?? "").trim() !== "" || (p.body ?? "").trim() !== "", label: `${prefix}Write the notification's title or message`, blocking: true }];
+    }
+    if (campaign.channel === "whatsapp") {
+      return [{ ok: Boolean((content as WhatsappContent).template_id), label: `${prefix}Pick an approved WhatsApp template and fill its variables`, blocking: true }];
     }
     const body = (content as SmsContent).body ?? "";
     return [
@@ -177,6 +183,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const contentDone = versions.every((v) => {
     const content = versionContent(current, v);
     if (campaign.channel === "push") return Boolean((content as PushContent).title || (content as PushContent).body);
+    if (campaign.channel === "whatsapp") return Boolean((content as WhatsappContent).template_id);
     return isEmail(content, campaign.channel) ? Boolean(content.subject) : Boolean((content as SmsContent).body);
   });
 
@@ -188,7 +195,11 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
         : "No subject yet"
       : push
         ? push.title || push.body || "No notification yet"
-        : sms?.body
+        : whatsapp
+          ? whatsapp.template_id
+            ? "WhatsApp template chosen"
+            : "No template yet"
+          : sms?.body
           ? sms.body.slice(0, 90)
           : "No message yet",
   ]
@@ -267,6 +278,8 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
               <p className="mt-1 text-xs text-zinc-500">
                 {campaign.channel === "push"
                   ? "People with a device that allowed notifications and who haven't turned push off, after exclusions."
+                  : campaign.channel === "whatsapp"
+                    ? "People whose number opted in to WhatsApp and is on WhatsApp, after exclusions."
                   : `People with ${campaign.channel === "email" ? "email" : "SMS"} consent, after exclusions and suppressions.`}
               </p>
               {estimate.error ? <p className="mt-2 text-xs text-red-600">{estimate.error.message}</p> : null}
@@ -311,6 +324,8 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
             <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} translationTarget={{ kind: "campaign", id: campaign.id, version: version === "a" ? undefined : version }} />
           ) : campaign.channel === "push" ? (
             <PushEditor key={version} value={shown as PushContent} onChange={editVersion} readOnly={!editable} />
+          ) : campaign.channel === "whatsapp" ? (
+            <WhatsappEditor key={version} value={shown as WhatsappContent} onChange={editVersion} readOnly={!editable} />
           ) : (
             <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} translationTarget={{ kind: "campaign", id: campaign.id, version: version === "a" ? undefined : version }} />
           )}
@@ -350,7 +365,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
               {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
-                defaultTo={campaign.channel !== "sms" ? user.email : ""}
+                defaultTo={campaign.channel !== "sms" && campaign.channel !== "whatsapp" ? user.email : ""}
                 channel={campaign.channel}
                 versions={test ? versions : null}
                 loading={testSend.isPending}
@@ -474,11 +489,13 @@ function TestSend({ defaultTo, channel, versions, loading, disabled, onSend }: T
             ? "Comma-separated email addresses."
             : channel === "push"
               ? "Email addresses of people whose devices get it. Yours includes the browsers you added in Settings → Push."
-              : "Comma-separated phone numbers in +1… format."
+              : channel === "whatsapp"
+                ? "Your team's test numbers from Settings → WhatsApp, comma-separated."
+                : "Comma-separated phone numbers in +1… format."
         }
       >
         <div className="flex gap-2">
-          <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "sms" ? "+15035550100" : "you@company.com"} disabled={disabled} />
+          <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "sms" || channel === "whatsapp" ? "+15035550100" : "you@company.com"} disabled={disabled} />
           {versions ? (
             <Select value={version} onChange={(e) => setPicked(e.target.value as VersionId)} disabled={disabled} aria-label="Version to test" className="w-32 shrink-0">
               {versions.map((v) => (

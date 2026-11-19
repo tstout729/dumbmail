@@ -5,6 +5,7 @@ import { DelayEditor, EventConditionEditor, NotifyEditor } from "../../features/
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
 import { PushEditor } from "../../features/push/PushEditor";
+import { WhatsappEditor } from "../../features/whatsapp/WhatsappEditor";
 import { ReviewStepEditor } from "../../features/reviews/StepEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
 import { ObjectSplitFields } from "../../features/objects/ObjectSplitFields";
@@ -59,6 +60,15 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly, trigg
           <PushEditor value={node.content} onChange={(content) => onChange({ ...node, content })} readOnly={readOnly} />
         </div>
       );
+    case "whatsapp":
+      return (
+        <div className="space-y-4">
+          <Field label="Step name">
+            <Input value={node.name ?? ""} onChange={(e) => onChange({ ...node, name: e.target.value || undefined })} disabled={readOnly} placeholder="WhatsApp" />
+          </Field>
+          <WhatsappEditor value={node.content} onChange={(content) => onChange({ ...node, content })} readOnly={readOnly} />
+        </div>
+      );
     case "condition":
       return (
         <fieldset disabled={readOnly} className="min-w-0 space-y-3">
@@ -87,6 +97,10 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly, trigg
             Wait for them to text back. If they reply in time they go down <b>replied</b> right away; otherwise <b>no reply</b> when the time is up. STOP and HELP don't
             count as replies.
           </p>
+          <Select value={node.channel ?? "sms"} onChange={(e) => onChange({ ...node, channel: e.target.value === "whatsapp" ? "whatsapp" : undefined })} aria-label="Reply channel">
+            <option value="sms">A text reply</option>
+            <option value="whatsapp">A WhatsApp reply</option>
+          </Select>
           <div className="flex gap-2">
             <Input type="number" min={1} value={node.amount} onChange={(e) => onChange({ ...node, amount: Math.max(1, Number(e.target.value) || 1) })} className="w-24" aria-label="Amount" />
             <Select value={node.unit} onChange={(e) => onChange({ ...node, unit: e.target.value as DelayUnit })} className="w-32" aria-label="Unit">

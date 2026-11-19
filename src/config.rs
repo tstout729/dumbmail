@@ -224,6 +224,9 @@ pub struct Config {
     /// The Shopify app (SHOPIFY_API_KEY, SHOPIFY_API_SECRET; see docs/SHOPIFY.md).
     #[command(flatten)]
     pub shopify: crate::features::shopify::Settings,
+    /// WhatsApp (PRICE_WHATSAPP; see docs/WHATSAPP.md).
+    #[command(flatten)]
+    pub whatsapp: crate::features::whatsapp::WhatsappConfig,
 }
 
 impl Config {

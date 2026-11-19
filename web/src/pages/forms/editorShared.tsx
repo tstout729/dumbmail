@@ -51,7 +51,7 @@ export function versionText(ed: Editor, key: FormVariantField, fallback = ""): T
   };
 }
 
-type SharedTextKey = "legal_text" | "success_button_text" | "success_button_url" | "redirect_url" | "confirm_message" | "sms_consent_text";
+type SharedTextKey = "legal_text" | "success_button_text" | "success_button_url" | "redirect_url" | "confirm_message" | "sms_consent_text" | "whatsapp_consent_text";
 
 /** Props for a text input shared by every version. */
 export function sharedText(ed: Editor, key: SharedTextKey, fallback = ""): TextProps {

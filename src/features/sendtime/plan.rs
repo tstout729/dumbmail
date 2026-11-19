@@ -253,7 +253,7 @@ async fn build_plan(state: &AppState, account: &Account, channel: &str, opts: Se
     let account_tz = crate::sending::account_tz(account);
     let local_date = opts.local_date.unwrap_or_else(|| start.with_timezone(&account_tz).date_naive());
     // Texts and push notifications wait for the recipient's quiet hours to end (push in the profile's zone).
-    let sms_window = if channel == "sms" || channel == "push" { Some(super::settings::sms_window(&state.db, account.id).await?) } else { None };
+    let sms_window = if channel == "sms" || channel == "push" || channel == "whatsapp" { Some(super::settings::sms_window(&state.db, account.id).await?) } else { None };
     let account_hist = if opts.timing == Timing::BestTime { account_histogram(&state.db, account.id, account_tz).await? } else { Histogram::default() };
     Ok(Plan { opts, start, account_tz, local_date, sms_window, account_hist })
 }
@@ -347,12 +347,16 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
 /// recorded, the options to store (the caller stores them with the launch).
 pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, send_at: Option<DateTime<Utc>>) -> AppResult<(Option<DateTime<Utc>>, Option<Value>)> {
     let Some(mut opts) = options::of(c.send_options.as_ref()) else { return Ok((send_at, None)) };
-    if c.channel == "sms" || c.channel == "push" {
+    if c.channel == "sms" || c.channel == "push" || c.channel == "whatsapp" {
         let (s, e) = super::settings::sms_window(&state.db, account.id).await?;
         if opts.timing == Timing::LocalTime && !(s..e).contains(&opts.local_minute()) {
             return Err(AppError::bad(format!(
                 "{} only go out between {} and {} in each person's time zone; pick a local time in that window",
-                if c.channel == "sms" { "Texts" } else { "Push notifications" },
+                match c.channel.as_str() {
+                    "sms" => "Texts",
+                    "whatsapp" => "WhatsApp messages",
+                    _ => "Push notifications",
+                },
                 super::clock::hhmm(s),
                 super::clock::hhmm(e)
             )));
@@ -466,17 +470,19 @@ pub fn push_recently_messaged(qb: &mut QueryBuilder<'_, sqlx::Postgres>, channel
         .push_bind(channel.to_string())
         .push(" AND rm.status IN ('sent','delivered') AND NOT rm.is_test AND NOT rm.transactional AND rm.sent_at > now() - make_interval(hours => ")
         .push_bind(hours as i32)
-        .push(") AND NOT EXISTS (SELECT 1 FROM sms_sent_texts st WHERE st.message_id = rm.id AND st.kind <> 'marketing'))");
+        .push(") AND NOT EXISTS (SELECT 1 FROM sms_sent_texts st WHERE st.message_id = rm.id AND st.kind <> 'marketing')")
+        .push(" AND NOT EXISTS (SELECT 1 FROM whatsapp_sent ws WHERE ws.message_id = rm.id AND ws.kind <> 'marketing'))");
 }
 
 /// Smart sending: did this person get a marketing message on this channel in the last `hours`?
 /// Transactional mail, tests and conversational texts (inbox replies, HELP answers, sign-up texts;
-/// see `features::inbox`) don't count. Used by campaigns and flows.
+/// see `features::inbox`) and WhatsApp replies (`features::whatsapp`) don't count. Used by campaigns and flows.
 pub async fn recently_messaged(db: &PgPool, profile_id: Uuid, channel: &str, hours: i64) -> sqlx::Result<bool> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = $2 AND status IN ('sent','delivered') AND NOT is_test AND NOT transactional
                         AND sent_at > now() - make_interval(hours => $3)
-                        AND NOT EXISTS (SELECT 1 FROM sms_sent_texts t WHERE t.message_id = messages.id AND t.kind <> 'marketing'))",
+                        AND NOT EXISTS (SELECT 1 FROM sms_sent_texts t WHERE t.message_id = messages.id AND t.kind <> 'marketing')
+                        AND NOT EXISTS (SELECT 1 FROM whatsapp_sent w WHERE w.message_id = messages.id AND w.kind <> 'marketing'))",
     )
     .bind(profile_id)
     .bind(channel)

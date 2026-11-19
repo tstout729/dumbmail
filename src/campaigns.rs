@@ -164,6 +164,8 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
 pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
     if channel == "push" {
         qb.push(" AND ").push(crate::features::push::send::REACHABLE_SQL);
+    } else if channel == "whatsapp" {
+        qb.push(" AND ").push(crate::features::whatsapp::consent::REACHABLE_SQL);
     } else if channel == "sms" {
         qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed'");
     } else {
@@ -316,6 +318,8 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
         }
     } else if c.channel == "push" {
         // Push setup is checked when it launches (`features::push::setup_problems`).
+    } else if c.channel == "whatsapp" {
+        // WhatsApp's connection and template are checked when it launches (`features::whatsapp::setup_problems`).
     } else if account.sms_from.is_none() {
         problems.push("Set an SMS sending number in Settings → SMS".into());
     }
@@ -346,6 +350,8 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
         }
     } else if channel == "push" {
         problems.extend(crate::features::push::content::problems(content));
+    } else if channel == "whatsapp" {
+        problems.extend(crate::features::whatsapp::content_problems(content));
     } else if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
         problems.push("Write the SMS message".into());
     }
@@ -517,7 +523,7 @@ async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, 
 /// What a campaign's queued message rows record as the recipient's address.
 fn recipient_column(channel: &str) -> &'static str {
     match channel {
-        "sms" => "p.phone_number",
+        "sms" | "whatsapp" => "p.phone_number",
         // Push goes to the person's devices, fixed when each message is claimed.
         "push" => "'push'",
         _ => "p.email",
@@ -948,6 +954,9 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
     }
     if c.channel == "push" {
         return crate::features::push::campaign_test(state, account, c, content, to, create_profiles).await;
+    }
+    if c.channel == "whatsapp" {
+        return crate::features::whatsapp::campaign_test(state, account, c, content, to).await;
     }
     let mut sent = 0;
     for raw in to {

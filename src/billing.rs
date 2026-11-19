@@ -88,6 +88,7 @@ pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: 
             }
         }
         "push" => p.push,
+        "whatsapp" => crate::features::whatsapp::send::price(state),
         _ if own_provider => 0,
         _ if mms => p.mms,
         _ => p.sms_segment * segments.max(1),
@@ -121,6 +122,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
         (recipients - covered).max(0) * p.email
     } else if channel == "push" {
         recipients * p.push
+    } else if channel == "whatsapp" {
+        recipients * crate::features::whatsapp::send::price(state)
     } else if !sms_billed(state, account_id).await? {
         0
     } else if mms {
@@ -205,6 +208,7 @@ pub async fn debit_usage_tx(tx: &mut sqlx::PgConnection, account_id: Uuid, kind:
         "sms" => "SMS segments sent",
         "mms" => "MMS sent",
         "push" => "Push notifications sent",
+        "whatsapp" => "WhatsApp messages sent",
         _ => "Usage",
     };
     sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;
