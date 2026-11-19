@@ -1518,10 +1518,9 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
         "SELECT max((request->>'cooldown_until')::timestamptz) FILTER (WHERE request ? 'cooldown_until'),
                 count(*) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute'),
                 min((request->>'sent_at')::timestamptz) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute')
-         FROM integration_deliveries WHERE integration_id = $1 AND source = 'fetch' AND id <> $2 AND created_at > now() - interval '1 day'",
+         FROM integration_deliveries WHERE integration_id = $1 AND source = 'fetch' AND created_at > now() - interval '1 day'",
     )
     .bind(integration_id)
-    .bind(id)
     .fetch_one(&mut *tx)
     .await?;
     let claimed_at = Utc::now();
