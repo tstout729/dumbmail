@@ -1,8 +1,9 @@
 import type { AbMetric, AbTest, Campaign, Channel, EmailContent, SmsContent, VersionId } from "../../api";
 import type { PushContent } from "../../features/push/types";
+import type { WhatsappContent } from "../../features/whatsapp/types";
 import { formatNumber, pluralize } from "../../lib/format";
 
-type Content = EmailContent | SmsContent | PushContent;
+type Content = EmailContent | SmsContent | PushContent | WhatsappContent;
 type VariantId = Exclude<VersionId, "a">;
 
 export const VERSION_IDS: VersionId[] = ["a", "b", "c", "d"];
@@ -126,7 +127,14 @@ export function metricsFor(channel: Channel): AbMetric[] {
 
 /** A short label for a version's content: the subject line, or the start of the text. */
 export function contentSnippet(content: Content, channel: Campaign["channel"]) {
-  const text = channel === "email" ? (content as EmailContent).subject : channel === "push" ? (content as PushContent).title || (content as PushContent).body : (content as SmsContent).body;
+  const text =
+    channel === "email"
+      ? (content as EmailContent).subject
+      : channel === "push"
+        ? (content as PushContent).title || (content as PushContent).body
+        : channel === "whatsapp"
+          ? Object.values((content as WhatsappContent).body ?? {}).join(", ")
+          : (content as SmsContent).body;
   const trimmed = (text ?? "").trim();
   if (!trimmed) return channel === "email" ? "No subject" : "No message";
   return trimmed.length > 80 ? `${trimmed.slice(0, 79)}…` : trimmed;

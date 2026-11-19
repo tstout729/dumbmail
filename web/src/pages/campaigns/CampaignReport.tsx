@@ -1,6 +1,9 @@
 import { PushReportCard } from "../../features/push/PushReportCard";
 import { PushPreview } from "../../features/push/PushEditor";
 import type { PushContent } from "../../features/push/types";
+import { WhatsappReportCard } from "../../features/whatsapp/WhatsappReportCard";
+import { WhatsappPreviewFor } from "../../features/whatsapp/WhatsappPreviewFor";
+import type { WhatsappContent } from "../../features/whatsapp/types";
 import { useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { Copy, Eye, FlaskConical, Trophy } from "lucide-react";
@@ -100,6 +103,11 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           <PushReportCard campaignId={campaign.id} />
         </div>
       ) : null}
+      {campaign.channel === "whatsapp" ? (
+        <div className="mt-4">
+          <WhatsappReportCard campaignId={campaign.id} />
+        </div>
+      ) : null}
       <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <Card title={campaign.channel === "email" ? "Opens and clicks over time" : "Clicks over time"}>
           <TimeSeriesChart
@@ -163,6 +171,8 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           ) : null}
           {campaign.channel === "email" ? (
             <EmailPreview key={viewing} content={viewed as EmailContent} className="h-[70vh]" />
+          ) : campaign.channel === "whatsapp" ? (
+            <WhatsappPreviewFor content={viewed as WhatsappContent} />
           ) : campaign.channel === "push" ? (
             <PushPreview content={viewed as PushContent} rendered={null} platforms={(viewed as PushContent).platforms?.length ? ((viewed as PushContent).platforms ?? []) : ["web", "ios", "android"]} />
           ) : (

@@ -238,6 +238,7 @@ const topLevelKeys = [
   "auto_close_seconds",
   "confirm_message",
   "sms_consent_text",
+  "whatsapp_consent_text",
   "brand_color",
   "fields",
   "collect",

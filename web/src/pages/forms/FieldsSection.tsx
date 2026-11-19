@@ -145,9 +145,14 @@ export function FieldsSection({ ed, open, onToggle }: SectionProps) {
 
 function SmsConsentField({ ed }: { ed: Editor }) {
   return (
-    <Field label="SMS consent text" hint="Shown next to the consent checkbox under the phone field. Carriers require clear consent language.">
-      <Textarea rows={3} maxLength={1000} {...sharedText(ed, "sms_consent_text", contentDefaults.sms_consent_text)} />
-    </Field>
+    <>
+      <Field label="SMS consent text" hint="Shown next to the consent checkbox under the phone field. Carriers require clear consent language.">
+        <Textarea rows={3} maxLength={1000} {...sharedText(ed, "sms_consent_text", contentDefaults.sms_consent_text)} />
+      </Field>
+      <Field label="WhatsApp consent text (optional)" hint="Adds a second box under the phone field. Ticking it signs the number up for WhatsApp marketing. Leave empty for no box.">
+        <Textarea rows={2} maxLength={1000} {...sharedText(ed, "whatsapp_consent_text")} placeholder="Also send me offers on WhatsApp. Reply STOP to unsubscribe." />
+      </Field>
+    </>
   );
 }
 
