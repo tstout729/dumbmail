@@ -45,16 +45,19 @@ pub const COMPLIANCE_TEXTS: &[&str] = &["help", "confirmation", "optin_request"]
 static DEFAULT_CONFIRMATION: Lazy<regex::Regex> = Lazy::new(|| {
     regex::Regex::new(r"^([^\n]{1,80}): Thanks! You're signed up for texts\. ([^\n.]{0,40})\. Msg & data rates may apply\. Reply HELP for help, STOP to cancel\.$").unwrap()
 });
-/// Something that could carry a pitch in the account's own slots (program name, frequency): a
-/// link, a domain, an address or a number.
-static CARRIES: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(?i)https?:|www\.|@|[a-z0-9-]+\.[a-z]{2,}|\d{5,}").unwrap());
+/// The account's own slots (program name, frequency) may hold only plain words: ASCII letters,
+/// spaces, a little punctuation (no dots or @) and at most 4 digits in all, so no link, domain,
+/// address or number can ride along.
+fn plain_slot(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric() || " &'-,!()/".contains(c)) && s.chars().filter(char::is_ascii_digit).count() <= 4
+}
 
 /// Whether this inbox text may go before approval: a compliance kind in its fixed wording (a
 /// confirmation only in its default wording, its own slots carrying no link, domain, address or
 /// number).
 fn fixed_compliance(kind: &str, body: &str) -> bool {
     match kind {
-        "confirmation" => DEFAULT_CONFIRMATION.captures(body).is_some_and(|c| !CARRIES.is_match(&c[1]) && !CARRIES.is_match(&c[2])),
+        "confirmation" => DEFAULT_CONFIRMATION.captures(body).is_some_and(|c| plain_slot(&c[1]) && plain_slot(&c[2])),
         k => COMPLIANCE_TEXTS.contains(&k),
     }
 }
@@ -333,6 +336,8 @@ mod tests {
         assert!(fixed_compliance("confirmation", d));
         let own = "Acme VIP: Thanks! You're signed up for texts. Buy crypto now at evil.test. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel.";
         assert!(!fixed_compliance("confirmation", own));
+        assert!(!fixed_compliance("confirmation", "Call 503 555 0199 now: Thanks! You're signed up for texts. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."));
+        assert!(!fixed_compliance("confirmation", "Visit evil．test: Thanks! You're signed up for texts. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."));
         assert!(!fixed_compliance("confirmation", "Visit evil.test: Thanks! You're signed up for texts. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."));
         assert!(!fixed_compliance("confirmation", "Acme VIP: Here's 20% off! Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."));
         assert!(fixed_compliance("help", "anything"));
