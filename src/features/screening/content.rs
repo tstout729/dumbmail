@@ -116,15 +116,19 @@ impl Collected {
         self.text.push(text);
     }
 
-    /// One string a block holds: a web address is a link (with the block's own words as its
-    /// text), anything else is text.
+    /// One string a block holds: always read as text (markup, anchors and written-out addresses
+    /// included); a value that is itself just a web address is also a link, with the block's own
+    /// words as its text.
     fn string(&mut self, s: &str, link_text: &str) {
         let t = s.trim();
-        if t.starts_with("http://") || t.starts_with("https://") {
-            self.links.push((fetch::visible_text(link_text, 120), t.to_string()));
-        } else if shown(t) {
-            self.html(t);
+        if !shown(t) {
+            return;
         }
+        let bare_url = (t.starts_with("http://") || t.starts_with("https://")) && !t.contains(char::is_whitespace) && !t.contains('<') && url::Url::parse(t).is_ok();
+        if bare_url {
+            self.links.push((fetch::visible_text(link_text, 120), t.to_string()));
+        }
+        self.html(t);
     }
 
     /// Every string a block holds, whatever its display rules, template conditions included: text
