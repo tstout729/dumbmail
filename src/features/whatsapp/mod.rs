@@ -6,7 +6,7 @@
 //! `sending::send` hands `whatsapp` messages to [`send::send`]; campaigns and flows otherwise treat
 //! WhatsApp like texts (audiences use [`consent::REACHABLE_SQL`]). See docs/WHATSAPP.md.
 //!
-//! RCS isn't here: see docs/WHATSAPP.md for what an RCS upgrade to texts needs.
+//! RCS isn't here: it's an upgrade to texts (see features::rcs).
 
 pub mod consent;
 pub mod content;

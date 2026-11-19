@@ -19,6 +19,7 @@ pub mod klaviyo_import;
 pub mod objects;
 pub mod observe;
 pub mod push;
+pub mod rcs;
 pub mod reports;
 pub mod reviews;
 pub mod sendtime;
@@ -124,6 +125,7 @@ pub static ALL: &[&dyn Feature] = &[
     &klaviyo_import::Module,
     &objects::Module,
     &push::Module,
+    &rcs::Module,
     &reports::Module,
     &reviews::Module,
     &sendtime::Module,

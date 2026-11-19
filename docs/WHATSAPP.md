@@ -210,11 +210,4 @@ A first live check should:
 
 ## RCS
 
-RCS (rich texts on Android) is a separate, later piece of work, not part of WhatsApp. Telnyx documents a public RCS API (`POST /v2/messages/rcs` with a registered RCS agent, a rich card and an `sms_fallback`), so it can be built as an upgrade to texts. It needs:
-
-- an RCS agent registered with Google and approved by carriers (the account's agent id in settings, switched off until then);
-- RCS content on texts (a card with an image, title, description and up to four suggested replies or links);
-- sending through Telnyx's RCS endpoint with SMS fallback, reading `data.type` to know whether it went as RCS or SMS;
-- Telnyx's RCS delivery webhooks;
-- a `PRICE_RCS` price;
-- reports that show RCS and SMS separately.
+RCS (rich texts) is an upgrade to texts, not part of WhatsApp. See [RCS](RCS.md) (`dumbmail://docs/rcs`).

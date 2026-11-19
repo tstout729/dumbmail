@@ -129,7 +129,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
     } else if mms {
         recipients * p.mms
     } else {
-        recipients * segments.max(1) * p.sms_segment
+        // With RCS on, each text goes as RCS or as SMS: estimate the costlier (features::rcs).
+        (recipients * segments.max(1) * p.sms_segment).max(crate::features::rcs::campaign_cost(state, account_id, recipients).await?)
     };
     ensure_funds(state, account_id, cost, "This send").await?;
     Ok(cost)
@@ -209,6 +210,7 @@ pub async fn debit_usage_tx(tx: &mut sqlx::PgConnection, account_id: Uuid, kind:
         "mms" => "MMS sent",
         "push" => "Push notifications sent",
         "whatsapp" => "WhatsApp messages sent",
+        "rcs" => "RCS messages sent",
         _ => "Usage",
     };
     sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;

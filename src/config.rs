@@ -223,6 +223,9 @@ pub struct Config {
     /// WhatsApp (PRICE_WHATSAPP; see docs/WHATSAPP.md).
     #[command(flatten)]
     pub whatsapp: crate::features::whatsapp::WhatsappConfig,
+    /// RCS for texts (PRICE_RCS; see docs/RCS.md).
+    #[command(flatten)]
+    pub rcs: crate::features::rcs::RcsConfig,
 }
 
 impl Config {
