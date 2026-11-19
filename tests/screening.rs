@@ -662,6 +662,18 @@ fn daytime_tz() -> String {
         .unwrap()
 }
 
+/// A number whose own time zone is in the middle of the day now (quiet hours never hold a text to it).
+fn daytime_number(n: u32) -> String {
+    let candidates = [
+        format!("+1808555{n:04}"), format!("+1503555{n:04}"), format!("+1303555{n:04}"), format!("+1312555{n:04}"), format!("+1212555{n:04}"),
+        format!("+4420794{n:05}"), format!("+9198123{n:05}"), format!("+97798123{n:04}"), format!("+8190123{n:05}"), format!("+6129123{n:04}"),
+    ];
+    candidates
+        .into_iter()
+        .find(|c| dumbmail::features::sendtime::zone::phone_zone(c).is_some_and(|tz| (11..17).contains(&chrono::Timelike::hour(&chrono::Utc::now().with_timezone(&tz)))))
+        .expect("some zone is at midday")
+}
+
 fn spec<'a>(account: &'a dumbmail::models::Account, profile: &'a dumbmail::models::Profile, channel: &'a str, content: &'a Value) -> SendSpec<'a> {
     SendSpec { account, profile, channel, content, campaign_id: None, flow_id: None, flow_node_id: None, event: None, is_test: false, message_id: None, to_override: None }
 }
@@ -765,7 +777,8 @@ async fn item2_the_final_claim_reads_the_standing_again() {
     h.credit(5.0).await;
     h.claim_number().await;
     h.ok("PATCH", "/api/account", Some(json!({"timezone": daytime_tz()}))).await;
-    let p = profile(&mut h, json!({"email": "ann@x.test", "email_consent": "subscribed", "phone_number": "+15035550188", "sms_consent": "subscribed"})).await;
+    // A number where it's midday, so the text reaches its claim whatever the time (quiet hours come first).
+    let p = profile(&mut h, json!({"email": "ann@x.test", "email_consent": "subscribed", "phone_number": daytime_number(188), "sms_consent": "subscribed"})).await;
     set_standing(&h, "blocked").await;
     // The send started from an approved read of the account; the claim sees it's blocked now.
     let stale = snapshot(&h, "approved").await;
