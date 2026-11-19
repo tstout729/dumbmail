@@ -1,7 +1,7 @@
 import { Badge } from "../../components/ui";
 import type { AgentConversation, AgentPlace } from "./types";
 
-export const PLACE_LABEL: Record<AgentPlace, string> = { hub: "Customer hub", site: "Website", sms: "Text", test: "Test chat" };
+export const PLACE_LABEL: Record<AgentPlace, string> = { hub: "Customer hub", site: "Website", sms: "Text", whatsapp: "WhatsApp", test: "Test chat" };
 
 export const REASON_LABEL: Record<string, string> = {
   refund: "Refund",

@@ -373,6 +373,10 @@ async fn after(state: &AppState, account_id: Uuid, rx: &Inbound, s: &Stored) -> 
             .await?;
         }
     }
+    // The shopping agent answers an ordinary message first when the store turned that on.
+    if s.kind == "message" {
+        crate::features::agent::whatsapp::take(state, account_id, s.id, &rx.msg_type, rx.timed).await?;
+    }
     sqlx::query("UPDATE whatsapp_inbound SET processed_at = now() WHERE id = $1").bind(s.id).execute(&state.db).await?;
     // A flow waiting for this person's WhatsApp reply takes the "replied" path now.
     // Meta's time is a whole second; the step itself checks the reply's time again.

@@ -737,3 +737,49 @@ async fn without_an_api_key_nothing_answers_and_the_settings_say_so() {
     assert_eq!(count(&h, "SELECT count(*) FROM agent_conversations").await, 0);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn whatsapp_messages_get_a_first_answer_with_only_their_own_order_status() {
+    use dumbmail::features::whatsapp::inbox::{receive, Inbound};
+    let (calls, url) = mock_model().await;
+    let mut h = agent_harness!(url);
+    let (account_id, _) = setup(&mut h).await;
+    let alice_phone = "+15035550101";
+    h.ok("POST", "/api/profiles", Some(json!({"email": "alice@example.com", "phone_number": alice_phone}))).await;
+    let bob = profile_id(&h, "bob@example.com").await;
+    let msg = |wamid: &str, text: &str| Inbound {
+        wamid: wamid.into(),
+        from: Some(alice_phone.into()),
+        user_id: None,
+        name: Some("Alice".into()),
+        msg_type: "text".into(),
+        text: text.into(),
+        payload: None,
+        context_wamid: None,
+        received_at: chrono::Utc::now(),
+        timed: true,
+    };
+    // Off: nothing answers.
+    receive(&h.state, account_id, &msg("wamid.0", "hello")).await.unwrap();
+    h.drain().await;
+    assert!(calls.lock().unwrap().is_empty());
+    h.ok("PATCH", "/api/agent/settings", Some(json!({"whatsapp": true}))).await;
+    receive(&h.state, account_id, &msg("wamid.1", &format!("ORDERS {bob}"))).await.unwrap();
+    h.drain().await;
+    // Meta delivering it again doesn't answer twice.
+    receive(&h.state, account_id, &msg("wamid.1", &format!("ORDERS {bob}"))).await.unwrap();
+    h.drain().await;
+    let reqs = calls.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "one tool round and one answer");
+    assert!(reqs[0]["system"][0]["text"].as_str().unwrap().contains("by WhatsApp message"));
+    let result = tool_results(&reqs[1])[0]["content"].as_str().unwrap().to_string();
+    assert!(result.contains("A100") && result.contains("1ZALICE") && !result.contains("Wool jacket") && !result.contains("B200"), "{result}");
+    let sent: Vec<(String, String)> = sqlx::query_as("SELECT kind, body FROM whatsapp_sent").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "agent_reply");
+    assert!(sent[0].1.starts_with("RESULT"));
+    let c = h.ok("GET", "/api/agent/conversations", None).await["data"][0].clone();
+    assert_eq!(c["place"], "whatsapp");
+    assert!(c["whatsapp_conversation_id"].is_string());
+    h.cleanup().await;
+}

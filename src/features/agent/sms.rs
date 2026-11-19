@@ -117,7 +117,7 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         .await?;
     let Some((number, trusted)) = phone else { return Ok(()) };
     let orders = if trusted && number.as_deref() == Some(rx.from.as_str()) { Orders::StatusOnly } else { Orders::None };
-    let st = Start { account: &account, place: "sms", who: Who { profile_id: Some(rx.profile_id), orders }, token: None, sms_conversation_id: Some(rx.conversation_id), ip: None };
+    let st = Start { account: &account, place: "sms", who: Who { profile_id: Some(rx.profile_id), orders }, token: None, sms_conversation_id: Some(rx.conversation_id), whatsapp_conversation_id: None, ip: None };
     let out = chat::say(state, st, &rx.text, |_| {}).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     if let Some(c) = out.conversation_id {
         sqlx::query("UPDATE agent_sms_claims SET conversation_id = $2 WHERE inbound_id = $1").bind(rx.id).bind(c).execute(&state.db).await?;

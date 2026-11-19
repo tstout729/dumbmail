@@ -33,22 +33,23 @@ pub struct ListQuery {
     pub cursor: Option<String>,
 }
 
-type Row = (Uuid, String, String, Option<String>, Option<String>, i32, DateTime<Utc>, DateTime<Utc>, Option<Uuid>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+type Row = (Uuid, String, String, Option<String>, Option<String>, i32, DateTime<Utc>, DateTime<Utc>, Option<Uuid>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
 
 const ROW_SQL: &str = "SELECT c.id, c.place, c.status, c.handoff_reason, c.handoff_summary, c.turns, c.created_at, c.last_message_at, c.profile_id,
         p.email, p.phone_number, NULLIF(trim(concat_ws(' ', p.first_name, p.last_name)), ''),
         (SELECT m.body FROM agent_messages m WHERE m.conversation_id = c.id AND m.role <> 'note' ORDER BY m.created_at DESC, m.id DESC LIMIT 1),
-        c.sms_conversation_id::text
+        c.sms_conversation_id::text, c.whatsapp_conversation_id::text
      FROM agent_conversations c LEFT JOIN profiles p ON p.id = c.profile_id AND p.account_id = c.account_id";
 
 fn row_json(r: Row) -> Value {
-    let (id, place, status, reason, summary, turns, created_at, last_message_at, profile_id, email, phone, name, last, sms) = r;
+    let (id, place, status, reason, summary, turns, created_at, last_message_at, profile_id, email, phone, name, last, sms, wa) = r;
     json!({
         "id": id, "place": place, "status": status, "handed_off": status == "handed_off", "handoff_reason": reason, "handoff_summary": summary,
         "turns": turns, "created_at": created_at, "last_message_at": last_message_at,
         "person": profile_id.map(|pid| json!({"id": pid, "email": email, "phone_number": phone, "name": name})),
         "last_message": last.map(|l| l.chars().take(160).collect::<String>()),
         "sms_conversation_id": sms,
+        "whatsapp_conversation_id": wa,
     })
 }
 
@@ -104,7 +105,7 @@ pub async fn test(state: &AppState, ctx: &Ctx, b: TestBody) -> AppResult<Value> 
         return Err(AppError::bad("The shopping agent isn't available on this server (no Anthropic API key is set)"));
     }
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    let st = Start { account: &account, place: "test", who: Who { profile_id: None, orders: Orders::Sample }, token: b.conversation.as_deref(), sms_conversation_id: None, ip: None };
+    let st = Start { account: &account, place: "test", who: Who { profile_id: None, orders: Orders::Sample }, token: b.conversation.as_deref(), sms_conversation_id: None, whatsapp_conversation_id: None, ip: None };
     let o = chat::say(state, st, &b.message, |_| {}).await?;
     Ok(json!({"reply": o.reply, "conversation": o.token.or(b.conversation), "conversation_id": o.conversation_id, "handed_off": o.handed_off, "refused": o.refused}))
 }

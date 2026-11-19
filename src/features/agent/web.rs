@@ -273,7 +273,7 @@ fn stream(state: AppState, account: Account, place: &'static str, who: Who, b: S
                 Event::Reset => sse(json!({"t": "reset"})),
             });
         };
-        let st = Start { account: &account, place, who, token: b.conversation.as_deref(), sms_conversation_id: None, ip: ip.as_deref() };
+        let st = Start { account: &account, place, who, token: b.conversation.as_deref(), sms_conversation_id: None, whatsapp_conversation_id: None, ip: ip.as_deref() };
         let done = match chat::say(&state, st, &b.message, sink).await {
             Ok(o) => json!({"t": "done", "reply": o.reply, "conversation": o.token.or(b.conversation), "handed_off": o.handed_off, "refused": o.refused}),
             Err(e) => {

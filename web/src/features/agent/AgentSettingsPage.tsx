@@ -26,10 +26,10 @@ export function AgentSettingsPage() {
   );
 }
 
-type Draft = { hub: boolean; site: boolean; sms: boolean; name: string; tone: string; answers: AgentAnswer[]; monthly_cap: number; pages: string[] };
+type Draft = { hub: boolean; site: boolean; sms: boolean; whatsapp: boolean; name: string; tone: string; answers: AgentAnswer[]; monthly_cap: number; pages: string[] };
 
 function draftOf(s: AgentSettings): Draft {
-  return { hub: s.hub, site: s.site, sms: s.sms, name: s.name, tone: s.tone, answers: s.answers.map((a) => ({ ...a })), monthly_cap: s.monthly_cap, pages: s.pages.map((p) => p.url) };
+  return { hub: s.hub, site: s.site, sms: s.sms, whatsapp: s.whatsapp, name: s.name, tone: s.tone, answers: s.answers.map((a) => ({ ...a })), monthly_cap: s.monthly_cap, pages: s.pages.map((p) => p.url) };
 }
 
 function PlaceToggle({ checked, onChange, title, children }: { checked: boolean; onChange: (v: boolean) => void; title: string; children: ReactNode }) {
@@ -102,6 +102,10 @@ function AgentForm({ s }: { s: AgentSettings }) {
           <PlaceToggle checked={d.sms} onChange={(v) => set({ sms: v })} title="First answers to texts">
             Answers ordinary texts to your number before a person does, instead of your default reply. Someone texting from the number on their profile can get their order status.
             Each answer is an automatic text, billed like any reply.
+          </PlaceToggle>
+          <PlaceToggle checked={d.whatsapp} onChange={(v) => set({ whatsapp: v })} title="First answers on WhatsApp">
+            Answers ordinary WhatsApp messages to your business number before a person does. Someone writing from the number on their profile can get their order status. Each
+            answer is billed like any WhatsApp reply.
           </PlaceToggle>
         </div>
       </Card>

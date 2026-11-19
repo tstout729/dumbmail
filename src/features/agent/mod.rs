@@ -1,6 +1,7 @@
 //! AI shopping agent: answers shoppers' questions from the store's own information, in the
 //! customer hub (signed-in shoppers), in a chat bubble on the store's website (anyone, never
-//! anything personal) and, when the store turns it on, as the first answer to inbound texts. It
+//! anything personal) and, when the store turns it on, as the first answer to inbound texts and
+//! WhatsApp messages. It
 //! hands off to a person when it should. See docs/AGENT.md.
 //!
 //! - `settings`: what the store turns on and tells it; the settings API and MCP tools.
@@ -8,7 +9,7 @@
 //! - `claude`: one streamed model turn over raw HTTPS.
 //! - `chat`: conversations, caps, billing, the tools the server runs, hand-offs.
 //! - `web`: the public chat pages on the hub's host and the bubble script.
-//! - `sms`: first answers to inbound texts.
+//! - `sms`, `whatsapp`: first answers to inbound texts and WhatsApp messages.
 //! - `api`: the team's view of conversations and the test chat.
 
 pub mod api;
@@ -18,6 +19,7 @@ pub mod knowledge;
 pub mod settings;
 pub mod sms;
 pub mod web;
+pub mod whatsapp;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -65,7 +67,7 @@ fn tools() -> Vec<Value> {
         tool(
             "get_agent_settings",
             "Get shopping agent settings",
-            "The AI shopping agent's settings: where it answers (customer hub, website bubble, texts), its name and tone note, your questions and answers, the website pages it reads and how they were read, the monthly conversation cap and this month's use, and whether this server can run it.",
+            "The AI shopping agent's settings: where it answers (customer hub, website bubble, texts, WhatsApp), its name and tone note, your questions and answers, the website pages it reads and how they were read, the monthly conversation cap and this month's use, and whether this server can run it.",
             obj(json!({}), &[]),
             true,
             false,
@@ -73,7 +75,7 @@ fn tools() -> Vec<Value> {
         tool(
             "update_agent_settings",
             "Update shopping agent settings",
-            "Change the shopping agent's settings. Send only what changes; `answers` and `pages` replace their lists. Pages must be on your own website. Turning on `sms` lets it send automatic first answers to people who text you (billed per text like any reply). See dumbmail://docs/agent.",
+            "Change the shopping agent's settings. Send only what changes; `answers` and `pages` replace their lists. Pages must be on your own website. Turning on `sms` or `whatsapp` lets it send automatic first answers to people who write to you (billed per message like any reply). See dumbmail://docs/agent.",
             obj(settings::patch_schema(), &[]),
             false,
             false,
@@ -164,6 +166,7 @@ impl Feature for Module {
         match kind {
             knowledge::FETCH_JOB => Some(knowledge::run_fetch(state, payload).await),
             sms::JOB => Some(sms::run(state, payload).await),
+            whatsapp::JOB => Some(whatsapp::run(state, payload).await),
             _ => None,
         }
     }

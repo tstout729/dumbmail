@@ -15,6 +15,7 @@ export type AgentSettings = {
   hub: boolean;
   site: boolean;
   sms: boolean;
+  whatsapp: boolean;
   name: string;
   tone: string;
   answers: AgentAnswer[];
@@ -30,9 +31,9 @@ export type AgentSettings = {
   website: string | null;
 };
 
-export type AgentSettingsPatch = Partial<Pick<AgentSettings, "hub" | "site" | "sms" | "name" | "tone" | "answers" | "monthly_cap">> & { pages?: string[] };
+export type AgentSettingsPatch = Partial<Pick<AgentSettings, "hub" | "site" | "sms" | "whatsapp" | "name" | "tone" | "answers" | "monthly_cap">> & { pages?: string[] };
 
-export type AgentPlace = "hub" | "site" | "sms" | "test";
+export type AgentPlace = "hub" | "site" | "sms" | "whatsapp" | "test";
 
 export type AgentConversation = {
   id: string;
@@ -47,6 +48,7 @@ export type AgentConversation = {
   person: { id: string; email: string | null; phone_number: string | null; name: string | null } | null;
   last_message: string | null;
   sms_conversation_id: string | null;
+  whatsapp_conversation_id: string | null;
 };
 
 export type AgentConversationList = { data: AgentConversation[]; next_cursor: string | null; handed_off_count: number };

@@ -131,6 +131,11 @@ function Transcript({ id }: { id: string }) {
             Profile
           </ButtonLink>
         ) : null}
+        {d.whatsapp_conversation_id ? (
+          <ButtonLink to={`/inbox/whatsapp/${d.whatsapp_conversation_id}`} size="sm" variant="primary">
+            Reply on WhatsApp
+          </ButtonLink>
+        ) : null}
         {d.sms_conversation_id ? (
           <ButtonLink to={`/inbox/${d.sms_conversation_id}`} size="sm" variant="primary">
             Reply by text

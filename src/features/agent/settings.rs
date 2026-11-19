@@ -39,6 +39,8 @@ pub struct Settings {
     pub site: bool,
     /// First answers to inbound texts.
     pub sms: bool,
+    /// First answers to inbound WhatsApp messages.
+    pub whatsapp: bool,
     /// What the agent calls itself.
     pub name: String,
     /// A short note on how it should sound. It can't change the rules.
@@ -51,7 +53,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { hub: false, site: false, sms: false, name: String::new(), tone: String::new(), answers: Vec::new(), monthly_cap: DEFAULT_MONTHLY_CAP }
+        Settings { hub: false, site: false, sms: false, whatsapp: false, name: String::new(), tone: String::new(), answers: Vec::new(), monthly_cap: DEFAULT_MONTHLY_CAP }
     }
 }
 
@@ -70,6 +72,7 @@ impl Settings {
             "hub" => self.hub,
             "site" => self.site,
             "sms" => self.sms,
+            "whatsapp" => self.whatsapp,
             "test" => true,
             _ => false,
         }
@@ -82,6 +85,7 @@ pub struct Patch {
     pub hub: Option<bool>,
     pub site: Option<bool>,
     pub sms: Option<bool>,
+    pub whatsapp: Option<bool>,
     pub name: Option<String>,
     pub tone: Option<String>,
     pub answers: Option<Vec<Answer>>,
@@ -95,6 +99,7 @@ pub fn patch_schema() -> Value {
         "hub": {"type": "boolean", "description": "Chat panel in the customer hub, for signed-in shoppers"},
         "site": {"type": "boolean", "description": "Chat bubble on your website, for anyone (it never shows anything personal)"},
         "sms": {"type": "boolean", "description": "Answer inbound texts first (a person takes over when it hands off)"},
+        "whatsapp": {"type": "boolean", "description": "Answer inbound WhatsApp messages first (a person takes over when it hands off)"},
         "name": {"type": "string", "maxLength": MAX_NAME, "description": "What the agent calls itself (empty: \"<store> assistant\")"},
         "tone": {"type": "string", "maxLength": MAX_TONE, "description": "A short note on how it should sound. It can't change the agent's rules."},
         "answers": {"type": "array", "maxItems": MAX_ANSWERS, "description": "Questions and answers in your own words (replaces the list)",
@@ -227,6 +232,9 @@ pub async fn update(state: &AppState, ctx: &Ctx, body: Value) -> AppResult<Value
     if let Some(v) = p.sms {
         s.sms = v;
     }
+    if let Some(v) = p.whatsapp {
+        s.whatsapp = v;
+    }
     if let Some(v) = p.name {
         s.name = v;
     }
@@ -251,8 +259,8 @@ pub async fn update(state: &AppState, ctx: &Ctx, body: Value) -> AppResult<Value
         "agent.settings_change",
         None,
         json!({
-            "hub": s.hub, "site": s.site, "sms": s.sms,
-            "was": {"hub": before.hub, "site": before.site, "sms": before.sms},
+            "hub": s.hub, "site": s.site, "sms": s.sms, "whatsapp": s.whatsapp,
+            "was": {"hub": before.hub, "site": before.site, "sms": before.sms, "whatsapp": before.whatsapp},
             "answers": s.answers.len(), "monthly_cap": s.monthly_cap,
             "pages_added": pages.map(|p| p.0), "pages_removed": pages.map(|p| p.1),
         }),

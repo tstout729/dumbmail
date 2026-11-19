@@ -2,11 +2,12 @@
 
 An AI assistant that answers your shoppers' questions ("where's my order?", "do you ship to Canada?", "which jacket is warmer?") from your own information, and hands the conversation to a person when it should.
 
-It can answer in three places. Each is switched on separately in **Settings → Shopping agent**, and all are off until you turn them on:
+It can answer in four places. Each is switched on separately in **Settings → Shopping agent**, and all are off until you turn them on:
 
 - **Customer hub** (`hub`): a chat page inside the customer hub, for shoppers signed in there. A "Chat with …" button shows on their account page.
 - **Website bubble** (`site`): a chat button on your website, added by the DumbMail snippet. Anyone can use it. It never knows who the shopper is and never shows anything personal; for order questions it points to the customer hub's sign-in (when the hub is on) or hands off.
 - **Texts** (`sms`): the first answer to an ordinary text someone sends your number (not STOP, HELP, a keyword or a confirmation). It replaces your default reply while it's on. Its answers are automatic texts: they count toward the inbox's per-person limit and hourly budgets, are billed per text like any reply, and are never sent to someone who opted out.
+- **WhatsApp** (`whatsapp`): the first answer to an ordinary WhatsApp text message to your business number (not STOP, START, a sign-up word or a keyword). Answers go out as free-form WhatsApp replies inside the 24-hour service window, count toward the WhatsApp inbox's 5 automatic answers per person per hour, are billed like any WhatsApp reply, and are sent exactly as written.
 
 The agent needs an Anthropic API key on the server (`ANTHROPIC_API_KEY`). Without one, the settings say it isn't available and nothing answers.
 
@@ -18,7 +19,7 @@ Only these, as tools the server runs:
 - `search_products`: your product catalog (published, verified products), by name, description, brand, category and tag, with price and stock as last synced.
 - `my_orders`: only in a conversation with a verified shopper, and only that shopper's own orders, read through the customer hub's own functions:
   - in the hub, a signed-in shopper sees their orders (items, totals, parcels and tracking) when the hub's Orders section is on and their email came from your own systems (the hub's rule);
-  - by text, someone texting from the number on their profile sees order status and tracking only, when that number (and any email on the profile) came from your own systems: the API, an import, an integration or Shopify, not the website snippet or a form.
+  - by text or WhatsApp, someone writing from the number on their profile sees order status and tracking only, when that number (and any email on the profile) came from your own systems: the API, an import, an integration or Shopify, not the website snippet or a form.
   The tool takes no input: whatever the model asks, it reads the conversation's own person in your account.
 - `hand_off`: marks the conversation for your team with a reason and a short summary.
 
@@ -40,7 +41,7 @@ If the model declines, its answer is cut off, or the service fails, the shopper 
 
 ## Hand-offs and transcripts
 
-Conversations are listed under **Inbox → Shopping agent**, newest first, with hand-offs marked (reason and summary). Once a conversation is handed off, the agent stops answering in it; the shopper's later messages are kept for your team. A handed-off text conversation is reopened in the SMS inbox, where you reply as usual.
+Conversations are listed under **Inbox → Shopping agent**, newest first, with hand-offs marked (reason and summary). Once a conversation is handed off, the agent stops answering in it; the shopper's later messages are kept for your team. A handed-off text or WhatsApp conversation is reopened in its inbox, where you reply as usual.
 
 A conversation with a verified shopper is kept with their profile; website-bubble chats are anonymous. Conversations are deleted 90 days after their last message, and with the person when they're deleted.
 
@@ -66,7 +67,7 @@ Events: `Chatted with Agent` (a verified shopper started a conversation) and `Ag
 
 Settings fields (send only what changes):
 
-- `hub`, `site`, `sms` (booleans): where it answers.
+- `hub`, `site`, `sms`, `whatsapp` (booleans): where it answers.
 - `name` (up to 40 characters), `tone` (up to 300).
 - `answers`: `[{question, answer}]`, up to 100 (questions up to 300 characters, answers up to 2,000). Replaces the list.
 - `pages`: up to 20 page addresses on your website. Replaces the list; new pages are read right away, then weekly. The settings show each page's title, status and any error.

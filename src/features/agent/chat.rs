@@ -55,6 +55,11 @@ pub const HANDED_OFF_METRIC: &str = "Agent Handed Off";
 
 static CALLS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT)));
 
+/// Places where the agent answers a message thread (texts, WhatsApp) rather than a browser chat.
+pub fn messaging(place: &str) -> bool {
+    matches!(place, "sms" | "whatsapp")
+}
+
 /// What `my_orders` may show in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Orders {
@@ -110,6 +115,8 @@ pub struct Start<'a> {
     pub token: Option<&'a str>,
     /// The SMS conversation being answered.
     pub sms_conversation_id: Option<Uuid>,
+    /// The WhatsApp conversation being answered.
+    pub whatsapp_conversation_id: Option<Uuid>,
     pub ip: Option<&'a str>,
 }
 
@@ -176,7 +183,7 @@ pub fn contact(account: &Account, hub: &crate::features::hub::settings::Settings
 
 pub fn handoff_text(account: &Account, contact: Option<&str>, place: &str) -> String {
     match (place, contact) {
-        ("sms", _) => format!("Thanks! A person from {} will reply here soon.", account.name),
+        ("sms" | "whatsapp", _) => format!("Thanks! A person from {} will reply here soon.", account.name),
         (_, Some(c)) => format!("I've passed this to the {} team and a person will follow up. You can also reach them at {c}.", account.name),
         (_, None) => format!("I've passed this to the {} team and a person will follow up.", account.name),
     }
@@ -223,23 +230,28 @@ pub fn system_prompt(account: &Account, s: &Settings, place: &str, orders: Order
         "hub" => "in the store's customer account page",
         "site" => "in a chat window on the store's website",
         "sms" => "by text message",
+        "whatsapp" => "by WhatsApp message",
         _ => "in a test chat the store is running",
     };
     let who = match orders {
         Orders::Full => "The shopper is signed in to their account. my_orders returns their own orders; never discuss anyone else's.".to_string(),
-        Orders::StatusOnly => "The shopper is texting from the number on their account. my_orders returns their own orders' status and tracking only; never discuss anyone else's.".to_string(),
+        Orders::StatusOnly => "The shopper is writing from the number on their account. my_orders returns their own orders' status and tracking only; never discuss anyone else's.".to_string(),
         Orders::Sample => "This is a test with a made-up shopper. my_orders returns a made-up order.".to_string(),
         Orders::None => match (place, hub_url) {
-            ("sms", _) => "You don't know who this shopper is and can't see any orders. For order questions, hand off to the team.".to_string(),
+            ("sms" | "whatsapp", _) => "You don't know who this shopper is and can't see any orders. For order questions, hand off to the team.".to_string(),
             (_, Some(u)) => format!("You don't know who this shopper is and can't see any orders or personal details. For order questions, suggest they sign in at {u} to see their orders and tracking, or offer to hand off."),
             _ => "You don't know who this shopper is and can't see any orders or personal details. For order questions, offer to hand off to the team.".to_string(),
         },
     };
     let prefs = match hub_url {
-        Some(u) if place != "sms" => format!(" They can change their email and text preferences themselves at {u}."),
+        Some(u) if !messaging(place) => format!(" They can change their email and text preferences themselves at {u}."),
         _ => String::new(),
     };
-    let length = if place == "sms" { "Keep answers under 320 characters, in plain text with no formatting or lists." } else { "Keep answers short and plain; use a short list only when it helps." };
+    let length = match place {
+        "sms" => "Keep answers under 320 characters, in plain text with no formatting or lists.",
+        "whatsapp" => "Keep answers under 600 characters, in plain text with no formatting or lists.",
+        _ => "Keep answers short and plain; use a short list only when it helps.",
+    };
     let contact = contact.map(|c| format!(" The team can be reached at {c}.")).unwrap_or_default();
     let mut p = format!(
         "You are {name}, the shopping assistant for {store}. You talk with shoppers {where_}.\n\n\
@@ -272,6 +284,21 @@ struct Conv {
 /// Find the conversation this message continues, if it's still this person's.
 async fn find(state: &AppState, st: &Start<'_>) -> AppResult<Option<Conv>> {
     let row: Option<(Uuid, Option<Uuid>, bool, String, Value)> = match (st.place, st.token, st.sms_conversation_id) {
+        ("whatsapp", _, _) => match st.whatsapp_conversation_id {
+            Some(wa) => {
+                sqlx::query_as(
+                    "SELECT id, profile_id, verified, status, tools FROM agent_conversations
+                     WHERE account_id = $1 AND whatsapp_conversation_id = $2 AND place = 'whatsapp' AND last_message_at > now() - make_interval(hours => $3)
+                     ORDER BY last_message_at DESC LIMIT 1",
+                )
+                .bind(st.account.id)
+                .bind(wa)
+                .bind(SMS_CONVERSATION_HOURS)
+                .fetch_optional(&state.db)
+                .await?
+            }
+            None => None,
+        },
         ("sms", _, Some(sms)) => {
             sqlx::query_as(
                 "SELECT id, profile_id, verified, status, tools FROM agent_conversations
@@ -314,7 +341,7 @@ async fn create(state: &AppState, st: &Start<'_>, s: &Settings) -> AppResult<Res
     let prompt = system_prompt(st.account, s, st.place, st.who.orders, hub_url.as_deref(), contact.as_deref());
     let tools = json!({"orders": st.who.orders.key(), "list": tools_for(st.who.orders)});
     let id = Uuid::now_v7();
-    let token = (st.place != "sms").then(|| crate::auth::random_token(24));
+    let token = (!messaging(st.place)).then(|| crate::auth::random_token(24));
     // Visitors with no readable address share one bucket (the limit never fails open).
     let ip = matches!(st.place, "hub" | "site").then(|| ip_hash(state, st.ip.unwrap_or("unknown")));
     let mut tx = state.db.begin().await?;
@@ -355,8 +382,8 @@ async fn create(state: &AppState, st: &Start<'_>, s: &Settings) -> AppResult<Res
         crate::billing::post_entry_tx(&mut tx, st.account.id, "agent", -price, "Shopping agent conversation", &format!("agent:{id}")).await?;
     }
     sqlx::query(
-        "INSERT INTO agent_conversations (id, account_id, profile_id, place, verified, token_hash, sms_conversation_id, system_prompt, tools, ip_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        "INSERT INTO agent_conversations (id, account_id, profile_id, place, verified, token_hash, sms_conversation_id, system_prompt, tools, ip_hash, whatsapp_conversation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(st.account.id)
@@ -368,6 +395,7 @@ async fn create(state: &AppState, st: &Start<'_>, s: &Settings) -> AppResult<Res
     .bind(&prompt)
     .bind(&tools)
     .bind(&ip)
+    .bind(st.whatsapp_conversation_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -429,7 +457,7 @@ pub async fn say(state: &AppState, st: Start<'_>, message: &str, mut sink: impl 
         note(&state.db, st.account.id, conv.id, "shopper", &message).await?;
         sqlx::query("UPDATE agent_conversations SET last_message_at = now() WHERE id = $1").bind(conv.id).execute(&state.db).await?;
         out.handed_off = true;
-        out.reply = (st.place != "sms").then(|| handoff_text(st.account, contact.as_deref(), st.place));
+        out.reply = (!messaging(st.place)).then(|| handoff_text(st.account, contact.as_deref(), st.place));
         return Ok(out);
     }
     // One message at a time per conversation, within its turn and token caps.
@@ -563,21 +591,29 @@ pub async fn say(state: &AppState, st: Start<'_>, message: &str, mut sink: impl 
 }
 
 /// Mark the conversation for a person: the team sees it with the reason and summary; an SMS
-/// conversation is reopened in the inbox; a known person gets an `Agent Handed Off` event.
+/// or WhatsApp conversation is reopened in its inbox; a known person gets an `Agent Handed Off` event.
 async fn hand_off(state: &AppState, account: &Account, conv: &Conv, place: &str, reason: &str, summary: &str) -> AppResult<()> {
-    let first: Option<Option<Uuid>> = sqlx::query_scalar(
-        "UPDATE agent_conversations SET status = 'handed_off', handoff_reason = $2, handoff_summary = $3, handed_off_at = now() WHERE id = $1 AND status = 'open' RETURNING sms_conversation_id",
+    let first: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "UPDATE agent_conversations SET status = 'handed_off', handoff_reason = $2, handoff_summary = $3, handed_off_at = now() WHERE id = $1 AND status = 'open'
+         RETURNING sms_conversation_id, whatsapp_conversation_id",
     )
     .bind(conv.id)
     .bind(reason)
     .bind(summary.chars().take(500).collect::<String>())
     .fetch_optional(&state.db)
     .await?;
-    let Some(sms) = first else { return Ok(()) };
+    let Some((sms, wa)) = first else { return Ok(()) };
     note(&state.db, account.id, conv.id, "note", &format!("Handed off ({reason}): {summary}")).await?;
     if let Some(sms) = sms {
         sqlx::query("UPDATE sms_conversations SET status = 'open', closed_at = NULL, unread_count = GREATEST(unread_count, 1) WHERE id = $1 AND account_id = $2")
             .bind(sms)
+            .bind(account.id)
+            .execute(&state.db)
+            .await?;
+    }
+    if let Some(wa) = wa {
+        sqlx::query("UPDATE whatsapp_conversations SET status = 'open', closed_at = NULL, unread_count = GREATEST(unread_count, 1) WHERE id = $1 AND account_id = $2")
+            .bind(wa)
             .bind(account.id)
             .execute(&state.db)
             .await?;
