@@ -534,6 +534,8 @@ pub async fn reply(state: &AppState, account_id: Uuid, id: Uuid, b: &ReplyBody, 
         return Err(AppError::bad("Connect WhatsApp in Settings → WhatsApp first"));
     }
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
+    // A reply the account writes waits for its sending review (see features::screening).
+    crate::features::screening::inbox_reply_allowed(state, &account)?;
     let profile = crate::audience::find_profile(&state.db, account_id, &ProfileInput { phone_number: Some(phone.clone()), ..Default::default() })
         .await?
         .filter(|p| p.id == profile_id);

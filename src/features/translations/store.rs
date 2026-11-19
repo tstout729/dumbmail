@@ -180,6 +180,9 @@ pub async fn update<R>(db: &PgPool, account_id: Uuid, t: &Target, scheduled_ok: 
     let mut tx = db.begin().await?;
     let out = update_in(&mut tx, account_id, t, scheduled_ok, f).await?;
     tx.commit().await?;
+    if matches!(t, Target::FlowStep { .. } | Target::SavedBlock { .. }) {
+        crate::features::screening::content_changed(account_id);
+    }
     Ok(out)
 }
 
@@ -226,6 +229,11 @@ pub async fn update_in<R>(tx: &mut PgConnection, account_id: Uuid, t: &Target, s
             let blocks = crate::features::content::saved::check_blocks(l.content.get("blocks").unwrap_or(&Value::Null))?;
             sqlx::query("UPDATE saved_blocks SET blocks = $3, updated_at = now() WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).bind(&blocks).execute(&mut *tx).await?;
         }
+    }
+    // What a live flow or a saved block sends changed outside the editors' checks: sender screening
+    // matches messages to a check again (features::screening).
+    if matches!(t, Target::FlowStep { .. } | Target::SavedBlock { .. }) {
+        crate::features::screening::content_changed(account_id);
     }
     Ok(out)
 }

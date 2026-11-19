@@ -573,6 +573,10 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         crate::deliverability::stop_campaign(&state.db, c.id, &crate::deliverability::paused_message(account.sending_paused_reason.as_deref())).await?;
         return Ok(());
     }
+    // An account that isn't approved to send stops here (see features::screening).
+    if crate::features::screening::stop_if_held(state, &account, &c, ids).await? {
+        return Ok(());
+    }
     let ab = ab_test(&c);
     // A text campaign's short links: the targets its launch set up (features::short_links).
     let short_link_targets = if c.channel == "sms" { crate::features::short_links::send::campaign_targets(&state.db, c.id).await? } else { None };

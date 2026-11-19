@@ -1328,21 +1328,25 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     } else {
                         None
                     };
-                    let out = sending::send(
-                        state,
-                        SendSpec {
-                            account: &account,
-                            profile: &person,
-                            channel: &node.kind,
-                            content: &content,
-                            campaign_id: None,
-                            flow_id: Some(flow.id),
-                            flow_node_id: Some(&node_id),
-                            event: event.as_ref(),
-                            is_test: false,
-                            message_id,
-                            to_override: None,
-                        },
+                    // As part of this run, so a wait is tracked per run and step (features::screening).
+                    let out = crate::features::screening::in_flow_run(
+                        run.id,
+                        sending::send(
+                            state,
+                            SendSpec {
+                                account: &account,
+                                profile: &person,
+                                channel: &node.kind,
+                                content: &content,
+                                campaign_id: None,
+                                flow_id: Some(flow.id),
+                                flow_node_id: Some(&node_id),
+                                event: event.as_ref(),
+                                is_test: false,
+                                message_id,
+                                to_override: None,
+                            },
+                        )
                     )
                     .await;
                     match out {
@@ -1360,7 +1364,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
             // Ask for reviews of the items in the triggering event (see features::reviews).
             "review_request" => {
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
-                if let Some(until) = crate::features::reviews::flow_step(state, &account, &person, &flow, run.id, &node_id, &node.data, &mut context, hours).await? {
+                if let Some(until) = crate::features::screening::in_flow_run(run.id, crate::features::reviews::flow_step(state, &account, &person, &flow, run.id, &node_id, &node.data, &mut context, hours)).await? {
                     wait_until(&state.db, &hold, &node_id, &context, until).await?;
                     return Ok(());
                 }

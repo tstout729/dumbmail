@@ -568,6 +568,8 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     for content in versions {
         render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content, profile_id: None, event: None }).await?;
     }
+    // Sender screening (hosted): the account's first check and the content check (see features::screening).
+    crate::features::screening::before_launch(state, &account, &c).await?;
     // A local-time send starts when the first time zone reaches the hour on the chosen day (recorded in the options).
     let (send_at, dated) = crate::features::sendtime::plan::launch_start(state, &account, &c, send_at).await?;
     if let Some(opts) = dated {
@@ -899,6 +901,8 @@ pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, mut b: Fl
     if let Some(d) = &b.definition {
         check_node_refs(state, account_id, d).await?;
     }
+    // A live flow's new email and text content is checked (see features::screening).
+    crate::features::screening::before_flow_edit(state, account_id, &cur, b.definition.as_ref()).await?;
     // A flow imported for review keeps its review marker whatever the edit sends, and a flow that went live
     // meanwhile still can't take in content needing review (see import_review.rs).
     let row: Option<FlowRow> = sqlx::query_as(
@@ -987,6 +991,8 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
                     .map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
             }
         }
+        // Sender screening (hosted): the account's first check and the steps' content (see features::screening).
+        crate::features::screening::before_flow_live(state, &account, &f).await?;
         // Segment triggers: snapshot current members so only new entrants start the flow.
         if let Ok(flows::Trigger::Segment { segment_id }) = flows::parse_trigger(&f.trigger) {
             super::audience::get_segment(state, account_id, segment_id).await?;
@@ -996,12 +1002,17 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             crate::flows::refresh_segment(state, segment_id).await.map_err(|e| AppError::bad(format!("couldn't refresh the trigger segment: {e}")))?;
         }
     }
-    // Turning live was checked against this version of the flow (review included); an edit meanwhile means check again.
-    let row: Option<FlowRow> = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *")
+    // Turning live was checked against this version of the flow (review and sender screening
+    // included): the statement compares the definition itself too, so anything that changed it
+    // meanwhile, by any path, means check again.
+    let row: Option<FlowRow> = sqlx::query_as(
+        "UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND md5(definition::text) = md5($5::jsonb::text) AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *",
+    )
         .bind(id)
         .bind(status)
         .bind(account_id)
         .bind(f.updated_at)
+        .bind(&f.definition)
         .fetch_optional(&state.db)
         .await?;
     let Some(row) = row else {

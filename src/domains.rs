@@ -137,6 +137,8 @@ async fn used_by_other_account(state: &AppState, account_id: Uuid, domain: &str)
 /// Add a sending domain (or refresh its records if the account already has it). Returns the cleaned name.
 pub async fn add_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<String> {
     let domain = clean_domain(raw)?;
+    // Checked before anything is created with the provider (see features::screening).
+    crate::features::screening::check_domain(state, account_id, &domain, "sending").await?;
     let mf = mail_from_for(&domain);
     // Checked before the transaction: every query inside it must use its one connection.
     if verified_elsewhere(state, account_id, &domain).await? {
@@ -320,6 +322,7 @@ pub async fn set_link_domain(state: &AppState, account_id: Uuid, raw: &str) -> A
     if domain == public_host(state) || state.cfg.shared_link_host().is_some_and(|h| h == domain) {
         return Err(AppError::bad("use a domain you own, like links.yourbrand.com"));
     }
+    crate::features::screening::check_domain(state, account_id, &domain, "link").await?;
     // Active domains are exclusive; an unfinished claim by someone else lapses after 48 hours.
     let holder: Option<(Uuid, String, Option<chrono::DateTime<chrono::Utc>>)> =
         sqlx::query_as("SELECT id, link_domain_status, link_domain_set_at FROM accounts WHERE link_domain = $1 AND id <> $2 LIMIT 1")

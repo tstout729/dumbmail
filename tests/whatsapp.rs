@@ -1404,3 +1404,146 @@ fn content_is_checked_when_saved() {
     assert!(content::parse(&json!({"template_id": null, "body": {"1": "{% coupon_code 'SPRING' %}"}})).unwrap_err().public_message().contains("coupon"));
     assert!(content::parse(&json!("text")).is_err());
 }
+
+// ---------- Sender screening (hosted): WhatsApp follows the standing like texts ----------
+
+macro_rules! wa_screened {
+    () => {{
+        let (m, base) = mock().await;
+        let h = match common::Harness::with(|c| {
+            c.whatsapp.whatsapp_api_base = Some(base.clone());
+            c.screen_senders = true;
+        })
+        .await
+        {
+            Some(h) => h,
+            None => return,
+        };
+        (h, m)
+    }};
+}
+
+async fn set_standing(h: &Harness, s: &str) {
+    sqlx::query("UPDATE accounts SET sending_review = $1").bind(s).execute(&h.state.db).await.unwrap();
+}
+
+/// A live flow with one WhatsApp step, turned on directly (the account's check isn't the point here).
+async fn live_flow_direct(h: &mut Harness, metric: &str, content: Value) {
+    let def = json!({"entry": "w", "nodes": [{"id": "w", "type": "whatsapp", "content": content, "next": null}]});
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": metric, "trigger": {"type": "metric", "metric": metric}, "definition": def}))).await;
+    sqlx::query("UPDATE flows SET status = 'live' WHERE id = $1::uuid").bind(f["id"].as_str().unwrap()).execute(&h.state.db).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pending_account_sends_no_whatsapp_marketing_or_own_replies() {
+    let (mut h, m) = wa_screened!();
+    let acct = setup(&mut h).await;
+    let t = template(&h, "spring_sale").await;
+    let them = daytime_number(901);
+    let p = person(&mut h, &them, None).await;
+    subscribe(&mut h, &p).await;
+    // Campaigns can't go.
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "VIP"}))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/lists/{list}/members"), Some(json!({"profile_ids": [p]}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Sale", "channel": "whatsapp", "audience": {"include": [{"type": "list", "id": list}]}, "content": sale(&t)}))).await;
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // A flow's WhatsApp step waits.
+    live_flow_direct(&mut h, "Joined", sale(&t)).await;
+    trigger(&mut h, "Joined", &them).await;
+    assert!(sends(&m).is_empty());
+    assert_eq!(count(&h, "SELECT count(*) FROM screening_waits").await, 1);
+    // A reply the account writes is refused with the reason; a keyword reply is held at the claim.
+    assert_eq!(hook(&h, &inbound(&them, "wamid.IN1", "Do you ship to Canada?")).await, StatusCode::OK);
+    let cid = h.ok("GET", "/api/whatsapp/conversations", None).await["conversations"][0]["id"].as_str().unwrap().to_string();
+    let (s, v) = h.req("POST", &format!("/api/whatsapp/conversations/{cid}/reply"), Some(json!({"text": "Yes we do!", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("Not sent"), "{v}");
+    let pid: Uuid = p.parse().unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    let mid = dumbmail::features::whatsapp::send::prepare_conversational(&mut tx, acct, pid, &them, "keyword_reply", None, "Here's 20% off!", None).await.unwrap();
+    tx.commit().await.unwrap();
+    let out = dumbmail::features::whatsapp::send::hand_off(&h.state, mid, false).await.unwrap();
+    assert!(matches!(out, dumbmail::sending::Outcome::Skipped("account not approved")), "{out:?}");
+    // Tests to a team member's verified number still go.
+    verify_tester(&mut h, TEST_NUMBER).await;
+    let order_t = template(&h, "order_update").await;
+    let content = json!({"template_id": order_t, "header": "A-1", "body": {"1": "Sam", "2": "A-1"}, "buttons": {"0": "A-1"}});
+    let out = h.ok("POST", "/api/whatsapp/test", Some(json!({"to": TEST_NUMBER, "content": content}))).await;
+    assert_eq!(out["sent"], true, "{out}");
+    assert_eq!(sends(&m).len(), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_blocked_account_sends_no_whatsapp_at_all() {
+    let (mut h, m) = wa_screened!();
+    let acct = setup(&mut h).await;
+    verify_tester(&mut h, TEST_NUMBER).await;
+    let t = template(&h, "spring_sale").await;
+    let them = daytime_number(902);
+    let p = person(&mut h, &them, None).await;
+    subscribe(&mut h, &p).await;
+    live_flow_direct(&mut h, "Joined", sale(&t)).await;
+    set_standing(&h, "blocked").await;
+    trigger(&mut h, "Joined", &them).await;
+    assert_eq!(messages_to(&h, &them).await, vec![("skipped".to_string(), Some("account blocked".to_string()))]);
+    let order_t = template(&h, "order_update").await;
+    let content = json!({"template_id": order_t, "header": "A-1", "body": {"1": "Sam", "2": "A-1"}, "buttons": {"0": "A-1"}});
+    let (s, _) = h.req("POST", "/api/whatsapp/test", Some(json!({"to": TEST_NUMBER, "content": content}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "no tests either");
+    // The final claim reads the standing again: a reply stored earlier doesn't go.
+    let pid: Uuid = p.parse().unwrap();
+    sqlx::query("UPDATE whatsapp_contacts SET last_inbound_at = now() WHERE phone_number = $1").bind(&them).execute(&h.state.db).await.unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    let mid = dumbmail::features::whatsapp::send::prepare_conversational(&mut tx, acct, pid, &them, "reply", None, "Hi again", None).await.unwrap();
+    tx.commit().await.unwrap();
+    let out = dumbmail::features::whatsapp::send::hand_off(&h.state, mid, false).await.unwrap();
+    assert!(matches!(out, dumbmail::sending::Outcome::Skipped("account blocked")), "{out:?}");
+    assert!(sends(&m).iter().all(|(to, _)| to == TEST_NUMBER) && sends(&m).len() <= 1, "only the tester's verification answer, if any");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn whatsapp_template_text_is_screened() {
+    let (mut h, m) = wa_screened!();
+    setup(&mut h).await;
+    set_standing(&h, "approved").await;
+    let t = template(&h, "spring_sale").await;
+    let them = daytime_number(903);
+    let p = person(&mut h, &them, None).await;
+    subscribe(&mut h, &p).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "VIP"}))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/lists/{list}/members"), Some(json!({"profile_ids": [p]}))).await;
+    // The filled-in template asks people to sign in at someone else's site: the rules refuse it.
+    let content = json!({"template_id": t, "body": {"1": "Unusual sign-in. Verify your account at https://login.evil-site.test now"}});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Phish", "channel": "whatsapp", "audience": {"include": [{"type": "list", "id": list}]}, "content": content}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("can't be sent"), "{v}");
+    assert!(sends(&m).is_empty());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn whatsapp_buttons_and_their_urls_are_screened() {
+    let (mut h, m) = wa_screened!();
+    setup(&mut h).await;
+    set_standing(&h, "approved").await;
+    let them = daytime_number(904);
+    let p = person(&mut h, &them, None).await;
+    subscribe(&mut h, &p).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "VIP"}))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/lists/{list}/members"), Some(json!({"profile_ids": [p]}))).await;
+    let order_t = template(&h, "order_update").await;
+    // The words ask people to sign in, and the only link is the template's button (shop.test, not the account's own).
+    let content = json!({"template_id": order_t, "header": "A-1", "body": {"1": "Sam, unusual sign-in. Verify your account", "2": "A-1"}, "buttons": {"0": "A-1"}});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Track", "channel": "whatsapp", "audience": {"include": [{"type": "list", "id": list}]}, "content": content}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("can't be sent"), "{v}");
+    let domains: Value = sqlx::query_scalar("SELECT signals->'link_domains' FROM screenings WHERE kind = 'content' ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert!(domains.to_string().contains("shop.test"), "the button's address was judged: {domains}");
+    assert!(sends(&m).is_empty());
+    h.cleanup().await;
+}

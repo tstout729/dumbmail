@@ -1864,3 +1864,36 @@ async fn a_refused_registration_creates_nobody() {
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'new1@x.test'").await, 1);
     h.cleanup().await;
 }
+
+/// Sender screening (hosted): a blocked account sends no push, even one already past the early
+/// checks; the final claim reads the account's standing again.
+#[tokio::test]
+async fn a_blocked_account_sends_no_push() {
+    let (m, base) = mock().await;
+    let b = base.clone();
+    let Some(mut h) = Harness::with(move |c| {
+        c.push_api_base = Some(b);
+        c.screen_senders = true;
+    })
+    .await
+    else {
+        return;
+    };
+    let a = setup(&mut h).await;
+    sqlx::query("UPDATE accounts SET sending_review = 'approved' WHERE id = $1").bind(a.id).execute(&h.state.db).await.unwrap();
+    let l = list(&mut h, "L").await;
+    let p = person(&mut h, &l, "p@x.test", "P").await;
+    enroll(&h, &a, &browser(&base, "p1"), "p@x.test").await;
+    let cid = push_campaign(&mut h, &l, json!({"title": "One"})).await;
+    let pause = send::hook::Pause::hold(a.id);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let task = drain_in_background(&h);
+    pause.arrived().await;
+    sqlx::query("UPDATE accounts SET sending_review = 'blocked' WHERE id = $1").bind(a.id).execute(&h.state.db).await.unwrap();
+    pause.release(a.id);
+    task.await.unwrap();
+    assert!(m.hits("/webpush/p1").is_empty());
+    let (mid, _, _) = message_of(&h, p).await;
+    assert_eq!(delivery_of(&h, mid).await.1.as_deref(), Some("account blocked"));
+    h.cleanup().await;
+}

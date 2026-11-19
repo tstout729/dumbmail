@@ -45,7 +45,7 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const PER_URL: Duration = Duration::from_secs(6);
 pub const GMAIL_CLIP_BYTES: usize = 102 * 1024;
 pub const HEAVY_IMAGE_BYTES: u64 = 1024 * 1024;
-const SHORTENERS: [&str; 14] = ["bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at", "tiny.cc", "rb.gy", "t.ly", "bl.ink"];
+pub const SHORTENERS: [&str; 14] = ["bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at", "tiny.cc", "rb.gy", "t.ly", "bl.ink"];
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]

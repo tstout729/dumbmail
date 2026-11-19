@@ -115,6 +115,11 @@ pub async fn send(state: &AppState, spec: &SendSpec<'_>, strict: bool) -> AppRes
     let Some(phone) = raw.and_then(normalize_phone) else {
         return early(state, spec, "no phone number", "That isn't a phone number (use +15035550100)").await;
     };
+    // Sender screening (hosted): an account not yet approved waits or is skipped, as for texts; an
+    // approved account's flow content must have passed (see features::screening).
+    if let Some(out) = crate::features::screening::send_gate(state, spec, &phone, None).await? {
+        return Ok(out);
+    }
     // A message already handled (a flow step run again) is never sent again.
     if let Some(mid) = spec.message_id {
         let st: Option<(String, Option<DateTime<Utc>>)> =
@@ -291,6 +296,12 @@ struct ClaimRow {
     /// failure Meta reported later is free; retries are capped (`RETRY_WAITS`), and each one costs the
     /// customer Meta's own fee, so a forged failure status gains nothing.
     charged: bool,
+    /// What it says (for sender screening's check of the account's own words).
+    #[sqlx(default)]
+    wa_body: Option<String>,
+    /// The account's sending review now ('approved' where screening is off).
+    #[sqlx(default)]
+    standing: String,
 }
 
 const CLAIM_SQL: &str = "SELECT m.account_id, m.status, m.to_address, m.campaign_id, m.flow_id, m.is_test, a.closed_at IS NOT NULL AS closed,
@@ -303,7 +314,7 @@ const CLAIM_SQL: &str = "SELECT m.account_id, m.status, m.to_address, m.campaign
         EXISTS (SELECT 1 FROM whatsapp_test_numbers tn JOIN memberships mb ON mb.user_id = tn.user_id AND mb.account_id = tn.account_id
                 WHERE tn.account_id = m.account_id AND tn.phone_number = m.to_address AND tn.verified_at IS NOT NULL) AS tester,
         (SELECT max(b.until) FROM whatsapp_backoff b WHERE b.account_id = m.account_id AND b.scope IN ('sender', 'pair:' || m.to_address)) AS backoff_until,
-        w.charged_at IS NOT NULL AS charged
+        w.charged_at IS NOT NULL AS charged, w.body AS wa_body, {STANDING} AS standing
      FROM messages m JOIN accounts a ON a.id = m.account_id JOIN whatsapp_sent w ON w.message_id = m.id
      LEFT JOIN profiles p ON p.id = m.profile_id
      LEFT JOIN whatsapp_templates t ON t.id = w.template_id
@@ -419,10 +430,18 @@ async fn claim(state: &AppState, message_id: Uuid, strict: bool) -> AppResult<Re
         Some(c) => sqlx::query_scalar("SELECT status FROM campaigns WHERE id = $1 FOR SHARE").bind(c).fetch_optional(&mut *tx).await?,
         None => None,
     };
-    let Some(r) = sqlx::query_as::<_, ClaimRow>(CLAIM_SQL).bind(message_id).fetch_optional(&mut *tx).await? else {
+    let sql = CLAIM_SQL.replace("{STANDING}", &crate::features::screening::standing_sql(state, "a"));
+    let Some(r) = sqlx::query_as::<_, ClaimRow>(&sql).bind(message_id).fetch_optional(&mut *tx).await? else {
         return Ok(Err(Stop::Skip("message deleted")));
     };
     let stop = if r.to_address != to { Some(Stop::Skip("phone number changed")) } else { decide(&r, &account, sender, campaign.as_deref(), strict, Utc::now()) };
+    // The account's sending review now (see features::screening), read in this claim's statement.
+    let stop = stop.or_else(|| {
+        crate::features::screening::whatsapp_stop(&r.standing, &r.kind, r.is_test, r.campaign_id.is_some(), r.flow_id.is_some(), r.wa_body.as_deref().unwrap_or("")).map(|f| match f {
+            crate::features::screening::FinalStop::Skip(why) => Stop::Skip(why),
+            crate::features::screening::FinalStop::Defer(until) => Stop::Defer(until),
+        })
+    });
     let stop = match stop {
         None => {
             // Hold the credit for it (released if it doesn't go out).
@@ -818,6 +837,8 @@ mod tests {
             tester: false,
             backoff_until: None,
             charged: false,
+            wa_body: None,
+            standing: "approved".into(),
         }
     }
 
@@ -849,6 +870,7 @@ mod tests {
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),
             verified_domains: Vec::new(),
+            sending_review: None,
         }
     }
 

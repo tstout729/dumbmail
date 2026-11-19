@@ -47,6 +47,11 @@ pub struct Account {
     #[serde(skip)]
     #[sqlx(default)]
     pub verified_domains: Vec<String>,
+    /// Sender screening standing (`pending`, `approved`, `review`, `blocked`; see
+    /// `features::screening`). None reads as approved.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub sending_review: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

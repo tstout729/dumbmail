@@ -87,6 +87,8 @@ impl Harness {
             google_redirect_base: None,
             anthropic_api_key: None,
             anthropic_api_base: None,
+            // Sender screening holds a new account's sends until it's approved; tests/screening.rs turns it on.
+            screen_senders: false,
             translation_daily_chars: 200_000,
             price_translation_per_1000_chars: 0.0,
             meta_app_id: None,

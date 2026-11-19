@@ -28,7 +28,9 @@ pub async fn test_send(state: &AppState, ctx: &Ctx, campaign_id: Uuid, to: &[Str
     // An archived campaign sends nothing, tests included (see `campaigns_plus::tags`).
     crate::features::campaigns_plus::tags::refuse_if_archived(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, ctx.account_id, campaign_id).await?;
     let account = campaigns::load_account(&state.db, ctx.account_id).await?;
-    let restricted = !ctx.can(Perm::CampaignSend);
+    // An account not yet approved to send tests only to its members, whatever the role (see features::screening).
+    let screened = crate::features::screening::tests_only_to_members(state, &account, &c.channel)?;
+    let restricted = !ctx.can(Perm::CampaignSend) || screened;
     let mut to: Vec<String> = to.to_vec();
     if restricted {
         if c.channel != "email" {
@@ -41,7 +43,8 @@ pub async fn test_send(state: &AppState, ctx: &Ctx, campaign_id: Uuid, to: &[Str
             .fetch_all(&state.db)
             .await?;
         if let Some(outsider) = to.iter().find(|a| !members.contains(a)) {
-            return Err(AppError::Forbidden(format!("your role can send tests only to team members' email addresses, and {outsider} isn't one")));
+            let who = if screened { "until your account is approved to send, tests go" } else { "your role can send tests" };
+            return Err(AppError::Forbidden(format!("{who} only to team members' email addresses, and {outsider} isn't one")));
         }
     }
     let mut sent = 0;

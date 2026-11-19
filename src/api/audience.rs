@@ -291,15 +291,21 @@ pub struct ImportBody {
     /// hosted service unless the whole file is imported as unsubscribed).
     #[serde(default)]
     pub permission_confirmed: bool,
+    /// The uploaded file's name, checked with the file on the hosted service (see features::screening).
+    #[serde(default)]
+    pub file_name: Option<String>,
 }
 
 pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> AppResult<Value> {
-    let as_unsubscribed = b.email_consent.as_deref() == Some("unsubscribed");
+    // A suppression file: everyone in it is unsubscribed, and it subscribes nobody on any channel.
+    let as_unsubscribed = b.email_consent.as_deref() == Some("unsubscribed") && b.sms_consent.as_deref() != Some("subscribed");
     if state.cfg.hosted && !as_unsubscribed && !b.permission_confirmed {
         return Err(AppError::bad(
             "Confirm that everyone in this file agreed to get email from you (permission_confirmed: true). Bought, rented or scraped lists aren't allowed.",
         ));
     }
+    // Checked before anything is written (see features::screening).
+    crate::features::screening::check_import(state, account_id, &b.csv, b.file_name.as_deref(), as_unsubscribed).await?;
     match b.list_id {
         Some(l) => core::list_belongs(&state.db, account_id, l).await?,
         // No list chosen: keep imports together so the first campaign has an obvious audience.

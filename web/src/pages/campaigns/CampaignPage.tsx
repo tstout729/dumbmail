@@ -51,6 +51,7 @@ import { SendOptionsPanel, localTimeNote } from "../../features/sendtime/SendOpt
 import { clockLabel, sendOptionsOf, timingLabel } from "../../features/sendtime/options";
 import type { SendOptions } from "../../features/sendtime/types";
 import { ChannelIcon } from "./CampaignsPage";
+import { SendingReviewNotice } from "../../features/screening/SendingReviewNotice";
 
 export function CampaignPage() {
   const { id = "" } = useParams();
@@ -345,6 +346,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
         <Step index={4} title="Review & send" open={open === 4} onToggle={() => setOpen(open === 4 ? null : 4)} summary={ready ? "Ready to send" : "A few things left"} done={ready && campaign.status === "scheduled"}>
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
+              {campaign.channel !== "push" && editable ? <SendingReviewNotice campaignId={campaign.id} checking={send.isPending || schedule.isPending} /> : null}
               <ul className="space-y-2">
                 {checks.map((c) => (
                   <li key={c.label} className="flex items-start gap-2 text-sm">

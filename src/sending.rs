@@ -288,6 +288,12 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     };
     let Some(to) = to else { return Ok(Outcome::Skipped("no address")) };
 
+    // An account not yet approved to send (see features::screening): campaign messages skipped,
+    // flow messages wait (also while an engagement pause has it in review). Approved accounts pay
+    // no query here unless the message is a flow's (its content is matched to a check).
+    if let Some(out) = crate::features::screening::send_gate(state, &spec, &to, conversational.map(|c| c.kind)).await? {
+        return Ok(out);
+    }
     // A paused account sends no email (see `deliverability`). Tests say why; real sends keep a
     // skipped message row with the reason instead of disappearing.
     if spec.channel == "email" && spec.account.sending_paused_at.is_some() {
@@ -516,7 +522,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     let stop = match &rendered {
         Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational, strict).await?,
         Rendered::Email(_) if !spec.is_test => last_check(state, &spec, p.id, message_id, &to, strict).await?,
-        Rendered::Email(_) => None,
+        // A test email's own last check: who it may reach while the account isn't approved.
+        Rendered::Email(_) => crate::features::screening::test_email_stop(state, &spec, &to).await?.map(|why| Stop::Skip(why, None)),
     };
     if let Some(stop) = stop {
         if limited {
@@ -646,18 +653,19 @@ enum Stop {
 /// consent and suppression for the channel, the account's email pause, the campaign's status, and for
 /// texts the whole quiet-hours decision. None: send it.
 async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, message_id: Uuid, to: &str, strict: bool) -> AppResult<Option<Stop>> {
-    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, bool, Option<String>, bool);
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, bool, Option<String>, bool, String);
     let (account, channel, campaign_id) = (spec.account, spec.channel, spec.campaign_id);
     let row: Option<Row> = sqlx::query_as(&format!(
         "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
                 CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
                 (SELECT c.status FROM campaigns c WHERE c.id = $2),
-                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, CASE WHEN $5 THEN p.marketing_hold ELSE {} END, {}, {}
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, CASE WHEN $5 THEN p.marketing_hold ELSE {} END, {}, {}, {}
          FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE p.id = $1",
         crate::marketing_hold::blocks_email_sql("$4"),
         crate::features::campaigns_plus::resend::HANDOFF_COLUMNS,
-        crate::features::reviews::requests::answered_sql("$5", "$6")
+        crate::features::reviews::requests::answered_sql("$5", "$6"),
+        crate::features::screening::standing_sql(state, "a")
     ))
     .bind(profile_id)
     .bind(campaign_id)
@@ -667,9 +675,14 @@ async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, mes
     .bind(message_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, held, resend, original_to, answered)) = row else {
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, held, resend, original_to, answered, standing)) = row else {
         return Ok(Some(Stop::Skip("profile deleted", None)));
     };
+    // The account's standing now (see features::screening), before the pause: a flow email of an
+    // account in review waits rather than being skipped.
+    if let Some(f) = crate::features::screening::final_stop(&standing, spec, None) {
+        return Ok(Some(screening_stop(f)));
+    }
     if answered {
         return Ok(Some(Stop::Skip(crate::features::reviews::requests::ANSWERED, None)));
     }
@@ -704,6 +717,13 @@ async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, mes
     Ok(marketing_text_stop(account, &sms_consent, phone.as_deref(), props.as_ref(), start, end, conflict.as_deref()))
 }
 
+fn screening_stop(f: crate::features::screening::FinalStop) -> Stop {
+    match f {
+        crate::features::screening::FinalStop::Skip(why) => Stop::Skip(why, None),
+        crate::features::screening::FinalStop::Defer(until) => Stop::Defer(until),
+    }
+}
+
 /// A marketing text's consent and the whole quiet-hours decision, from the current row.
 fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>, props: Option<&Value>, start: Option<i32>, end: Option<i32>, conflict: Option<&str>) -> Option<Stop> {
     if sms_consent != "subscribed" || phone.is_none() {
@@ -725,25 +745,26 @@ fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>
 /// (`queued`/`sending` → `sending`); if not, it's marked skipped unless something else already
 /// settled it. None: claimed, send it.
 async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>, strict: bool) -> AppResult<Option<Stop>> {
-    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool, bool, bool);
+    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool, bool, bool, String);
     let account = spec.account;
     let mut tx = state.db.begin().await?;
     crate::features::inbox::store::lock_number(&mut tx, account.id, to).await?;
     let ours = conversational.map(|_| from);
     // The account row is held (shared) until the claim commits, so an account closing right now
     // either finishes first (and this sees it) or waits for this claim.
-    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed, held, answered): Row = sqlx::query_as(&format!(
+    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed, held, answered, standing): Row = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = a.id AND o.phone_number = $3),
                 p.sms_consent, p.phone_number, p.properties, (SELECT c.status FROM campaigns c WHERE c.id = $4),
                 ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict,
                 $5::text IS NOT NULL AND (a.sms_from = $5 OR EXISTS (SELECT 1 FROM phone_numbers n WHERE n.account_id = a.id AND n.phone_number = $5 AND n.status IN ('verified', 'active'))),
                 (SELECT max(i.provider_received_at) FROM sms_inbound i
                   WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {}),
-                a.closed_at IS NOT NULL, $6 AND COALESCE(p.marketing_hold, false), {}
+                a.closed_at IS NOT NULL, $6 AND COALESCE(p.marketing_hold, false), {}, {}
          FROM accounts a LEFT JOIN profiles p ON p.id = $2 AND p.account_id = a.id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE a.id = $1 FOR SHARE OF a",
         crate::features::inbox::store::NO_WINDOW_KINDS,
-        crate::features::reviews::requests::answered_sql("$6", "$7")
+        crate::features::reviews::requests::answered_sql("$6", "$7"),
+        crate::features::screening::standing_sql(state, "a")
     ))
     .bind(account.id)
     .bind(spec.profile.id)
@@ -765,6 +786,9 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
         Some(Stop::Skip(crate::features::reviews::requests::ANSWERED, None))
     } else if held {
         Some(Stop::Skip(crate::marketing_hold::SKIP_REASON, None))
+    } else if let Some(f) = crate::features::screening::final_stop(&standing, spec, conversational.map(|c| c.kind)) {
+        // The account's standing now (see features::screening).
+        Some(screening_stop(f))
     } else if !spec.is_test && spec.campaign_id.is_some() && campaign.as_deref() != Some("sending") {
         Some(Stop::Skip(if matches!(campaign.as_deref(), Some("cancelled") | None) { "campaign cancelled" } else { "campaign stopped" }, None))
     } else if let Some(c) = conversational {
@@ -848,6 +872,7 @@ mod tests {
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),
             verified_domains: Vec::new(),
+            sending_review: None,
         }
     }
 }

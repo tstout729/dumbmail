@@ -866,3 +866,32 @@ async fn settings_need_permissions_are_checked_and_audited() {
     assert!(js.contains("var C = null;"));
     h.cleanup().await;
 }
+
+/// Sender screening (hosted): a pending account's sign-in codes go (transactional, to a person who
+/// asked); a blocked account sends none, also when the block lands after the code was asked for.
+#[tokio::test]
+async fn a_blocked_account_sends_no_sign_in_code() {
+    let Some(mut h) = Harness::with(|c| c.screen_senders = true).await else { return };
+    let (account, key) = setup(&mut h).await;
+    let standing: String = sqlx::query_scalar("SELECT sending_review FROM accounts WHERE id = $1").bind(account).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(standing, "pending");
+    let mut b = Browser::default();
+    h.state.email.clear_sent();
+    ask_code(&h, &key, &mut b, "alice@example.com").await;
+    assert!(code_sent_to(&h, "alice@example.com").is_some(), "a pending account still sends codes");
+    // Blocked before the code is asked for: none is written or sent.
+    sqlx::query("UPDATE accounts SET sending_review = 'blocked' WHERE id = $1").bind(account).execute(&h.state.db).await.unwrap();
+    h.state.email.clear_sent();
+    let (s, body) = ask_code(&h, &key, &mut b, "bob@example.com").await;
+    assert!(s == StatusCode::OK && body.contains("If we have"), "the same answer either way");
+    assert!(h.state.email.sent().is_empty());
+    // Blocked after it was asked for, before the send job ran: the last check stops it.
+    sqlx::query("UPDATE accounts SET sending_review = 'approved' WHERE id = $1").bind(account).execute(&h.state.db).await.unwrap();
+    sqlx::query("DELETE FROM hub_codes").execute(&h.state.db).await.unwrap();
+    let t = token(&b.page(&h, &key).await);
+    b.go(&h, "POST", &format!("/hub/{key}/code"), Some(&format!("t={t}&email=alice%40example.com"))).await;
+    sqlx::query("UPDATE accounts SET sending_review = 'blocked' WHERE id = $1").bind(account).execute(&h.state.db).await.unwrap();
+    h.drain().await;
+    assert!(h.state.email.sent().is_empty());
+    h.cleanup().await;
+}

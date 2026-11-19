@@ -189,6 +189,10 @@ pub struct Config {
     /// `http://localhost:…` is ignored: the key only ever goes to https://api.anthropic.com.
     #[arg(skip)]
     pub anthropic_api_base: Option<String>,
+    /// Sender screening on the hosted service (see `features::screening`): always on in the
+    /// server; only the shared test harness turns it off, for tests of other features.
+    #[arg(skip = true)]
+    pub screen_senders: bool,
     /// Most characters one account may send for machine translation per day (its time zone).
     #[arg(long, env = "TRANSLATION_DAILY_CHARS", default_value_t = 200_000)]
     pub translation_daily_chars: i64,

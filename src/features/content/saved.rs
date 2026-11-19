@@ -273,6 +273,8 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, b: Input) -> A
                 problems.join("; ")
             )));
         }
+        // Live flows that use it are checked with the new version first (see features::screening).
+        crate::features::screening::before_saved_block_edit(state, account_id, id, blocks).await?;
     }
     let row: Option<SavedBlock> = sqlx::query_as(
         "UPDATE saved_blocks SET name = COALESCE($3, name), blocks = COALESCE($4, blocks), updated_at = now()
@@ -286,6 +288,8 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, b: Input) -> A
     .await
     .map_err(|e| name_taken(e.into()))?;
     let row = row.ok_or_else(|| AppError::not_found("saved block"))?;
+    // Flow messages that use it are matched to a check again (see features::screening).
+    crate::features::screening::content_changed(account_id);
     let mut v = serde_json::to_value(&row)?;
     v["used_in"] = usage(state, account_id, id).await?["data"].clone();
     Ok(v)
