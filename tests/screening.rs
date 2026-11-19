@@ -707,11 +707,21 @@ async fn item1_inbox_texts_the_account_writes_wait_for_approval() {
         let out = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &body), &conv(kind)).await.unwrap();
         assert!(matches!(out, Outcome::Skipped("account not approved")), "{kind}: {out:?}");
     }
-    // DumbMail's fixed compliance texts aren't held by the standing.
+    // DumbMail's fixed compliance texts aren't held by the standing (a confirmation only in its
+    // default wording).
+    let fixed = json!({"body": "Acme VIP: Thanks! You're signed up for texts. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."});
     for kind in ["help", "confirmation", "optin_request"] {
-        let out = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &body), &conv(kind)).await;
+        let out = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &fixed), &conv(kind)).await;
         assert!(!matches!(out, Ok(Outcome::Skipped("account not approved" | "account blocked"))), "{kind}: {out:?}");
     }
+    let out = dumbmail::sending::send_conversational(&h.state, spec(&a, &p, "sms", &body), &conv("confirmation")).await.unwrap();
+    assert!(matches!(out, Outcome::Skipped("account not approved")), "a keyword's own words aren't fixed wording: {out:?}");
+    // While blocked nothing goes, compliance texts included.
+    set_standing(&h, "blocked").await;
+    let blocked = snapshot(&h, "blocked").await;
+    let out = dumbmail::sending::send_conversational(&h.state, spec(&blocked, &p, "sms", &fixed), &conv("help")).await.unwrap();
+    assert!(matches!(out, Outcome::Skipped("account blocked")), "{out:?}");
+    set_standing(&h, "pending").await;
     // The final claim reads the standing again: an approved snapshot doesn't let a keyword reply through.
     let stale = snapshot(&h, "approved").await;
     let out = dumbmail::sending::send_conversational(&h.state, spec(&stale, &p, "sms", &body), &conv("keyword_reply")).await.unwrap();

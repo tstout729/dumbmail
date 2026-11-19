@@ -63,9 +63,20 @@ pub const JOB: &str = "screening_content_check";
 static ANCHOR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?is)<a\s[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap());
 static BARE_URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>"')]+"#).unwrap());
 
-/// Fields whose words people read, and fields that hold where a link goes.
-const TEXT_KEYS: &[&str] = &["text", "html", "heading", "title", "subtitle", "alt", "button_text", "author", "caption", "label", "quote", "description"];
-const LINK_KEYS: &[&str] = &["href", "url", "button_href", "logo_href", "link"];
+/// Fields that never show as words: a block's kind and ids, layout and colours, display rules.
+/// Every other string a block holds is read (as text, or as a link when it's a web address), so a
+/// new kind of block or field can't slip past the check.
+const NOT_SHOWN: &[&str] = &[
+    "type", "id", "k", "key", "saved_block_id", "name", "color", "colour", "background", "background_color", "bg", "text_color", "button_color", "link_color", "border",
+    "border_color", "align", "width", "height", "padding", "margin", "font", "font_family", "font_size", "font_weight", "size", "style", "radius", "layout", "variant",
+    "display", "rules", "condition", "conditions", "spacing", "weight", "icon", "network", "ratio", "position", "format", "theme", "coupon", "coupon_id", "product_id",
+    "list_id", "segment_id", "metric", "channel", "currency", "locale", "lang", "src", "image", "logo", "thumbnail", "image_url", "video_thumbnail",
+];
+
+fn shown(s: &str) -> bool {
+    static NOISE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(#[0-9a-fA-F]{3,8}|[0-9.]+(px|%|em|rem)?|true|false)$").unwrap());
+    !s.trim().is_empty() && !NOISE.is_match(s.trim())
+}
 
 fn host(u: &str) -> Option<String> {
     url::Url::parse(u.trim()).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
@@ -97,25 +108,38 @@ impl Collected {
         for c in ANCHOR.captures_iter(html) {
             self.links.push((fetch::visible_text(&c[2], 120), c[1].replace("&amp;", "&")));
         }
-        self.text.push(fetch::visible_text(html, usize::MAX));
+        let text = fetch::visible_text(html, usize::MAX);
+        // Addresses written out in the text (email apps make them links).
+        for m in BARE_URL.find_iter(&text) {
+            self.links.push((String::new(), m.as_str().to_string()));
+        }
+        self.text.push(text);
     }
 
-    /// Every block's words and links, whatever its display rules, template conditions included.
-    fn walk(&mut self, v: &Value) {
+    /// One string a block holds: a web address is a link (with the block's own words as its
+    /// text), anything else is text.
+    fn string(&mut self, s: &str, link_text: &str) {
+        let t = s.trim();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            self.links.push((fetch::visible_text(link_text, 120), t.to_string()));
+        } else if shown(t) {
+            self.html(t);
+        }
+    }
+
+    /// Every string a block holds, whatever its display rules, template conditions included: text
+    /// fields, table cells, captions, links. Only fields that never show as words are left out.
+    fn walk(&mut self, v: &Value, link_text: &str) {
         match v {
-            Value::Array(a) => a.iter().for_each(|x| self.walk(x)),
+            Value::String(s) => self.string(s, link_text),
+            Value::Array(a) => a.iter().for_each(|x| self.walk(x, link_text)),
             Value::Object(o) => {
-                let link_text = o.get("text").or_else(|| o.get("button_text")).or_else(|| o.get("title")).and_then(|t| t.as_str()).unwrap_or("");
+                let own_text = o.get("text").or_else(|| o.get("button_text")).or_else(|| o.get("title")).or_else(|| o.get("alt")).and_then(|t| t.as_str()).unwrap_or(link_text);
                 for (k, x) in o {
-                    if k.starts_with('_') || k == "i18n" || k == "translations" {
+                    if k.starts_with('_') || k == "i18n" || k == "translations" || NOT_SHOWN.contains(&k.as_str()) {
                         continue;
                     }
-                    match (k.as_str(), x) {
-                        (k, Value::String(s)) if TEXT_KEYS.contains(&k) => self.html(s),
-                        (k, Value::String(s)) if LINK_KEYS.contains(&k) && !s.trim().is_empty() => self.links.push((fetch::visible_text(link_text, 120), s.clone())),
-                        (_, Value::Array(_) | Value::Object(_)) => self.walk(x),
-                        _ => {}
-                    }
+                    self.walk(x, own_text);
                 }
             }
             _ => {}
@@ -142,7 +166,7 @@ fn variant(channel: &str, c: &Value, label: &str, language: &str) -> (Value, boo
             col.html(h);
         }
         if let Some(b) = c.get("blocks") {
-            col.walk(b);
+            col.walk(b, "");
         }
         (c["subject"].as_str().unwrap_or("").to_string(), c["preheader"].as_str().unwrap_or("").to_string())
     };
@@ -168,24 +192,26 @@ fn part_hash(v: &Value) -> String {
     hex::encode(Sha256::digest(serde_json::to_vec(&core).unwrap_or_default()))
 }
 
+/// The saved blocks `content` uses.
+fn collect_saved_ids(v: &Value, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| collect_saved_ids(x, out)),
+        Value::Object(o) => {
+            if o.get("type").and_then(|t| t.as_str()) == Some("saved") {
+                if let Some(id) = o.get("saved_block_id").and_then(|i| i.as_str()) {
+                    out.insert(id.to_string());
+                }
+            }
+            o.values().for_each(|x| collect_saved_ids(x, out));
+        }
+        _ => {}
+    }
+}
+
 /// `content` with every saved block it uses swapped for that block's current content.
 async fn with_saved_blocks(state: &AppState, account_id: Uuid, content: &Value) -> AppResult<Value> {
     let mut ids = BTreeSet::new();
-    fn find(v: &Value, out: &mut BTreeSet<String>) {
-        match v {
-            Value::Array(a) => a.iter().for_each(|x| find(x, out)),
-            Value::Object(o) => {
-                if o.get("type").and_then(|t| t.as_str()) == Some("saved") {
-                    if let Some(id) = o.get("saved_block_id").and_then(|i| i.as_str()) {
-                        out.insert(id.to_string());
-                    }
-                }
-                o.values().for_each(|x| find(x, out));
-            }
-            _ => {}
-        }
-    }
-    find(content, &mut ids);
+    collect_saved_ids(content, &mut ids);
     if ids.is_empty() {
         return Ok(content.clone());
     }
@@ -853,7 +879,16 @@ async fn kick(state: &AppState, payload: Value) -> sqlx::Result<()> {
 
 /// A flow message about to send (`gate`): its content, exactly as it will go out, must have passed.
 pub async fn flow_at_send(state: &AppState, account: &Account, flow_id: Uuid, channel: &str, content: &Value) -> AppResult<AtSend> {
-    let key = hex::encode(Sha256::digest(serde_json::to_vec(&json!([channel, content])).unwrap_or_default()));
+    // The saved blocks it uses, as they are now, are part of what was checked.
+    let saved: Vec<(Uuid, chrono::DateTime<Utc>)> = if content.to_string().contains("saved_block_id") {
+        let mut ids = BTreeSet::new();
+        collect_saved_ids(content, &mut ids);
+        let uuids: Vec<Uuid> = ids.iter().filter_map(|i| i.parse().ok()).collect();
+        sqlx::query_as("SELECT id, updated_at FROM saved_blocks WHERE account_id = $1 AND id = ANY($2) ORDER BY id").bind(account.id).bind(&uuids).fetch_all(&state.db).await?
+    } else {
+        Vec::new()
+    };
+    let key = hex::encode(Sha256::digest(serde_json::to_vec(&json!([channel, content, saved])).unwrap_or_default()));
     if remembered(account.id, &key) {
         return Ok(AtSend::Go);
     }
@@ -989,6 +1024,16 @@ mod tests {
         let mut tagged = c.clone();
         tagged["link_tags"] = json!({"params": [["utm_source", "dm"]]});
         assert_eq!(part_hash(&variant("email", &tagged, "", "").0), part_hash(&v));
+    }
+
+    #[test]
+    fn table_cells_and_new_fields_count() {
+        let t = |cell: &str| json!({"subject": "s", "blocks": [{"type": "table", "rows": [["Item", cell]], "footer": "Total", "color": "#ff0000"}, {"type": "newthing", "blurb": "Fresh"}]});
+        let (a, _) = variant("email", &t("$10"), "", "");
+        let (b, _) = variant("email", &t("VERDICT_REVIEW free money"), "", "");
+        assert!(b["text"].as_str().unwrap().contains("free money") && a["text"].as_str().unwrap().contains("Fresh"), "{b}");
+        assert!(!a["text"].as_str().unwrap().contains("ff0000"));
+        assert_ne!(part_hash(&a), part_hash(&b), "a table cell change changes the fingerprint");
     }
 
     #[test]

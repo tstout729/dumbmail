@@ -288,6 +288,8 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, b: Input) -> A
     .await
     .map_err(|e| name_taken(e.into()))?;
     let row = row.ok_or_else(|| AppError::not_found("saved block"))?;
+    // Flow messages that use it are matched to a check again (see features::screening).
+    crate::features::screening::content_changed(account_id);
     let mut v = serde_json::to_value(&row)?;
     v["used_in"] = usage(state, account_id, id).await?["data"].clone();
     Ok(v)

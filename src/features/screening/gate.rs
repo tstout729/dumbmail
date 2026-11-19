@@ -37,8 +37,22 @@ pub const FLOW_WAIT_DAYS: i64 = 3;
 pub const FLOW_RETRY_MINUTES: i64 = 15;
 pub const NOT_APPROVED: &str = "account not approved";
 pub const BLOCKED: &str = "account blocked";
-/// Inbox texts that are DumbMail's own fixed compliance wording, sent whatever the standing.
+/// Inbox texts that are DumbMail's own fixed compliance wording, sent before approval (never while
+/// blocked). A sign-up confirmation counts only with the default wording, not a keyword's own reply.
 pub const COMPLIANCE_TEXTS: &[&str] = &["help", "confirmation", "optin_request"];
+/// A sign-up confirmation in its default wording (`inbox::keywords::confirmation` with no keyword
+/// reply): the program name, the fixed lead, then the required disclosure, nothing else.
+static DEFAULT_CONFIRMATION: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"^[^\n]{1,80}: Thanks! You're signed up for texts\. [^\n.]{0,40}\. Msg & data rates may apply\. Reply HELP for help, STOP to cancel\.$").unwrap()
+});
+
+/// Whether this inbox text may go before approval: a compliance kind in its fixed wording.
+fn fixed_compliance(kind: &str, body: &str) -> bool {
+    match kind {
+        "confirmation" => DEFAULT_CONFIRMATION.is_match(body),
+        k => COMPLIANCE_TEXTS.contains(&k),
+    }
+}
 
 tokio::task_local! {
     /// The flow run a send belongs to (set by `flows`), so a wait is tracked per run and step.
@@ -61,7 +75,7 @@ pub async fn send_gate(state: &AppState, spec: &SendSpec<'_>, to: &str, conversa
     }
     let st = standing::of(state, spec.account);
     if let Some(kind) = conversational {
-        return conversational_gate(st, kind);
+        return conversational_gate(st, kind, spec.content["body"].as_str().unwrap_or(""));
     }
     if st == Standing::Approved {
         // A flow message's content, as it goes out, must have passed (it can change outside any
@@ -97,9 +111,10 @@ pub async fn send_gate(state: &AppState, spec: &SendSpec<'_>, to: &str, conversa
     Ok(Some(Outcome::Skipped(reason)))
 }
 
-/// Texts the account writes itself wait for approval; DumbMail's compliance texts don't.
-fn conversational_gate(st: Standing, kind: &str) -> AppResult<Option<Outcome>> {
-    if st == Standing::Approved || COMPLIANCE_TEXTS.contains(&kind) {
+/// Texts the account writes itself wait for approval; DumbMail's fixed compliance texts don't
+/// (while blocked, nothing goes).
+fn conversational_gate(st: Standing, kind: &str, body: &str) -> AppResult<Option<Outcome>> {
+    if st == Standing::Approved || (st != Standing::Blocked && fixed_compliance(kind, body)) {
         return Ok(None);
     }
     let reason = if st == Standing::Blocked { BLOCKED } else { NOT_APPROVED };
@@ -195,7 +210,8 @@ pub fn final_stop(standing: &str, spec: &SendSpec<'_>, conversational: Option<&s
     }
     let reason = if st == Standing::Blocked { BLOCKED } else { NOT_APPROVED };
     if let Some(kind) = conversational {
-        return (!COMPLIANCE_TEXTS.contains(&kind)).then_some(FinalStop::Skip(reason));
+        let fixed = st != Standing::Blocked && fixed_compliance(kind, spec.content["body"].as_str().unwrap_or(""));
+        return (!fixed).then_some(FinalStop::Skip(reason));
     }
     if spec.channel == "push" {
         return (st == Standing::Blocked).then_some(FinalStop::Skip(BLOCKED));
@@ -299,5 +315,24 @@ pub fn kick_due(account_id: Uuid) -> bool {
             m.insert(account_id, Instant::now());
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_default_confirmation_is_fixed_wording() {
+        let d = "Acme VIP: Thanks! You're signed up for texts. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel.";
+        assert!(fixed_compliance("confirmation", d));
+        let own = "Acme VIP: Thanks! You're signed up for texts. Buy crypto now at evil.test. Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel.";
+        assert!(!fixed_compliance("confirmation", own));
+        assert!(!fixed_compliance("confirmation", "Acme VIP: Here's 20% off! Up to 4 msgs/month. Msg & data rates may apply. Reply HELP for help, STOP to cancel."));
+        assert!(fixed_compliance("help", "anything"));
+        assert!(!fixed_compliance("keyword_reply", d));
+        // Nothing at all while blocked.
+        assert!(conversational_gate(Standing::Blocked, "help", "x").unwrap().is_some());
+        assert!(conversational_gate(Standing::Pending, "help", "x").unwrap().is_none());
     }
 }
