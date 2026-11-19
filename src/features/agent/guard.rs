@@ -205,11 +205,14 @@ impl StreamGuard {
         if shown.len() <= self.emitted {
             return None;
         }
-        let out = shown[self.emitted..].to_string();
-        if !last && (PRICE.is_match(&out) || PERCENT.is_match(&out) || CODE.is_match(&out)) {
+        // Judged on all the text so far, so a claim split across pieces ("code " then "FREE50")
+        // is caught when its end arrives.
+        let fresh = |re: &Regex| re.find_iter(&shown).any(|m| m.end() > self.emitted);
+        if !last && (fresh(&PRICE) || fresh(&PERCENT) || fresh(&CODE)) {
             self.held = true;
             return None;
         }
+        let out = shown[self.emitted..].to_string();
         self.emitted = shown.len();
         Some(out)
     }
@@ -381,6 +384,13 @@ mod tests {
         let mut g = StreamGuard::default();
         g.hold();
         assert_eq!(g.push(&l, "Order #A100 shipped "), None);
+        // Split across pieces.
+        let mut g = StreamGuard::default();
+        assert_eq!(g.push(&l, "Use code ").as_deref(), Some("Use code "));
+        assert_eq!(g.push(&l, "FREE50 now "), None);
+        let mut g = StreamGuard::default();
+        assert_eq!(g.push(&l, "Take 50 ").as_deref(), Some("Take 50 "));
+        assert_eq!(g.push(&l, "percent off "), None);
     }
 
     #[test]
