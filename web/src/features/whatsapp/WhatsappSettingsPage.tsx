@@ -27,6 +27,8 @@ import { formatPhone, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useCan } from "../team/api";
 import {
+  useAddTestNumber,
+  useRemoveTestNumber,
   useCheckWhatsapp,
   useCreateTemplate,
   useDisconnectWhatsapp,
@@ -48,11 +50,16 @@ export function WhatsappSettingsPage() {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Stat label="Connection" value={s.connected ? "Connected" : "Not connected"} sub={s.phone.verified_name ?? undefined} />
+        <Stat label="Sending" value={s.connected ? "On" : "Off"} sub={s.phone.verified_name ?? undefined} />
         <Stat label="Quality rating" value={s.phone.quality_rating ? s.phone.quality_rating.toLowerCase() : "—"} sub="From Meta" />
         <Stat label="Messaging limit" value={limitLabel(s.phone.messaging_limit)} sub="People a day, outside conversations" />
         <Stat label="Approved templates" value={`${s.templates.approved} of ${s.templates.total}`} />
       </div>
+      {s.missing.length > 0 && s.missing.length < 4 ? (
+        <Notice tone="amber" icon={<AlertTriangle />} title="Sending isn't on yet">
+          Still needed: {s.missing.join(", ")}. The app secret is required so DumbMail can check Meta's webhooks, including opt-outs.
+        </Notice>
+      ) : null}
       {s.error ? (
         <Notice tone="red" icon={<AlertTriangle />} title="Meta reported a problem">
           {s.error}
@@ -60,7 +67,8 @@ export function WhatsappSettingsPage() {
       ) : null}
       <Connection settings={s} />
       <Webhook settings={s} />
-      <TestNumbers key={s.test_numbers.join(",")} settings={s} />
+      <Signup key={`${s.signup_keywords.join(",")}|${s.optin_buttons.join(",")}|${s.signup_reply ?? ""}`} settings={s} />
+      <TestNumbers settings={s} />
       <Templates connected={s.connected} />
     </div>
   );
@@ -226,18 +234,95 @@ function Webhook({ settings: s }: { settings: WhatsappSettings }) {
 }
 
 function TestNumbers({ settings: s }: { settings: WhatsappSettings }) {
-  const canWrite = useCan("settings.write");
-  const update = useUpdateWhatsappSettings();
-  const [numbers, setNumbers] = useState(s.test_numbers);
-  const changed = numbers.join(",") !== s.test_numbers.join(",");
+  const canTest = useCan("campaigns.test");
+  const add = useAddTestNumber();
+  const remove = useRemoveTestNumber();
+  const [phone, setPhone] = useState("");
+  const [pending, setPending] = useState<{ code: string; phone_number: string } | null>(null);
   return (
     <Card title="Test numbers">
       <div className="space-y-3 text-sm text-zinc-600">
-        <p>WhatsApp tests only go to these numbers: your team's own phones. Up to 10, in +1… format.</p>
-        <TagInput value={numbers} onChange={setNumbers} placeholder="+15035550100" aria-label="Test numbers" />
+        <p>
+          WhatsApp tests only go to team members' own phones. Add yours, then send the code shown from that phone, on WhatsApp, to your business number. Tests stop
+          going to a number when its member leaves the team.
+        </p>
+        {s.test_numbers.length ? (
+          <ul className="divide-y divide-zinc-100 rounded-md border border-zinc-200">
+            {s.test_numbers.map((t) => (
+              <li key={t.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+                <span className="tabular-nums text-zinc-800">{formatPhone(t.phone_number)}</span>
+                <span className="text-xs text-zinc-500">{t.member}</span>
+                {t.verified ? <Badge tone="green">Verified</Badge> : <Badge tone="amber">Waiting for the code</Badge>}
+                <IconButton label="Remove test number" onClick={() => remove.mutate(t.id)}>
+                  <Trash2 className="size-4" />
+                </IconButton>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {canTest ? (
+          <form
+            className="flex flex-wrap items-end gap-2"
+            onSubmit={(e: FormEvent) => {
+              e.preventDefault();
+              add.mutate(phone, {
+                onSuccess: (r) => {
+                  setPending(r);
+                  setPhone("");
+                },
+              });
+            }}
+          >
+            <Field label="Your phone">
+              <Input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+15035550100" className="w-48" inputMode="tel" />
+            </Field>
+            <Button type="submit" variant="secondary" loading={add.isPending} disabled={!phone.trim()}>
+              Add my number
+            </Button>
+          </form>
+        ) : null}
+        {pending ? (
+          <Notice tone="blue" title={`Send ${pending.code} from ${formatPhone(pending.phone_number)}`}>
+            Open WhatsApp on that phone and send exactly <b>{pending.code}</b> to your business number{s.phone.display_phone_number ? ` (${s.phone.display_phone_number})` : ""} within 30 minutes.
+          </Notice>
+        ) : null}
+        {add.error ? <InlineError message={add.error.message} /> : null}
+      </div>
+    </Card>
+  );
+}
+
+function Signup({ settings: s }: { settings: WhatsappSettings }) {
+  const canWrite = useCan("settings.write");
+  const update = useUpdateWhatsappSettings();
+  const [words, setWords] = useState(s.signup_keywords);
+  const [buttons, setButtons] = useState(s.optin_buttons);
+  const [reply, setReply] = useState(s.signup_reply ?? "");
+  const changed = words.join(",") !== s.signup_keywords.join(",") || buttons.join(",") !== s.optin_buttons.join(",") || reply !== (s.signup_reply ?? "");
+  return (
+    <Card title="Sign-ups on WhatsApp">
+      <div className="space-y-3 text-sm text-zinc-600">
+        <p>
+          Someone is subscribed to WhatsApp marketing only when they ask for it on WhatsApp: by sending exactly one of these words, or tapping a quick-reply
+          button with one of these payloads. Texting keywords don't sign anyone up here.
+        </p>
+        <Field label="Sign-up words" hint="One word each, like JOIN.">
+          <TagInput value={words} onChange={setWords} placeholder="JOIN" aria-label="Sign-up words" />
+        </Field>
+        <Field label="Opt-in button payloads" hint="The payload of a quick-reply button in your templates that means yes.">
+          <TagInput value={buttons} onChange={setButtons} placeholder="YES_WHATSAPP" aria-label="Opt-in button payloads" />
+        </Field>
+        <Field label="Answer" hint={'"Reply STOP to unsubscribe." is added.'}>
+          <Textarea rows={2} value={reply} onChange={(e) => setReply(e.target.value)} placeholder="Thanks! You're subscribed to WhatsApp messages from us." maxLength={1000} />
+        </Field>
         {canWrite ? (
-          <Button variant="secondary" disabled={!changed} loading={update.isPending} onClick={() => update.mutate({ test_numbers: numbers }, { onSuccess: () => toast.success("Test numbers saved") })}>
-            Save test numbers
+          <Button
+            variant="secondary"
+            disabled={!changed}
+            loading={update.isPending}
+            onClick={() => update.mutate({ signup_keywords: words, optin_buttons: buttons, signup_reply: reply }, { onSuccess: () => toast.success("Sign-up settings saved") })}
+          >
+            Save
           </Button>
         ) : null}
         {update.error ? <InlineError message={update.error.message} /> : null}

@@ -666,6 +666,9 @@ pub struct SubscribeBody {
     last_name: Option<String>,
     #[serde(default)]
     sms_consent: bool,
+    /// Ticked the form's box naming WhatsApp (see features::whatsapp).
+    #[serde(default)]
+    whatsapp_consent: bool,
     /// The A/B test version the visitor saw.
     #[serde(default)]
     variant: Option<String>,
@@ -775,6 +778,10 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     };
     let upserted = audience::upsert_profile_public(&state.db, account.id, &input).await?;
     let p = upserted.profile;
+    // The form's explicit WhatsApp box (only shown when the form words it).
+    if let (true, Some(phone)) = (b.whatsapp_consent && form.config["whatsapp_consent_text"].as_str().is_some_and(|t| !t.trim().is_empty()), phone.as_deref()) {
+        crate::features::whatsapp::consent::form_opt_in(&state.db, account.id, p.id, phone, form.id).await?;
+    }
     if let Some(tz) = &b.timezone {
         audience::fill_location_from_timezone(&state.db, p.id, tz).await?;
     }
@@ -884,7 +891,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
             // Everything else is a field answer; a key sent more than once (ticked checkboxes) becomes a list.
             let mut fields = Map::new();
             for (k, v) in &pairs {
-                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone" | "locale") {
+                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "whatsapp_consent" | "variant" | "step" | "phone_token" | "timezone" | "locale") {
                     continue;
                 }
                 match fields.get_mut(k) {
@@ -902,6 +909,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
                 first_name: one("first_name"),
                 last_name: one("last_name"),
                 sms_consent: one("sms_consent").is_some(),
+                whatsapp_consent: one("whatsapp_consent").is_some(),
                 variant: one("variant"),
                 fields: Some(fields),
                 step: one("step"),
@@ -969,7 +977,13 @@ fn form_fields_html(config: &Value) -> String {
                     r#"<input type="tel" name="phone_number" placeholder="{}" autocomplete="tel"{req}><label style="display:flex;gap:8px;align-items:flex-start;margin:0 0 12px"><input type="checkbox" name="sms_consent" value="1" style="margin-top:3px"><span>{}</span></label>"#,
                     ph("Mobile number"),
                     esc(consent)
-                ))
+                ));
+                if let Some(wa) = config["whatsapp_consent_text"].as_str().filter(|s| !s.trim().is_empty()) {
+                    h.push_str(&format!(
+                        r#"<label style="display:flex;gap:8px;align-items:flex-start;margin:0 0 12px"><input type="checkbox" name="whatsapp_consent" value="1" style="margin-top:3px"><span>{}</span></label>"#,
+                        esc(wa)
+                    ));
+                }
             }
             ("first_name", _) => h.push_str(&format!(r#"<input type="text" name="first_name" placeholder="{}" autocomplete="given-name"{req}>"#, ph("First name"))),
             ("last_name", _) => h.push_str(&format!(r#"<input type="text" name="last_name" placeholder="{}" autocomplete="family-name"{req}>"#, ph("Last name"))),

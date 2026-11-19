@@ -18,16 +18,21 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool("get_whatsapp_settings", "Get WhatsApp settings", "The WhatsApp connection (business account id, phone number id, whether the token and app secret are saved, never their values), the webhook URL and verify token to paste into the Meta app, the phone number's name, quality rating and messaging limit from the last check, the team's test numbers and template counts.",
             obj(json!({}), &[]), true, false),
-        tool("update_whatsapp_settings", "Connect or change WhatsApp", "Save the WhatsApp Business Account id, the phone number id, a permanent system-user access token and the Meta app's app secret (tokens and secrets are encrypted and never shown again; leave them out to keep the saved ones), and the team's test numbers. Then check_whatsapp_connection.",
+        tool("update_whatsapp_settings", "Connect or change WhatsApp", "Save the WhatsApp Business Account id, the phone number id, a permanent system-user access token and the Meta app's app secret (tokens and secrets are encrypted and never shown again; leave them out to keep the saved ones). Sending turns on once all four are saved. Changing the business account or number starts fresh: nobody stays subscribed and queued messages are skipped. Also WhatsApp's own sign-up words and opt-in buttons. Then check_whatsapp_connection.",
             obj(json!({"waba_id": {"type": "string"}, "phone_number_id": {"type": "string"}, "access_token": {"type": "string"}, "app_secret": {"type": "string"},
-                "test_numbers": {"type": "array", "maxItems": 10, "items": {"type": "string"}, "description": "E.164 numbers WhatsApp tests may go to (the team's own phones)."}}), &[]), false, false),
+                "signup_keywords": {"type": "array", "maxItems": 10, "items": {"type": "string"}, "description": "Words that sign someone up to WhatsApp marketing when they send exactly that word on WhatsApp, e.g. JOIN."},
+                "signup_reply": {"type": "string", "maxLength": 1000, "description": "The answer to a sign-up word (\"Reply STOP to unsubscribe\" is added)."},
+                "optin_buttons": {"type": "array", "maxItems": 10, "items": {"type": "string"}, "description": "Quick-reply button payloads that mean yes to WhatsApp marketing."}}), &[]), false, false),
         tool("disconnect_whatsapp", "Disconnect WhatsApp", "Forget the WhatsApp connection (ids, token, app secret). Nothing can be sent on WhatsApp until it's connected again. Requires confirm=true.",
             obj(json!({"confirm": {"type": "boolean"}}), &[]), false, true),
         tool("check_whatsapp_connection", "Check the WhatsApp connection", "Read the phone number's display name, quality rating and messaging limit from Meta with the saved token. A token or permission problem shows in error.",
             obj(json!({}), &[]), false, false),
-        tool("list_whatsapp_templates", "List WhatsApp templates", "The account's message templates as last synced from Meta: name, language, category (MARKETING needs a WhatsApp opt-in; UTILITY is for order and booking updates), status (only APPROVED can be sent), components and the variables a send fills. Set sync=true to read them from Meta first.",
-            obj(json!({"sync": {"type": "boolean"}}), &[]), false, false),
-        tool("sync_whatsapp_templates", "Sync WhatsApp templates", "Read every template from Meta now (status changes also arrive by webhook).", obj(json!({}), &[]), false, false),
+        tool("list_whatsapp_templates", "List WhatsApp templates", "The account's message templates as last synced from Meta: name, language, category (MARKETING needs a WhatsApp opt-in; UTILITY is for order and booking updates), status (only APPROVED can be sent), components and the variables a send fills. sync_whatsapp_templates reads them from Meta again.",
+            obj(json!({}), &[]), true, false),
+        tool("sync_whatsapp_templates", "Sync WhatsApp templates", "Read every template from Meta now (status changes also arrive by webhook). Needs settings write.", obj(json!({}), &[]), false, false),
+        tool("list_whatsapp_test_numbers", "List WhatsApp test numbers", "Team members' own phone numbers that WhatsApp tests may go to, and whether each is verified.", obj(json!({}), &[]), true, false),
+        tool("add_whatsapp_test_number", "Add your WhatsApp test number", "Start verifying your own phone as a WhatsApp test number (needs a signed-in member, not an API key): send the code it returns from that phone, on WhatsApp, to the business number within 30 minutes.",
+            obj(json!({"phone_number": {"type": "string"}}), &["phone_number"]), false, false),
         tool("create_whatsapp_template", "Create a WhatsApp template", "Submit a new template to Meta for review (status starts PENDING; approval usually takes minutes to a day). Variables are {{1}}, {{2}} ... with one example each, never at the very start or end of the message. Link buttons are tracked by default. Without confirm=true it returns what would be submitted.",
             obj(json!({
                 "name": {"type": "string", "description": "lowercase letters, digits and underscores, e.g. order_update"},
@@ -41,7 +46,7 @@ pub fn definitions() -> Vec<Value> {
                 "buttons": {"type": "array", "maxItems": 10, "items": button},
                 "confirm": {"type": "boolean"}
             }), &["name", "language", "category", "body"]), false, true),
-        tool("send_test_whatsapp", "Send a WhatsApp test", "Send WhatsApp content (a template and its variables) to one of the team's test numbers (Settings → WhatsApp). Personalized as profile_id when given, otherwise as the profile with that number.",
+        tool("send_test_whatsapp", "Send a WhatsApp test", "Send WhatsApp content (a template and its variables) to a team member's verified test number (Settings → WhatsApp). Personalized as profile_id when given, otherwise as the profile with that number.",
             obj(json!({"to": {"type": "string"}, "content": content::schema(), "profile_id": id("Optional sample person.")}), &["to", "content"]), false, false),
         tool("get_whatsapp_consent", "Get a person's WhatsApp consent", "WhatsApp consent for a profile's current number (separate from texts): subscribed, unsubscribed or never_subscribed, where it came from, its history, whether the number is on WhatsApp, and whether the 24-hour reply window is open.",
             obj(json!({"profile_id": id("Profile id.")}), &["profile_id"]), true, false),
@@ -82,14 +87,13 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
             }
         }
         "check_whatsapp_connection" => super::settings::check(state, acct).await,
-        "list_whatsapp_templates" => {
-            if a["sync"].as_bool() == Some(true) {
-                super::sync_templates(state, acct).await
-            } else {
-                super::templates_json(state, acct).await
-            }
-        }
-        "sync_whatsapp_templates" => super::sync_templates(state, acct).await,
+        "list_whatsapp_templates" => super::templates_json(state, acct).await,
+        "sync_whatsapp_templates" => super::sync_templates(state, ctx).await,
+        "list_whatsapp_test_numbers" => super::testers::list(&state.db, acct).await.map(|l| json!({"test_numbers": l})).map_err(Into::into),
+        "add_whatsapp_test_number" => match a["phone_number"].as_str() {
+            Some(p) => super::add_test_number(state, ctx, p).await,
+            None => Err(AppError::bad("phone_number is required")),
+        },
         "create_whatsapp_template" => match from::<super::CreateBody>(a.clone()) {
             Ok(b) => super::create_template(state, ctx, b).await,
             Err(e) => Err(e),

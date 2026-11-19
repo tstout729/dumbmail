@@ -157,14 +157,16 @@ fn clip(v: &Value, n: usize) -> Option<String> {
 /// Read every template from Meta and bring the local copies up to date. Templates Meta no longer
 /// lists are marked DELETED (campaigns using them then stop at their checks). Returns the count read.
 pub async fn sync(state: &AppState, account_id: Uuid) -> AppResult<usize> {
-    let Some(c) = settings::load(state, account_id).await? else {
+    let Some((waba_id, _, token)) = settings::load_reader(state, account_id).await? else {
         return Err(AppError::bad("Connect WhatsApp first"));
     };
+    // What this read finds is Meta's state as of now: an event Meta sent after this moment (a pause,
+    // a category change) wins over it.
     let started = Utc::now();
     let mut after: Option<String> = None;
     let mut seen = 0usize;
     for _ in 0..MAX_PAGES {
-        let page = match graph::templates_page(&state.cfg, &c.token, &c.waba_id, after.as_deref()).await {
+        let page = match graph::templates_page(&state.cfg, &token, &waba_id, after.as_deref()).await {
             Ok(p) => p,
             Err(e) => {
                 if e.class() == graph::Class::Auth {
@@ -181,10 +183,20 @@ pub async fn sync(state: &AppState, account_id: Uuid) -> AppResult<usize> {
             }
             let components = if t["components"].is_array() && t["components"].to_string().len() <= 32_000 { t["components"].clone() } else { json!([]) };
             sqlx::query(
-                "INSERT INTO whatsapp_templates (id, account_id, meta_id, name, language, category, status, parameter_format, components, reason, quality, synced_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
-                 ON CONFLICT (account_id, meta_id) DO UPDATE SET name = EXCLUDED.name, language = EXCLUDED.language, category = EXCLUDED.category,
-                     status = EXCLUDED.status, parameter_format = EXCLUDED.parameter_format, components = EXCLUDED.components,
+                "INSERT INTO whatsapp_templates (id, account_id, meta_id, name, language, category, status, parameter_format, components, reason, quality, synced_at, status_at, category_at,
+                                                paused_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), $12, $12, CASE WHEN $7 IN ('PAUSED', 'DISABLED') THEN $12 END)
+                 ON CONFLICT (account_id, meta_id) DO UPDATE SET name = EXCLUDED.name, language = EXCLUDED.language,
+                     category = CASE WHEN whatsapp_templates.category_at > $12 THEN whatsapp_templates.category ELSE EXCLUDED.category END,
+                     category_at = GREATEST(whatsapp_templates.category_at, $12),
+                     status = CASE WHEN whatsapp_templates.status_at > $12 THEN whatsapp_templates.status
+                                   WHEN whatsapp_templates.status IN ('PAUSED', 'DISABLED') AND EXCLUDED.status IN ('PAUSED', 'DISABLED') THEN EXCLUDED.status
+                                   WHEN whatsapp_templates.paused_at >= $12 THEN whatsapp_templates.status
+                                   ELSE EXCLUDED.status END,
+                     paused_at = CASE WHEN EXCLUDED.status IN ('PAUSED', 'DISABLED') AND whatsapp_templates.status NOT IN ('PAUSED', 'DISABLED') AND NOT (whatsapp_templates.status_at > $12)
+                                      THEN $12 ELSE whatsapp_templates.paused_at END,
+                     status_at = GREATEST(whatsapp_templates.status_at, $12),
+                     parameter_format = EXCLUDED.parameter_format, components = EXCLUDED.components,
                      reason = EXCLUDED.reason, quality = EXCLUDED.quality, synced_at = now(),
                      updated_at = CASE WHEN whatsapp_templates.status IS DISTINCT FROM EXCLUDED.status THEN now() ELSE whatsapp_templates.updated_at END",
             )
@@ -199,6 +211,7 @@ pub async fn sync(state: &AppState, account_id: Uuid) -> AppResult<usize> {
             .bind(&components)
             .bind(clip(&t["rejected_reason"], 100).filter(|r| r != "NONE"))
             .bind(clip(&t["quality_score"]["score"], 40))
+            .bind(started)
             .execute(&state.db)
             .await?;
             seen += 1;
@@ -217,30 +230,85 @@ pub async fn sync(state: &AppState, account_id: Uuid) -> AppResult<usize> {
     Ok(seen)
 }
 
-/// Meta's template status webhook. Returns false when the template isn't known here yet (the
-/// caller queues a sync).
-pub async fn status_update(db: &sqlx::PgPool, account_id: Uuid, meta_id: &str, event: &str, reason: Option<&str>) -> sqlx::Result<bool> {
-    let n = sqlx::query("UPDATE whatsapp_templates SET status = $3, reason = $4, updated_at = now() WHERE account_id = $1 AND meta_id = $2")
-        .bind(account_id)
-        .bind(meta_id)
-        .bind(event)
-        .bind(reason.filter(|r| *r != "NONE"))
-        .execute(db)
-        .await?
-        .rows_affected();
-    Ok(n > 0)
+/// What a template status webhook did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StatusChange {
+    /// The template isn't known here yet (the caller queues a sync).
+    Unknown,
+    /// Older than what's in force, or an approval that came from before its pause: nothing changed.
+    Ignored,
+    Applied {
+        /// It just went from usable to paused or disabled (alert the owners, once).
+        paused_now: bool,
+    },
 }
 
-/// Stop using a template Meta paused or disabled (error 132015 or 132016, or the webhook).
+pub fn is_paused(status: &str) -> bool {
+    matches!(status, "PAUSED" | "DISABLED")
+}
+
+/// Meta's template status webhook, with Meta's time for it (`entry[].time`). Events apply in their
+/// own order; once paused or disabled, only an event from after the pause can change it again.
+pub async fn status_update(db: &sqlx::PgPool, account_id: Uuid, meta_id: &str, event: &str, reason: Option<&str>, at: DateTime<Utc>) -> sqlx::Result<StatusChange> {
+    let mut tx = db.begin().await?;
+    let cur: Option<(String, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT status, status_at, paused_at FROM whatsapp_templates WHERE account_id = $1 AND meta_id = $2 FOR UPDATE").bind(account_id).bind(meta_id).fetch_optional(&mut *tx).await?;
+    let Some((status, status_at, paused_at)) = cur else { return Ok(StatusChange::Unknown) };
+    // Meta's times are whole seconds: compare to the second.
+    let secs = |t: DateTime<Utc>| t.timestamp();
+    let older = status_at.is_some_and(|s| secs(at) < secs(s));
+    let before_pause = paused_at.is_some_and(|p| secs(at) <= secs(p)) && !is_paused(event);
+    if older || before_pause {
+        return Ok(StatusChange::Ignored);
+    }
+    let paused_now = is_paused(event) && !is_paused(&status);
+    sqlx::query(
+        "UPDATE whatsapp_templates SET status = $3, reason = $4, status_at = $5, paused_at = CASE WHEN $6 THEN $5 ELSE paused_at END, updated_at = now()
+         WHERE account_id = $1 AND meta_id = $2",
+    )
+    .bind(account_id)
+    .bind(meta_id)
+    .bind(event)
+    .bind(reason.filter(|r| *r != "NONE"))
+    .bind(at)
+    .bind(is_paused(event))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StatusChange::Applied { paused_now })
+}
+
+/// Meta's template category webhook (a completed change), with Meta's time for it. Returns false
+/// when the template isn't known here yet.
+pub async fn category_update(db: &sqlx::PgPool, account_id: Uuid, meta_id: &str, category: &str, at: DateTime<Utc>) -> sqlx::Result<bool> {
+    let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM whatsapp_templates WHERE account_id = $1 AND meta_id = $2)").bind(account_id).bind(meta_id).fetch_one(db).await?;
+    sqlx::query(
+        "UPDATE whatsapp_templates SET category = $3, category_at = $4, updated_at = now()
+         WHERE account_id = $1 AND meta_id = $2 AND (category_at IS NULL OR date_trunc('second', category_at) <= date_trunc('second', $4))",
+    )
+    .bind(account_id)
+    .bind(meta_id)
+    .bind(category)
+    .bind(at)
+    .execute(db)
+    .await?;
+    Ok(known)
+}
+
+/// Stop using a template Meta paused or disabled (error 132015 or 132016 on a send). Returns
+/// whether it just changed (alert the owners, once).
 pub async fn mark_paused(db: &sqlx::PgPool, account_id: Uuid, template_id: Uuid, code: i64) -> sqlx::Result<bool> {
     let status = if code == 132016 { "DISABLED" } else { "PAUSED" };
-    let n = sqlx::query("UPDATE whatsapp_templates SET status = $3, updated_at = now() WHERE id = $1 AND account_id = $2 AND status = 'APPROVED'")
-        .bind(template_id)
-        .bind(account_id)
-        .bind(status)
-        .execute(db)
-        .await?
-        .rows_affected();
+    let n = sqlx::query(
+        "UPDATE whatsapp_templates SET status = $3, paused_at = now(), status_at = GREATEST(status_at, now()), updated_at = now()
+         WHERE id = $1 AND account_id = $2 AND status NOT IN ('PAUSED', 'DISABLED')",
+    )
+    .bind(template_id)
+    .bind(account_id)
+    .bind(status)
+    .execute(db)
+    .await?
+    .rows_affected();
     Ok(n > 0)
 }
 
@@ -400,14 +468,16 @@ pub fn build(n: &NewTemplate, link_base: &str) -> AppResult<(Value, Value)> {
 
 /// Submit a template for Meta's review and keep it (status as Meta answered, usually PENDING).
 pub async fn create(state: &AppState, account_id: Uuid, n: &NewTemplate) -> AppResult<Template> {
-    let Some(c) = settings::load(state, account_id).await? else {
+    let Some((waba_id, _, token)) = settings::load_reader(state, account_id).await? else {
         return Err(AppError::bad("Connect WhatsApp first"));
     };
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
     let (submit, tracked) = build(n, &crate::domains::link_base(state, &account))?;
-    let answer = graph::create_template(&state.cfg, &c.token, &c.waba_id, &submit).await.map_err(|e| {
+    let answer = graph::create_template(&state.cfg, &token, &waba_id, &submit).await.map_err(|e| {
         if e.code == 100 && e.subcode == Some(2388024) {
             AppError::Conflict("A template with this name already exists in this language".into())
+        } else if e.class() == graph::Class::RateLimited {
+            AppError::LimitReached("Meta's limit for template changes was reached; try again in a while".into())
         } else {
             AppError::bad(format!("Meta didn't accept the template: {}", e.describe()))
         }

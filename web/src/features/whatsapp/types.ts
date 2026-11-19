@@ -9,8 +9,12 @@ export type WhatsappContent = {
   buttons?: Record<string, string>;
 };
 
+export type WhatsappTestNumber = { id: string; phone_number: string; member: string; verified: boolean; verified_at: string | null; created_at: string };
+
 export type WhatsappSettings = {
   connected: boolean;
+  /** What's still needed before sending turns on. */
+  missing: string[];
   connected_via: string;
   waba_id: string | null;
   phone_number_id: string | null;
@@ -30,7 +34,10 @@ export type WhatsappSettings = {
   };
   error: string | null;
   error_at: string | null;
-  test_numbers: string[];
+  test_numbers: WhatsappTestNumber[];
+  signup_keywords: string[];
+  signup_reply: string | null;
+  optin_buttons: string[];
   templates: { total: number; approved: number };
   embedded_signup_available: boolean;
 };
@@ -40,7 +47,9 @@ export type WhatsappSettingsPatch = {
   phone_number_id?: string;
   access_token?: string;
   app_secret?: string;
-  test_numbers?: string[];
+  signup_keywords?: string[];
+  signup_reply?: string;
+  optin_buttons?: string[];
 };
 
 export type TemplateComponent = {

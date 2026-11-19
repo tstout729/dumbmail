@@ -1,19 +1,28 @@
-//! Two-way WhatsApp: inbound messages become conversations in the inbox, keywords work as they do
-//! for texts, STOP and START change WhatsApp consent (never SMS), and the team replies: free-form
-//! text inside the 24-hour customer service window, approved templates outside it.
+//! Two-way WhatsApp: inbound messages become conversations in the inbox, STOP and START change
+//! WhatsApp consent (never SMS), and the team replies: free-form text inside the 24-hour customer
+//! service window, approved templates outside it.
 //!
 //! An inbound message is stored with its consent effect, its conversation and any automatic answer
 //! (queued with its job) in one transaction under the number's lock; a retried webhook finds it
 //! stored and does nothing twice. Events (flows, segments) follow, each recorded once.
+//!
+//! - **Sign-ups** come only from the account's own WhatsApp sign-up words (a text message that is
+//!   exactly the word) or opt-in buttons (a quick reply whose payload is one of them). A texting
+//!   keyword, a generic button label or a media caption is never consent.
+//! - **Texting keywords** that don't subscribe (add to a list, answer) also work on WhatsApp text
+//!   messages.
+//! - **Who and when.** A message identified only by Meta's business-scoped user id is matched to the
+//!   number a signed webhook connected it with; one we can't match is dropped, except an opt-out,
+//!   which is kept until we can. A message without Meta's time opens no window and signs nobody up.
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::content::{self, WaContent};
 use super::send::{self, WINDOW_HOURS};
-use super::{consent, templates};
+use super::{consent, settings, templates, testers};
 use crate::audience::{self, NewEvent, ProfileInput};
 use crate::error::{AppError, AppResult};
 use crate::features::inbox::keywords::{self, Keyword};
@@ -28,47 +37,61 @@ const AUTO_PER_HOUR: i32 = 5;
 #[derive(Debug, Clone)]
 pub struct Inbound {
     pub wamid: String,
-    pub from: String,
+    /// Their phone number, when Meta shared it.
+    pub from: Option<String>,
+    /// Meta's business-scoped user id (BSUID), when given.
+    pub user_id: Option<String>,
     pub name: Option<String>,
     pub msg_type: String,
     pub text: String,
+    /// A quick-reply button's payload.
+    pub payload: Option<String>,
     pub context_wamid: Option<String>,
     pub received_at: DateTime<Utc>,
+    /// Meta gave the time it was sent (needed to open a window or sign anyone up).
+    pub timed: bool,
 }
 
 impl Inbound {
-    /// A `messages[]` item (with the change's `contacts[]` for the name). None when it can't be
-    /// stored: no id, or no phone number (someone using a WhatsApp username only).
+    /// A `messages[]` item (with the change's `contacts[]` for the name and ids). None when it has no
+    /// id, or neither a phone number nor a business-scoped user id.
     pub fn parse(m: &Value, contacts: &Value) -> Option<Self> {
         let wamid = m["id"].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 200)?.to_string();
-        let digits: String = m["from"].as_str()?.chars().filter(char::is_ascii_digit).collect();
-        let from = crate::models::normalize_phone(&format!("+{digits}"))?;
+        let from = m["from"].as_str().and_then(|f| crate::models::normalize_phone(&format!("+{}", f.chars().filter(char::is_ascii_digit).collect::<String>())));
+        let contact = contacts.as_array().and_then(|cs| {
+            cs.iter()
+                .find(|c| (m["from"].is_string() && c["wa_id"] == m["from"]) || (m["from_user_id"].is_string() && c["user_id"] == m["from_user_id"]))
+                .or(if cs.len() == 1 { cs.first() } else { None })
+        });
+        let user_id = m["from_user_id"].as_str().or_else(|| contact.and_then(|c| c["user_id"].as_str())).filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string);
+        if from.is_none() && user_id.is_none() {
+            return None;
+        }
         let msg_type = m["type"].as_str().unwrap_or("unknown").chars().take(30).collect::<String>();
-        let text = match msg_type.as_str() {
-            "text" => m["text"]["body"].as_str().unwrap_or_default().to_string(),
-            "button" => m["button"]["text"].as_str().or(m["button"]["payload"].as_str()).unwrap_or_default().to_string(),
+        let (text, payload) = match msg_type.as_str() {
+            "text" => (m["text"]["body"].as_str().unwrap_or_default().to_string(), None),
+            "button" => (m["button"]["text"].as_str().unwrap_or_default().to_string(), m["button"]["payload"].as_str().map(str::to_string)),
             "interactive" => {
                 let i = &m["interactive"];
-                i["button_reply"]["title"].as_str().or(i["list_reply"]["title"].as_str()).unwrap_or_default().to_string()
+                let title = i["button_reply"]["title"].as_str().or(i["list_reply"]["title"].as_str()).unwrap_or_default().to_string();
+                (title, i["button_reply"]["id"].as_str().or(i["list_reply"]["id"].as_str()).map(str::to_string))
             }
-            "image" | "video" | "document" | "audio" | "sticker" => m[msg_type.as_str()]["caption"].as_str().unwrap_or_default().to_string(),
-            _ => String::new(),
+            "image" | "video" | "document" | "audio" | "sticker" => (m[msg_type.as_str()]["caption"].as_str().unwrap_or_default().to_string(), None),
+            _ => (String::new(), None),
         };
-        let name = contacts
-            .as_array()
-            .and_then(|cs| cs.iter().find(|c| c["wa_id"].as_str() == m["from"].as_str()).or(cs.first()))
-            .and_then(|c| c["profile"]["name"].as_str())
-            .map(|n| n.chars().take(100).collect());
-        let now = Utc::now();
-        let received_at = m["timestamp"].as_str().and_then(|t| t.parse::<i64>().ok()).and_then(|t| Utc.timestamp_opt(t, 0).single()).map_or(now, |t| t.min(now));
+        let name = contact.and_then(|c| c["profile"]["name"].as_str()).map(|n| n.chars().take(100).collect());
+        let at = super::webhook::meta_time(&m["timestamp"]);
         Some(Self {
             wamid,
             from,
+            user_id,
             name,
             msg_type,
             text: text.chars().take(MAX_BODY_CHARS).collect(),
+            payload: payload.map(|p| p.chars().take(256).collect()),
             context_wamid: m["context"]["id"].as_str().map(|s| s.chars().take(200).collect()),
-            received_at,
+            received_at: at.unwrap_or_else(Utc::now),
+            timed: at.is_some(),
         })
     }
 }
@@ -103,25 +126,67 @@ struct Stored {
 pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppResult<()> {
     let db = &state.db;
     let class = optout::classify(&rx.text, None);
+    // Who sent it: their number, or the one a signed webhook tied their business-scoped id to.
+    let from = match (&rx.from, &rx.user_id) {
+        (Some(f), _) => f.clone(),
+        (None, Some(uid)) => {
+            let mut conn = db.acquire().await?;
+            match consent::number_for_user_id(&mut conn, account_id, uid).await? {
+                Some(n) => n,
+                None => {
+                    drop(conn);
+                    if class == Class::Stop {
+                        // The safe direction: kept and applied as soon as we learn their number.
+                        let mut tx = db.begin().await?;
+                        consent::opt_out_user_id(&mut tx, db, account_id, uid, "stop", rx.received_at).await?;
+                        tx.commit().await?;
+                    } else {
+                        tracing::info!(account = %account_id, "WhatsApp message from someone known only by a business-scoped id; not stored");
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        (None, None) => return Ok(()),
+    };
     let word = optout::word(&rx.text);
     let strict = optout::strict_word(&rx.text);
-    let keyword = if class == Class::Other && !word.is_empty() { keywords::matching(db, account_id, &word, &strict).await? } else { None };
-    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&rx.from).fetch_optional(db).await?;
+    let (signup_words, signup_reply, optin_buttons) = settings::signup(db, account_id).await?;
+    // Consent needs Meta's time for the message.
+    let signup = rx.timed
+        && match rx.msg_type.as_str() {
+            "text" => signup_words.contains(&strict),
+            "button" | "interactive" => rx.payload.as_ref().is_some_and(|p| optin_buttons.iter().any(|b| b == p)),
+            _ => false,
+        };
+    // Texting keywords that don't subscribe: only typed text, never captions or buttons.
+    let keyword = if class == Class::Other && rx.msg_type == "text" && !word.is_empty() && !signup {
+        keywords::matching(db, account_id, &word, &strict).await?.filter(|k| !k.subscribe)
+    } else {
+        None
+    };
+    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&from).fetch_optional(db).await?;
     let profile_id = match existing {
         Some(id) => id,
         // A number we haven't seen: a profile with just the number. Writing in isn't consent.
-        None => audience::upsert_profile(db, account_id, &ProfileInput { phone_number: Some(rx.from.clone()), ..Default::default() }).await?.profile.id,
+        None => audience::upsert_profile(db, account_id, &ProfileInput { phone_number: Some(from.clone()), ..Default::default() }).await?.profile.id,
     };
     let account_name: String = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
     let text = shown(rx);
 
     let mut tx = db.begin().await?;
-    consent::lock(&mut tx, account_id, &rx.from).await?;
-    consent::ensure_contact(&mut tx, account_id, &rx.from, Some(profile_id)).await?;
-    let current: String = sqlx::query_scalar("SELECT consent FROM whatsapp_contacts WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&rx.from).fetch_one(&mut *tx).await?;
+    consent::lock(&mut tx, account_id, &from).await?;
+    consent::ensure_contact(&mut tx, account_id, &from, Some(profile_id)).await?;
+    if let Some(uid) = &rx.user_id {
+        consent::learn_user_id(&mut tx, db, account_id, &from, uid, Some(profile_id)).await?;
+    }
+    let current: String = sqlx::query_scalar("SELECT consent FROM whatsapp_contacts WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&from).fetch_one(&mut *tx).await?;
+    let verification = rx.msg_type == "text" && testers::verify_from(&mut tx, account_id, &from, &rx.text).await?;
     let kind = match class {
         Class::Stop => "stop",
-        _ if optout::START_WORDS.contains(&strict.as_str()) && current == "unsubscribed" => "start",
+        _ if verification => "verification",
+        _ if rx.timed && rx.msg_type == "text" && optout::START_WORDS.contains(&strict.as_str()) && current == "unsubscribed" => "start",
+        _ if signup => "signup",
         _ if keyword.is_some() => "keyword",
         _ => "message",
     };
@@ -133,7 +198,7 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
     .bind(Uuid::now_v7())
     .bind(account_id)
     .bind(profile_id)
-    .bind(&rx.from)
+    .bind(&from)
     .bind(&rx.name)
     .fetch_one(&mut *tx)
     .await?;
@@ -147,11 +212,11 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
     .bind(conversation_id)
     .bind(profile_id)
     .bind(&rx.wamid)
-    .bind(&rx.from)
+    .bind(&from)
     .bind(&rx.msg_type)
     .bind(&rx.text)
     .bind(kind)
-    .bind(keyword.as_ref().map(|k| k.keyword.clone()))
+    .bind(keyword.as_ref().map(|k| k.keyword.clone()).or_else(|| (kind == "signup").then(|| strict.clone())))
     .bind(&rx.context_wamid)
     .bind(rx.received_at)
     .fetch_optional(&mut *tx)
@@ -161,25 +226,29 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
         tx.rollback().await?;
         return finish_stored(state, account_id, &rx.wamid).await;
     };
-    // They wrote, so they're on WhatsApp, and the service window starts again.
+    // They wrote, so they're on WhatsApp; with Meta's time, the service window starts again.
     sqlx::query(
-        "UPDATE whatsapp_contacts SET last_inbound_at = GREATEST(COALESCE(last_inbound_at, $3), $3), unreachable_at = NULL, profile_id = $4, updated_at = now()
+        "UPDATE whatsapp_contacts SET last_inbound_at = CASE WHEN $5 THEN GREATEST(COALESCE(last_inbound_at, $3), $3) ELSE last_inbound_at END,
+                unreachable_at = NULL, undeliverable_count = 0, profile_id = $4, updated_at = now()
          WHERE account_id = $1 AND phone_number = $2",
     )
     .bind(account_id)
-    .bind(&rx.from)
+    .bind(&from)
     .bind(rx.received_at)
     .bind(profile_id)
+    .bind(rx.timed)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE whatsapp_conversations SET unread_count = unread_count + 1, last_message_at = now(), last_inbound_at = GREATEST(COALESCE(last_inbound_at, $3), $3),
+        "UPDATE whatsapp_conversations SET unread_count = unread_count + 1, last_message_at = now(),
+                last_inbound_at = CASE WHEN $4 THEN GREATEST(COALESCE(last_inbound_at, $3), $3) ELSE last_inbound_at END,
                 last_direction = 'inbound', last_preview = $2, status = 'open', closed_at = NULL
          WHERE id = $1",
     )
     .bind(conversation_id)
     .bind(crate::features::inbox::store::preview(&text, 0))
     .bind(rx.received_at)
+    .bind(rx.timed)
     .execute(&mut *tx)
     .await?;
     let detail = json!({"wamid": rx.wamid, "inbound_id": id});
@@ -187,27 +256,32 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
     let mut answer: Option<(&str, String)> = None;
     match kind {
         "stop" => {
-            consent::set(&mut tx, db, account_id, &rx.from, Some(profile_id), "unsubscribed", "stop", detail).await?;
-            answer = Some(("optout_confirmation", format!("You won't get marketing messages from {account_name} on WhatsApp anymore. Reply START to get them again.")));
+            if consent::set(&mut tx, db, account_id, &from, Some(profile_id), "unsubscribed", "stop", detail, rx.received_at).await? || current == "unsubscribed" {
+                answer = Some(("optout_confirmation", format!("You won't get marketing messages from {account_name} on WhatsApp anymore. Reply START to get them again.")));
+            }
         }
         "start" => {
-            subscribed_now = consent::set(&mut tx, db, account_id, &rx.from, Some(profile_id), "subscribed", "start", detail).await?;
-            answer = Some(("confirmation", format!("You're subscribed to WhatsApp messages from {account_name} again. Reply STOP to unsubscribe.")));
+            subscribed_now = consent::set(&mut tx, db, account_id, &from, Some(profile_id), "subscribed", "start", detail, rx.received_at).await?;
+            if subscribed_now {
+                answer = Some(("confirmation", format!("You're subscribed to WhatsApp messages from {account_name} again. Reply STOP to unsubscribe.")));
+            }
+        }
+        "signup" => {
+            let source = if rx.msg_type == "text" { "keyword" } else { "button" };
+            subscribed_now = consent::set(&mut tx, db, account_id, &from, Some(profile_id), "subscribed", source, json!({"wamid": rx.wamid, "inbound_id": id, "word": strict, "payload": rx.payload}), rx.received_at).await?;
+            let lead = signup_reply.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| format!("Thanks! You're subscribed to WhatsApp messages from {account_name}."));
+            answer = Some(("confirmation", format!("{lead} Reply STOP to unsubscribe.")));
         }
         "keyword" => {
             let k = keyword.as_ref().expect("matched");
-            if k.subscribe {
-                // A sign-up keyword sent on WhatsApp is an explicit WhatsApp opt-in (texts are untouched).
-                subscribed_now = consent::set(&mut tx, db, account_id, &rx.from, Some(profile_id), "subscribed", "keyword", json!({"wamid": rx.wamid, "inbound_id": id, "keyword": k.keyword})).await?;
-                let lead = if k.reply.trim().is_empty() { format!("Thanks! You're subscribed to WhatsApp messages from {account_name}.") } else { k.reply.clone() };
-                answer = Some(("confirmation", format!("{lead} Reply STOP to unsubscribe.")));
-            } else if !k.reply.trim().is_empty() {
+            if !k.reply.trim().is_empty() {
                 answer = Some(("keyword_reply", k.reply.clone()));
             }
         }
         _ => {}
     }
-    if let Some((answer_kind, raw)) = answer {
+    // Answers need an open window (Meta's time for their message).
+    if let (Some((answer_kind, raw)), true) = (answer, rx.timed) {
         // A bounded number of automatic answers per person per hour, counted in this transaction.
         let allowed: bool = sqlx::query_scalar(
             "UPDATE whatsapp_conversations SET
@@ -220,25 +294,28 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
         .fetch_one(&mut *tx)
         .await?;
         if allowed {
-            let profile = crate::audience::find_profile(db, account_id, &ProfileInput { phone_number: Some(rx.from.clone()), ..Default::default() }).await?;
+            let profile = crate::audience::find_profile(db, account_id, &ProfileInput { phone_number: Some(from.clone()), ..Default::default() }).await?;
             let account = crate::campaigns::load_account(db, account_id).await?;
             let ctx = crate::render::context(&account, profile.as_ref(), None, "");
             let body: String = crate::render::render_str(&raw, &ctx, false).unwrap_or(raw).chars().take(MAX_BODY_CHARS).collect();
             if !body.trim().is_empty() {
-                let mid = send::prepare_conversational(&mut tx, account_id, profile_id, &rx.from, answer_kind, None, &body, None).await?;
+                let mid = send::prepare_conversational(&mut tx, account_id, profile_id, &from, answer_kind, None, &body, None).await?;
                 crate::jobs::enqueue(&mut *tx, "whatsapp_send", json!({"message_id": mid}), None).await?;
             }
         }
     }
     tx.commit().await?;
     let stored = Stored { id, profile_id, kind: kind.to_string(), keyword, subscribed_now };
-    after(state, account_id, rx, &stored).await
+    let mut rx = rx.clone();
+    rx.from = Some(from);
+    after(state, account_id, &rx, &stored).await
 }
 
 /// A message stored by an earlier delivery whose follow-up didn't finish: run it again (each step is
 /// recorded once).
 async fn finish_stored(state: &AppState, account_id: Uuid, wamid: &str) -> AppResult<()> {
-    let row: Option<(Uuid, Uuid, String, Option<String>, String, String, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>, String)> = sqlx::query_as(
+    type Row = (Uuid, Uuid, String, Option<String>, String, String, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>, String);
+    let row: Option<Row> = sqlx::query_as(
         "SELECT id, profile_id, kind, keyword, from_number, body, context_wamid, received_at, processed_at, msg_type FROM whatsapp_inbound WHERE account_id = $1 AND wamid = $2",
     )
     .bind(account_id)
@@ -249,12 +326,12 @@ async fn finish_stored(state: &AppState, account_id: Uuid, wamid: &str) -> AppRe
     if processed.is_some() {
         return Ok(());
     }
-    let k = match keyword.as_deref() {
-        Some(w) => keywords::by_word(&state.db, account_id, w).await?,
-        None => None,
+    let k = match (kind.as_str(), keyword.as_deref()) {
+        ("keyword", Some(w)) => keywords::by_word(&state.db, account_id, w).await?,
+        _ => None,
     };
-    let subscribed_now = matches!(kind.as_str(), "start") || k.as_ref().is_some_and(|k| k.subscribe);
-    let rx = Inbound { wamid: wamid.to_string(), from, name: None, msg_type, text: body, context_wamid, received_at };
+    let subscribed_now = matches!(kind.as_str(), "start" | "signup");
+    let rx = Inbound { wamid: wamid.to_string(), from: Some(from), user_id: None, name: None, msg_type, text: body, payload: None, context_wamid, received_at, timed: true };
     after(state, account_id, &rx, &Stored { id, profile_id, kind, keyword: k, subscribed_now }).await
 }
 
@@ -274,10 +351,11 @@ async fn after(state: &AppState, account_id: Uuid, rx: &Inbound, s: &Stored) -> 
         "stop" => {
             audience::record_event(&state.db, event("Unsubscribed from WhatsApp", format!("wa-out:{}", s.id), json!({"method": "stop", "inbound_message_id": s.id}))).await?;
         }
+        "verification" => {}
         _ => {
             if s.subscribed_now {
                 let method = if s.kind == "start" { "start" } else { "keyword" };
-                audience::record_event(&state.db, event("Subscribed to WhatsApp", format!("wa-sub:{}", s.id), json!({"method": method, "keyword": s.keyword.as_ref().map(|k| &k.keyword), "inbound_message_id": s.id}))).await?;
+                audience::record_event(&state.db, event("Subscribed to WhatsApp", format!("wa-sub:{}", s.id), json!({"method": method, "inbound_message_id": s.id}))).await?;
             }
             if let Some(k) = &s.keyword {
                 if let Some(list_id) = k.list_id {
@@ -296,9 +374,24 @@ async fn after(state: &AppState, account_id: Uuid, rx: &Inbound, s: &Stored) -> 
         }
     }
     sqlx::query("UPDATE whatsapp_inbound SET processed_at = now() WHERE id = $1").bind(s.id).execute(&state.db).await?;
-    // A flow waiting for this person's reply takes the "replied" path now.
-    crate::features::inbox::store::wake_waiting_flows(&state.db, s.profile_id, rx.received_at).await?;
+    // A flow waiting for this person's WhatsApp reply takes the "replied" path now.
+    // Meta's time is a whole second; the step itself checks the reply's time again.
+    crate::features::inbox::store::wake_waiting_flows(&state.db, s.profile_id, rx.received_at + chrono::Duration::milliseconds(999)).await?;
     Ok(())
+}
+
+/// For the flow step "wait for a reply" on WhatsApp: did this person send a WhatsApp message that
+/// counts as a reply (not an opt-out or a verification code) between `since` and `until`?
+pub async fn replied_between(db: &sqlx::PgPool, profile_id: Uuid, since: DateTime<Utc>, until: DateTime<Utc>) -> AppResult<bool> {
+    // Meta's times are whole seconds: a reply in the second the wait began counts.
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM whatsapp_inbound WHERE profile_id = $1 AND received_at >= date_trunc('second', $2) AND received_at <= $3 AND kind IN ('message', 'keyword', 'signup'))",
+    )
+        .bind(profile_id)
+        .bind(since)
+        .bind(until)
+        .fetch_one(db)
+        .await?)
 }
 
 // ---------- Conversations ----------
@@ -467,6 +560,10 @@ pub async fn reply(state: &AppState, account_id: Uuid, id: Uuid, b: &ReplyBody, 
             }
             if t.is_marketing() && contact["consent"] != "subscribed" {
                 return Err(AppError::bad("This is a marketing template, and they haven't opted in to WhatsApp marketing. Use a utility template or a free-form reply."));
+            }
+            let held: bool = sqlx::query_scalar("SELECT marketing_hold FROM profiles WHERE id = $1").bind(profile_id).fetch_optional(&state.db).await?.unwrap_or(false);
+            if t.is_marketing() && held {
+                return Err(AppError::bad("This is a marketing template, and they're held back from marketing. Use a utility template or a free-form reply."));
             }
             let r = content::render(&t, &c, &ctx, None)?;
             (r.text.clone(), Some((t, c)))

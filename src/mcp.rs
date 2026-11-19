@@ -260,6 +260,7 @@ fn form_config_schema() -> Value {
         "auto_close_seconds": int(0, 60, "Popup/flyout: close the thank-you screen after this many seconds; 0 keeps it open. Default 3 (0 with a discount code or success button)."),
         "confirm_message": text(300, "Shown instead of the thank-you screen when the list uses double opt-in."),
         "sms_consent_text": text(1000, "Shown next to the SMS consent checkbox under any phone field. Default: the standard carrier disclosure."),
+        "whatsapp_consent_text": text(1000, "Wording for an optional second box under the phone field that names WhatsApp; ticking it subscribes the number to WhatsApp marketing (dumbmail://docs/whatsapp). No wording, no box."),
         "brand_color": color("Default button color. Default: the account's brand color."),
         "delay_seconds": int(0, 600, "For targeting.trigger delay. Default 5."),
         "collect": {"type": ["array", "null"], "items": {"enum": ["email", "phone_number", "first_name"]}, "description": "Older way to pick fields; ignored when fields is set (it's kept in step automatically)."},

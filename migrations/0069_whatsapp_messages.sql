@@ -7,6 +7,16 @@ CREATE TABLE whatsapp_sent (
     -- marketing (campaigns and flows) | reply (typed by a team member) | keyword_reply | confirmation
     kind           text NOT NULL DEFAULT 'marketing',
     sent_by        uuid REFERENCES users(id) ON DELETE SET NULL,
+    -- The sender it was prepared for (`whatsapp_settings.sender_id`): another sender never sends it.
+    sender_id      uuid,
+    -- The number the final claim handed it to (what the worker sent to).
+    sent_to        text,
+    -- Credit held at the claim (when a price is set), settled once Meta says it was sent, released
+    -- if it fails.
+    reserved_micros bigint NOT NULL DEFAULT 0,
+    charged_at     timestamptz,
+    -- Meta's pacing answer to the send (accepted | held_for_quality_assessment | paused).
+    pacing         text,
     template_id    uuid REFERENCES whatsapp_templates(id) ON DELETE SET NULL,
     template_name  text,
     category       text,

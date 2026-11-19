@@ -26,8 +26,18 @@ CREATE TABLE whatsapp_settings (
     -- The last account-level problem Meta reported (token, permission, number), as a short class.
     error               text,
     error_at            timestamptz,
-    -- Numbers WhatsApp tests may go to (the team's own phones), E.164.
-    test_numbers        text[] NOT NULL DEFAULT '{}',
+    -- The verified sender everything else is bound to: a new id whenever the WhatsApp Business
+    -- Account or phone number changes (NULL while not connected). Consent, service windows, queued
+    -- sends and claims made for another sender don't carry over.
+    sender_id           uuid,
+    -- Words that sign someone up when sent on WhatsApp (explicitly WhatsApp's own, not texting
+    -- keywords), the answer to them, and quick-reply button payloads that mean "yes, send me
+    -- WhatsApp messages".
+    signup_keywords     text[] NOT NULL DEFAULT '{}',
+    signup_reply        text,
+    optin_buttons       text[] NOT NULL DEFAULT '{}',
+    -- When the owners were last told about a quality problem (at most once a day).
+    quality_alert_at    timestamptz,
     -- Last time a webhook delivery checked out, so the settings can show the webhook works.
     last_webhook_at     timestamptz,
     created_at          timestamptz NOT NULL DEFAULT now(),
@@ -52,6 +62,11 @@ CREATE TABLE whatsapp_templates (
     tracked_buttons  jsonb NOT NULL DEFAULT '{}',
     reason           text,
     quality          text,
+    -- Meta's time for the last status event applied, and when it was last paused or disabled:
+    -- only a later event or a read made after the pause can approve it again.
+    status_at        timestamptz,
+    paused_at        timestamptz,
+    category_at      timestamptz,
     created_by_dumbmail boolean NOT NULL DEFAULT false,
     synced_at        timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
@@ -70,8 +85,11 @@ CREATE TABLE whatsapp_contacts (
     consent_source  text,
     consent_at      timestamptz,
     wa_id           text,
-    -- Meta said this number can't get WhatsApp messages (error 131026); nothing more goes to it
-    -- until it messages the account.
+    -- Meta's business-scoped user id for this person (BSUID), learned from signed webhooks.
+    user_id         text,
+    -- Undeliverable answers (131026) in a row; after a few the number counts as off WhatsApp
+    -- (`unreachable_at`) until it writes in.
+    undeliverable_count integer NOT NULL DEFAULT 0,
     unreachable_at  timestamptz,
     -- Their latest message: the 24-hour customer service window runs from here.
     last_inbound_at timestamptz,
@@ -79,6 +97,7 @@ CREATE TABLE whatsapp_contacts (
     PRIMARY KEY (account_id, phone_number)
 );
 CREATE INDEX whatsapp_contacts_profile ON whatsapp_contacts (profile_id) WHERE profile_id IS NOT NULL;
+CREATE UNIQUE INDEX whatsapp_contacts_user ON whatsapp_contacts (account_id, user_id) WHERE user_id IS NOT NULL;
 
 -- Every WhatsApp consent change, with where it came from (until the shared consent history lands).
 CREATE TABLE whatsapp_consent_log (

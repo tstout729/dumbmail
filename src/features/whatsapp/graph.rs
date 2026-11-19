@@ -65,7 +65,8 @@ pub enum Class {
     NotOnWhatsApp,
     /// 131050: the person stopped marketing messages from this business on WhatsApp.
     MarketingOptOut,
-    /// 130429, 131056, 80007, 4: throughput, pair rate or account rate limits. Back off and retry.
+    /// 130429, 131056, 80007, 80008, 4: throughput, pair rate, account or template API rate limits.
+    /// Back off and retry.
     RateLimited,
     /// 132015, 132016: the template was paused or disabled for quality.
     TemplatePaused,
@@ -103,7 +104,7 @@ impl GraphError {
         match self.code {
             131026 => Class::NotOnWhatsApp,
             131050 => Class::MarketingOptOut,
-            130429 | 131056 | 80007 | 4 => Class::RateLimited,
+            130429 | 131056 | 80007 | 80008 | 4 => Class::RateLimited,
             132015 | 132016 => Class::TemplatePaused,
             132001 => Class::TemplateMissing,
             131047 => Class::WindowClosed,
@@ -192,7 +193,11 @@ async fn call(cfg: &Config, method: reqwest::Method, path: &str, query: &[(&str,
         return Ok(v);
     }
     let e = &v["error"];
-    Err(GraphError { code: e["code"].as_i64().unwrap_or(0), subcode: e["error_subcode"].as_i64(), status, unclear: false })
+    let code = e["code"].as_i64().unwrap_or(0);
+    // A change that got a gateway error (502, 503 ...) or no definite Meta error code may have been
+    // made anyway: it's never repeated.
+    let unclear = write && (status >= 500 || code == 0);
+    Err(GraphError { code, subcode: e["error_subcode"].as_i64(), status, unclear })
 }
 
 /// The phone number's name, quality and messaging limit (Check connection).
@@ -227,6 +232,8 @@ pub async fn create_template(cfg: &Config, token: &str, waba_id: &str, body: &Va
 pub struct Accepted {
     pub wamid: String,
     pub wa_id: Option<String>,
+    /// Meta's pacing answer: accepted, held_for_quality_assessment or paused.
+    pub pacing: Option<String>,
 }
 
 /// Send one message. `payload` is the message without `messaging_product` and the recipient.
@@ -239,7 +246,11 @@ pub async fn send_message(cfg: &Config, token: &str, phone_number_id: &str, to: 
     }
     let v = call(cfg, reqwest::Method::POST, &format!("{phone_number_id}/messages"), &[], token, Some(&body), true).await?;
     match v["messages"][0]["id"].as_str().filter(|s| !s.is_empty() && s.len() <= 200) {
-        Some(id) => Ok(Accepted { wamid: id.to_string(), wa_id: v["contacts"][0]["wa_id"].as_str().map(|s| s.chars().take(40).collect()) }),
+        Some(id) => Ok(Accepted {
+            wamid: id.to_string(),
+            wa_id: v["contacts"][0]["wa_id"].as_str().map(|s| s.chars().take(40).collect()),
+            pacing: v["messages"][0]["message_status"].as_str().map(|s| s.chars().take(40).collect()),
+        }),
         None => Err(GraphError { code: 0, subcode: None, status: 200, unclear: true }),
     }
 }
@@ -259,6 +270,7 @@ mod tests {
         assert_eq!(e(190).class(), Class::Auth);
         assert_eq!(e(100).class(), Class::Refused);
         assert_eq!(GraphError { code: 0, subcode: None, status: 503, unclear: false }.class(), Class::Transient);
+        assert_eq!(e(80008).class(), Class::RateLimited);
         assert_eq!(GraphError { code: 0, subcode: None, status: 0, unclear: true }.class(), Class::Unclear);
         assert!(e(131026).describe().contains("131026"));
         assert!(valid_id("106540352242922"));

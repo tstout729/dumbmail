@@ -411,6 +411,8 @@ export type RandomSplitNode = {
 export type WaitForReplyNode = {
   id: string;
   type: "wait_for_reply";
+  /** Which replies count: texts (default) or WhatsApp messages. */
+  channel?: "sms" | "whatsapp";
   amount: number;
   unit: DelayUnit;
   yes: string | null;
@@ -693,6 +695,7 @@ export type FormConfig = {
   auto_close_seconds?: number | null;
   confirm_message?: string | null;
   sms_consent_text?: string | null;
+  whatsapp_consent_text?: string | null;
   brand_color?: string | null;
   fields?: FormFieldDef[] | null;
   /** Legacy field list; used only while `fields` is absent. */

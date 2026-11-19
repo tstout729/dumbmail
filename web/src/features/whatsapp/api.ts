@@ -61,6 +61,22 @@ export function useRotateVerifyToken() {
   });
 }
 
+export function useAddTestNumber() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (phone_number: string) => api<{ id: string; phone_number: string; code: string; note: string }>("POST", "/api/whatsapp/test-numbers", { phone_number }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: whatsappKeys.settings }),
+  });
+}
+
+export function useRemoveTestNumber() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api<{ ok: boolean }>("DELETE", `/api/whatsapp/test-numbers/${id}`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: whatsappKeys.settings }),
+  });
+}
+
 export function useWhatsappTemplates(enabled = true) {
   return useQuery({
     queryKey: whatsappKeys.templates,

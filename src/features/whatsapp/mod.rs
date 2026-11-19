@@ -15,6 +15,7 @@ pub mod inbox;
 pub mod send;
 pub mod settings;
 pub mod templates;
+pub mod testers;
 mod tools;
 pub mod webhook;
 
@@ -61,9 +62,12 @@ static ROUTES: &[RouteRule] = &[
     rule("POST", "/api/whatsapp/settings/verify-token", Perm::SettingsWrite),
     rule("GET", "/api/whatsapp/templates", Perm::AccountRead),
     rule("POST", "/api/whatsapp/templates", Perm::SettingsWrite),
-    rule("POST", "/api/whatsapp/templates/sync", Perm::AccountRead),
+    rule("POST", "/api/whatsapp/templates/sync", Perm::SettingsWrite),
     rule("GET", "/api/whatsapp/templates/{id}", Perm::AccountRead),
     rule("POST", "/api/whatsapp/test", Perm::TestSend),
+    rule("GET", "/api/whatsapp/test-numbers", Perm::AccountRead),
+    rule("POST", "/api/whatsapp/test-numbers", Perm::TestSend),
+    rule("DELETE", "/api/whatsapp/test-numbers/{id}", Perm::TestSend),
     rule("GET", "/api/whatsapp/profiles/{id}", Perm::ProfilesRead),
     rule("PUT", "/api/whatsapp/profiles/{id}/consent", Perm::AudienceWrite),
     rule("POST", "/api/whatsapp/consent/import", Perm::AudienceWrite),
@@ -84,7 +88,9 @@ static TOOLS: &[ToolRule] = &[
     ToolRule { name: "disconnect_whatsapp", perm: Perm::SettingsWrite },
     ToolRule { name: "check_whatsapp_connection", perm: Perm::AccountRead },
     ToolRule { name: "list_whatsapp_templates", perm: Perm::AccountRead },
-    ToolRule { name: "sync_whatsapp_templates", perm: Perm::AccountRead },
+    ToolRule { name: "sync_whatsapp_templates", perm: Perm::SettingsWrite },
+    ToolRule { name: "list_whatsapp_test_numbers", perm: Perm::AccountRead },
+    ToolRule { name: "add_whatsapp_test_number", perm: Perm::TestSend },
     ToolRule { name: "create_whatsapp_template", perm: Perm::SettingsWrite },
     ToolRule { name: "send_test_whatsapp", perm: Perm::TestSend },
     ToolRule { name: "get_whatsapp_consent", perm: Perm::ProfilesRead },
@@ -109,6 +115,28 @@ pub async fn alert_template(state: &AppState, account_id: Uuid, name: &str, even
          Check its quality in WhatsApp Manager, edit it if needed, then sync templates in Settings → WhatsApp."
     );
     crate::features::webhooks::alert_account(state, account_id, &format!("WhatsApp template {name} was {what}"), &text).await;
+}
+
+/// Email the account's owners about a quality problem Meta reported (a restricted number, spam
+/// signals), at most once a day.
+pub async fn alert_quality(state: &AppState, account_id: Uuid, why: &str) {
+    let due: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE whatsapp_settings SET quality_alert_at = now() WHERE account_id = $1 AND (quality_alert_at IS NULL OR quality_alert_at < now() - interval '1 day') RETURNING account_id",
+    )
+    .bind(account_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    if due.is_none() {
+        return;
+    }
+    let text = format!(
+        "Meta limited sending from your WhatsApp number: {why}.\n\n\
+         This usually follows people blocking or reporting your messages. DumbMail keeps trying within Meta's limits, but check the number's quality \
+         rating in WhatsApp Manager, slow down marketing sends and make sure everyone you message opted in."
+    );
+    crate::features::webhooks::alert_account(state, account_id, "Meta limited your WhatsApp number", &text).await;
 }
 
 // ---------- Channel hooks used by shared code ----------
@@ -174,8 +202,8 @@ pub async fn campaign_test(state: &AppState, account: &Account, c: &CampaignRow,
 
 async fn test_number(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<String> {
     let n = normalize_phone(raw).ok_or_else(|| AppError::bad(format!("{raw:?} isn't a phone number (use +15035550100)")))?;
-    if !settings::test_numbers(&state.db, account_id).await?.contains(&n) {
-        return Err(AppError::bad(format!("WhatsApp tests go only to the team's test numbers, and {n} isn't one. Add it in Settings → WhatsApp.")));
+    if !testers::is_member_number(&state.db, account_id, &n).await? {
+        return Err(AppError::bad(format!("WhatsApp tests go only to team members' verified numbers, and {n} isn't one. Add yours in Settings → WhatsApp.")));
     }
     Ok(n)
 }
@@ -266,15 +294,44 @@ async fn template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
     Ok(Json(templates::get(&state.db, ctx.account_id, id).await?.json()))
 }
 
-pub async fn sync_templates(state: &AppState, account_id: Uuid) -> AppResult<Value> {
-    let n = templates::sync(state, account_id).await?;
-    let mut out = templates_json(state, account_id).await?;
+pub async fn sync_templates(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
+    let n = templates::sync(state, ctx.account_id).await?;
+    crate::features::team::audit(state, ctx, "whatsapp.templates_sync", None, json!({"read": n})).await;
+    let mut out = templates_json(state, ctx.account_id).await?;
     out["read"] = json!(n);
     Ok(out)
 }
 
 async fn sync_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(sync_templates(&state, ctx.account_id).await?))
+    Ok(Json(sync_templates(&state, &ctx).await?))
+}
+
+async fn test_numbers_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    Ok(Json(json!({"test_numbers": testers::list(&state.db, ctx.account_id).await?})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestNumberBody {
+    pub phone_number: String,
+}
+
+/// Start verifying the signed-in member's own number.
+pub async fn add_test_number(state: &AppState, ctx: &Ctx, phone: &str) -> AppResult<Value> {
+    let user = ctx.user_id.ok_or_else(|| AppError::bad("Sign in as the team member whose phone this is: a test number is a member's own phone"))?;
+    let out = testers::add(&state.db, ctx.account_id, user, phone).await?;
+    crate::features::team::audit(state, ctx, "whatsapp.test_number_add", out["id"].as_str(), json!({})).await;
+    Ok(out)
+}
+
+async fn add_test_number_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<TestNumberBody>) -> AppResult<Json<Value>> {
+    Ok(Json(add_test_number(&state, &ctx, &b.phone_number).await?))
+}
+
+async fn remove_test_number_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    testers::remove(&state.db, ctx.account_id, ctx.user_id, ctx.can(Perm::SettingsWrite), id).await?;
+    crate::features::team::audit(&state, &ctx, "whatsapp.test_number_remove", Some(&id.to_string()), json!({})).await;
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Deserialize)]
@@ -386,7 +443,7 @@ pub async fn set_profile_consent(state: &AppState, ctx: &Ctx, id: Uuid, b: &Cons
     if now_phone.flatten().as_deref() != Some(phone.as_str()) {
         return Err(AppError::Conflict("This person's phone number just changed; try again".into()));
     }
-    let changed = consent::set(&mut tx, &state.db, ctx.account_id, &phone, Some(id), &b.consent, "api", detail).await?;
+    let changed = consent::set(&mut tx, &state.db, ctx.account_id, &phone, Some(id), &b.consent, "api", detail, chrono::Utc::now()).await?;
     tx.commit().await?;
     if changed {
         let metric = if b.consent == "subscribed" { "Subscribed to WhatsApp" } else { "Unsubscribed from WhatsApp" };
@@ -439,7 +496,7 @@ pub async fn import_consent(state: &AppState, ctx: &Ctx, b: &ImportBody) -> AppR
         };
         let mut tx = state.db.begin().await?;
         consent::lock(&mut tx, ctx.account_id, n).await?;
-        if consent::set(&mut tx, &state.db, ctx.account_id, n, Some(pid), &b.consent, "import", detail.clone()).await? {
+        if consent::set(&mut tx, &state.db, ctx.account_id, n, Some(pid), &b.consent, "import", detail.clone(), chrono::Utc::now()).await? {
             changed += 1;
         }
         tx.commit().await?;
@@ -581,6 +638,8 @@ impl Feature for Module {
             .route("/api/whatsapp/templates/sync", post(sync_h))
             .route("/api/whatsapp/templates/{id}", get(template_h))
             .route("/api/whatsapp/test", post(test_h))
+            .route("/api/whatsapp/test-numbers", get(test_numbers_h).post(add_test_number_h))
+            .route("/api/whatsapp/test-numbers/{id}", axum::routing::delete(remove_test_number_h))
             .route("/api/whatsapp/profiles/{id}", get(profile_h))
             .route("/api/whatsapp/profiles/{id}/consent", put(consent_h))
             .route("/api/whatsapp/consent/import", post(import_h))
@@ -625,5 +684,15 @@ impl Feature for Module {
             .await),
             _ => None,
         }
+    }
+
+    async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
+        if tick.is_multiple_of(90) {
+            send::release_stale_holds(&state.db).await?;
+            sqlx::query("DELETE FROM whatsapp_seen WHERE created_at < now() - interval '14 days'").execute(&state.db).await?;
+            sqlx::query("DELETE FROM whatsapp_backoff WHERE until < now() - interval '1 day'").execute(&state.db).await?;
+            sqlx::query("DELETE FROM whatsapp_test_numbers WHERE verified_at IS NULL AND created_at < now() - interval '1 day'").execute(&state.db).await?;
+        }
+        Ok(())
     }
 }

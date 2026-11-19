@@ -301,6 +301,9 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
             }
             "update_profile" => need("properties")?,
             "wait_for_reply" => {
+                if !matches!(n.str("channel"), None | Some("sms" | "whatsapp")) {
+                    return Err(AppError::bad(format!("wait for reply {} channel must be sms or whatsapp", n.id)));
+                }
                 let amount = n.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                 let unit = match n.str("unit") {
                     Some("minutes") => 60.0,
@@ -1399,7 +1402,13 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                 // A deadline that can't be read counts nothing after the wait began.
                 let deadline = at("_reply_until").unwrap_or(since);
                 let now = Utc::now();
-                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                // Only a reply on the step's own channel counts (texts unless it says WhatsApp).
+                let replied = if node.str("channel") == Some("whatsapp") {
+                    crate::features::whatsapp::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await
+                } else {
+                    crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await
+                }
+                .map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 if !replied && now < deadline {
                     // Woken before the deadline without a reply inside the wait: keep waiting.
                     wait_until(&state.db, &hold, &node_id, &context, deadline).await?;
