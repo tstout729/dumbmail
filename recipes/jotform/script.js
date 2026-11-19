@@ -8,20 +8,32 @@
 //
 // Form Submitted: once per submission, on the profile of the email answer (settings.email_field,
 // the question's ID). A form submission isn't an opt-in: nobody is subscribed and nobody is
-// renamed, and people this adds are held back from marketing. If the form has a consent question,
+// renamed, and people this adds are held back from marketing. Only the form you choose
+// (settings.form_id, required) is recorded, and only questions of safe types can be mapped: names,
+// email, phone, short text, numbers, dates, dropdowns, radio buttons and checkboxes; never
+// addresses, payments, signatures or file uploads. If the form has a consent question,
 // map it (consent_field and the answer that means yes, consent_value): the answer is recorded on
 // the event as marketing_consent, for you to follow up with a confirmation. Only the answers in
-// copy_fields are copied onto the event; every other answer is dropped before anything is stored.
+// copy_fields are copied onto the event (their values, not Jotform's formatted text); every other answer is dropped before anything is stored.
 
 var ID = /^[0-9]{1,24}$/;
+// Question types that may be mapped. Never addresses, payments, signatures, file uploads or
+// anything else: those answers aren't kept, so they can't be copied.
+var SAFE = ["control_fullname", "control_email", "control_phone", "control_textbox", "control_number", "control_datetime", "control_dropdown", "control_radio", "control_checkbox"];
+var CONSENT_TYPES = ["control_checkbox", "control_radio", "control_dropdown"];
 
-function answerValue(a) {
-  if (!a || typeof a !== "object") return undefined;
+// A mapped answer's value: text, a number, a list of ticked options, or a name ("first last").
+// Anything else (an answer given as some other object) isn't used.
+function answerValue(a, types) {
+  if (!a || typeof a !== "object" || (types || SAFE).indexOf(a.type) < 0) return undefined;
   var v = a.answer;
   if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return v;
   if (Array.isArray(v) && v.every(function (x) { return typeof x === "string"; })) return v;
-  // Names, addresses and the like are objects; their prettyFormat is the text.
-  return typeof a.prettyFormat === "string" ? a.prettyFormat : undefined;
+  if (a.type === "control_fullname" && v && typeof v === "object") {
+    var n = [v.first, v.last].filter(function (x) { return typeof x === "string" && x; }).join(" ");
+    return n || undefined;
+  }
+  return undefined;
 }
 
 function fetched(input, id) {
@@ -30,14 +42,14 @@ function fetched(input, id) {
   var c = body.content || {};
   if (String(c.id) !== id) return [{ type: "log", message: "the answer isn't submission " + id }];
   var form = String(c.form_id || "");
-  if (s.form_id && form !== String(s.form_id)) return [{ type: "log", message: "submission " + id + " is from another form (" + form + ")" }];
+  if (!s.form_id || form !== String(s.form_id)) return [{ type: "log", message: "submission " + id + " isn't from the form this integration records (form_id)" }];
   if (!s.email_field) return [{ type: "log", message: "set email_field in the integration's settings to the ID of the form's email question" }];
   var answers = c.answers && typeof c.answers === "object" ? c.answers : {};
-  var email = answerValue(answers[String(s.email_field)]);
+  var email = answerValue(answers[String(s.email_field)], ["control_email"]);
   if (typeof email !== "string" || email.indexOf("@") < 1) return [{ type: "log", message: "submission " + id + " has no email answer" }];
   var props = { form_id: form, submission_id: id };
   if (s.consent_field && s.consent_value) {
-    var v = answerValue(answers[String(s.consent_field)]);
+    var v = answerValue(answers[String(s.consent_field)], CONSENT_TYPES);
     var yes = String(s.consent_value);
     props.marketing_consent = v === yes || (Array.isArray(v) && v.indexOf(yes) >= 0);
   }
@@ -70,6 +82,7 @@ function handle(input) {
   var form = String(f.formID === undefined || f.formID === null ? "" : f.formID);
   if (!ID.test(id)) return [{ type: "log", message: "not a Jotform submission (no submissionID)" }];
   var s = input.settings || {};
-  if (s.form_id && form !== String(s.form_id)) return [{ type: "log", message: "ignored a submission from another form (" + form + ")" }];
+  if (!s.form_id) return [{ type: "log", message: "set form_id in the integration's settings to the form to record" }];
+  if (form !== String(s.form_id)) return [{ type: "log", message: "ignored a submission from another form (" + form + ")" }];
   return [{ type: "next_request", url: "/submission/" + id }];
 }

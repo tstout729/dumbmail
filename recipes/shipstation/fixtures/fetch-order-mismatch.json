@@ -16,6 +16,12 @@
       ]
     },
     "payload": {
+      "advancedOptions": {
+        "customField1": "Gift wrap, code 5150",
+        "source": "web",
+        "storeId": 123456,
+        "warehouseId": 16079
+      },
       "amountPaid": 218.73,
       "billTo": {
         "addressVerified": null,
@@ -84,6 +90,11 @@
       "headers": {},
       "received_at": "2026-11-17T17:01:00.000Z",
       "status": 200
+    },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
     },
     "source": "fetch"
   }

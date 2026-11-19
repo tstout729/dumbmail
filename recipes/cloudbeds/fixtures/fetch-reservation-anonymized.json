@@ -7,7 +7,7 @@
       "type": "log"
     },
     {
-      "as_of": "2026-11-17T17:00:00.250Z",
+      "as_of": "2026-11-17T17:00:00.100Z",
       "external_id": "cloudbeds:31415926",
       "fields": {
         "balance": 0,
@@ -15,7 +15,7 @@
         "check_out": "2026-12-05",
         "guests": 3,
         "nights": 2,
-        "paid_checked_at": "2026-11-17T17:00:00.250Z",
+        "paid_checked_at": "2026-11-17T17:00:00.100Z",
         "paid_in_full": true,
         "property_id": "12345",
         "reservation_id": "31415926",
@@ -23,7 +23,7 @@
         "status": "confirmed",
         "total": 241.8
       },
-      "object_type": "reservation",
+      "object_type": "cloudbeds_reservation",
       "profiles": [],
       "replace_links": [
         "guest"
@@ -173,7 +173,18 @@
     },
     "request": {
       "method": "GET",
-      "url": "https://api.cloudbeds.com/api/v1.3/getReservation?reservationID=31415926&propertyID=12345"
+      "query": [
+        [
+          "propertyID",
+          "12345"
+        ],
+        [
+          "reservationID",
+          "31415926"
+        ]
+      ],
+      "sent_at": "2026-11-17T17:00:00.100Z",
+      "url": "https://api.cloudbeds.com/api/v1.3/getReservation"
     },
     "response": {
       "headers": {

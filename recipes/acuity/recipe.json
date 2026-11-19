@@ -77,6 +77,7 @@
     "In Acuity, open Integrations → API → View credentials. Save the user ID and API key as the credentials user_id and api_key, and the API key again as the integration's signing secret (Acuity signs webhooks with it).",
     "In Acuity, open Integrations → Webhooks (Set up). Paste the webhook URL in the boxes for Appointment scheduled, Appointment rescheduled and Appointment canceled, and save. Leave the \"any change\" box empty: it repeats the others.",
     "Book a test appointment and check the delivery log: each webhook is followed by a fetch of the appointment.",
+    "Acuity's appointments carry no revision number, so each webhook records the appointment as Acuity has it when DumbMail fetches it: its latest state. An appointment moved back and forth quickly (A to B, back to A, then B again) can show fewer reschedules than happened.",
     "Clients are held back from marketing: booking an appointment isn't consent. Flows marked as service messages (a booking follow-up, say) still reach them.",
     "Only the client's name, email and phone and the appointment's time, type, calendar and length are kept. Intake form answers, notes, prices and links are dropped before anything is stored."
   ],

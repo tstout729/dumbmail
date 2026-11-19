@@ -48,7 +48,7 @@
             "type": "control_email"
           },
           "6": {
-            "answer": "",
+            "answer": [],
             "prettyFormat": "",
             "text": "Can we email you?",
             "type": "control_checkbox"
@@ -57,6 +57,15 @@
             "answer": "Surfing",
             "text": "Interest",
             "type": "control_dropdown"
+          },
+          "8": {
+            "answer": {
+              "addr_line1": "1 Test Street",
+              "city": "Portland"
+            },
+            "prettyFormat": "1 Test Street, Portland",
+            "text": "Address",
+            "type": "control_address"
           }
         },
         "created_at": "2013-06-25 03:38:00",

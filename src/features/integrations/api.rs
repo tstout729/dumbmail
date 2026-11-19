@@ -244,7 +244,11 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     let ct = parts.headers.get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
     // A multipart form (Jotform) is kept as an ordinary form of its text fields, once its
     // signature (if any) has been checked against the raw bytes.
-    let (ct, body) = match ct.as_deref().and_then(|c| engine::multipart_as_form(c, &bytes)) {
+    let form = match ct.as_deref() {
+        Some(c) => engine::multipart_as_form(c, bytes.clone()).await,
+        None => None,
+    };
+    let (ct, body) = match form {
         Some(form) => (Some("application/x-www-form-urlencoded".to_string()), form),
         None => (ct, String::from_utf8_lossy(&bytes).into_owned()),
     };

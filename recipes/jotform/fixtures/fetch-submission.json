@@ -1,5 +1,5 @@
 {
-  "description": "The fetched submission: Form Submitted on the email answer's profile, the consent answer as marketing_consent (nobody subscribed), and only the mapped answers; the message and IP are never kept",
+  "description": "The fetched submission: Form Submitted on the email answer's profile, the consent answer as marketing_consent (nobody subscribed), and only the mapped answers of safe types (the name's value, not Jotform's formatted text; the address isn't kept even though it's listed); the message and IP are never kept",
   "doc": "https://api.jotform.com/docs/#submission-id (example response; answers extended with documented question types; personal data replaced)",
   "expect": [
     {
@@ -59,6 +59,15 @@
             "answer": "Surfing",
             "text": "Interest",
             "type": "control_dropdown"
+          },
+          "8": {
+            "answer": {
+              "addr_line1": "1 Test Street",
+              "city": "Portland"
+            },
+            "prettyFormat": "1 Test Street, Portland",
+            "text": "Address",
+            "type": "control_address"
           }
         },
         "created_at": "2013-06-25 03:38:00",
@@ -88,7 +97,9 @@
       "consent_value": "Yes, send me emails",
       "copy_fields": [
         "7",
-        "3"
+        "3",
+        "8",
+        "4"
       ],
       "email_field": "5",
       "form_id": "31751954731962"
@@ -97,6 +108,7 @@
   },
   "sensitive": [
     "My door code is 2468",
-    "203.0.113.7"
+    "203.0.113.7",
+    "1 Test Street"
   ]
 }

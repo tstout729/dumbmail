@@ -72,7 +72,8 @@
     "In Gorgias, open Settings → REST API. Save the username (your email) and the API key as the credentials email and api_key. In the Pull tab, change your-account in https://your-account.gorgias.com to your Gorgias account's name (the part before .gorgias.com in the base URL on the same page).",
     "Pick a long random value and save it as the integration's signing secret.",
     "In Gorgias, open Settings → HTTP integration → Manage → Add HTTP integration. Name it DumbMail, paste the webhook URL, method POST, and under Header add X-Webhook-Token with the same value. Tick the triggers Ticket created and Ticket updated. Request content type application/json, with this body: {\"ticket_id\": \"{{ticket.id}}\"}. Add the integration.",
-    "Create a test ticket and check the delivery log: each request is followed by a fetch of the ticket. Closing it records Ticket Closed; a survey answer is recorded the next time Gorgias sends an update for the ticket.",
+    "Create a test ticket and check the delivery log: each request is followed by a fetch of the ticket. Closing it records Ticket Closed.",
+    "Satisfaction ratings arrive only with the ticket's next update: Gorgias's HTTP integrations have no trigger for a survey answer, so a rating is recorded the next time Gorgias sends Ticket updated for that ticket (for example when it's reopened, tagged or closed again).",
     "Only the ticket's subject, status and channel and the survey's score are kept. Messages, the survey comment and customers' names are never stored.",
     "Customers are held back from marketing: a support ticket isn't consent."
   ],

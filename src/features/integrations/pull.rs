@@ -85,7 +85,28 @@ pub struct FetchRules {
     /// lookup is refused unless its path, once rendered and normalised, does too. Default `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// Lookups this integration may queue in an hour (default 1,000, at most 10,000): counted in
+    /// the database when each one is reserved. Past it, the webhook (or page) that asked waits and
+    /// is tried again later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_hour: Option<u32>,
+    /// Requests a minute this integration's credentials may make (the app's documented rate, e.g.
+    /// ShipStation's 40). A lookup over it waits for room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_minute: Option<u32>,
+    /// A header in which the app gives the seconds until its rate window resets (ShipStation's
+    /// `X-Rate-Limit-Reset`), read after a 429 when there's no `Retry-After`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_header: Option<String>,
+    /// What makes two lookups the same while they wait: `record` (default: the path and query;
+    /// a second callback's context replaces the first's) or `record_and_context` (each context is
+    /// its own piece of work, so one never replaces another).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
+
+/// Default lookups an integration may queue in an hour.
+pub const DEFAULT_LOOKUPS_PER_HOUR: u32 = 1000;
 
 fn default_fetch_id() -> String {
     "^[0-9]{1,20}$".into()
@@ -111,7 +132,29 @@ impl FetchRules {
         if self.id.len() > 100 || !self.id.starts_with('^') || !self.id.ends_with('$') || regex::Regex::new(&self.id).is_err() {
             return Err(AppError::bad("fetch id must be an anchored pattern (^…$) of up to 100 characters"));
         }
+        if self.per_hour.is_some_and(|n| !(1..=10_000).contains(&n)) {
+            return Err(AppError::bad("fetch per_hour must be 1 to 10000"));
+        }
+        if self.per_minute.is_some_and(|n| !(1..=600).contains(&n)) {
+            return Err(AppError::bad("fetch per_minute must be 1 to 600"));
+        }
+        if self.reset_header.as_ref().is_some_and(|h| h.is_empty() || h.len() > 64 || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+            return Err(AppError::bad("fetch reset_header must be a header name"));
+        }
+        if self.identity.as_deref().is_some_and(|i| i != "record" && i != "record_and_context") {
+            return Err(AppError::bad("fetch identity is record or record_and_context"));
+        }
         Ok(())
+    }
+
+    /// Lookups this integration may queue in an hour.
+    pub fn lookups_per_hour(&self) -> i64 {
+        i64::from(self.per_hour.unwrap_or(DEFAULT_LOOKUPS_PER_HOUR))
+    }
+
+    /// Whether each context is its own piece of work (see `identity`).
+    pub fn context_is_identity(&self) -> bool {
+        self.identity.as_deref() == Some("record_and_context")
     }
 
     /// The lookup a script asked for, if these rules allow it: a `GET` of a declared path and
@@ -153,7 +196,11 @@ impl FetchRules {
         let mut query = Map::new();
         for (k, v) in next.query.iter().flatten() {
             let text = plain(v).ok_or_else(|| format!("fetch query {k:?} must be text"))?;
-            if !self.query.iter().any(|q| q == k) || !text.split(',').all(|part| id.is_match(part)) {
+            // A declared `key=value` allows exactly that value (Eventbrite's `expand=refund_requests`);
+            // a declared `key` allows ids.
+            let fixed = self.query.iter().any(|q| q.split_once('=').is_some_and(|(qk, qv)| qk == k && qv == text));
+            let as_id = self.query.iter().any(|q| q == k) && text.split(',').all(|part| id.is_match(part));
+            if !fixed && !as_id {
                 return Err(format!("fetch query {k:?} isn't allowed (or its value isn't an id)"));
             }
             query.insert(k.clone(), Value::String(text));
@@ -1098,6 +1145,20 @@ mod tests {
         assert!(ask("/v3/plain/7").is_ok());
         assert!(ask("/v3/orders//").is_err());
         assert!(ask("/v3//orders/123/").is_err());
+    }
+
+    #[test]
+    fn a_declared_query_value_is_allowed_exactly() {
+        let cfg = PullConfig::parse(&json!({"url": "https://www.eventbriteapi.com/v3/orders", "fetch": {"prefix": "/v3/", "paths": ["/v3/orders/{id}/"], "query": ["expand=refund_requests", "page"]}})).unwrap();
+        let rules = cfg.fetch.unwrap();
+        let empty = Map::new();
+        let v = vars(&empty, &empty, &empty, false);
+        let ask = |k: &str, val: &str| rules.allow(&NextRequest { url: Some("/v3/orders/1/".into()), query: Some(obj(json!({k: val}))), ..Default::default() }, &v);
+        assert!(ask("expand", "refund_requests").is_ok());
+        assert!(ask("expand", "attendees").is_err(), "only the declared value");
+        assert!(ask("expand", "refund_requests,attendees").is_err());
+        assert!(ask("page", "2").is_ok());
+        assert!(ask("page", "x").is_err());
     }
 
     #[test]

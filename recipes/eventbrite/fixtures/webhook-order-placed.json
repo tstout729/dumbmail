@@ -3,6 +3,9 @@
   "doc": "https://www.eventbrite.com/platform/docs/webhooks (example payload; config fields from the same page)",
   "expect": [
     {
+      "query": {
+        "expand": "refund_requests"
+      },
       "type": "next_request",
       "url": "/v3/orders/1234567890/"
     }
@@ -16,6 +19,12 @@
         "user_id": "1548223516143",
         "webhook_id": "157236"
       }
+    },
+    "settings": {
+      "event_ids": [
+        "123456",
+        "12345"
+      ]
     }
   }
 }

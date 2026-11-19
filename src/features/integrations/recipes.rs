@@ -187,7 +187,6 @@ mod tests {
             all().iter().map(|r| (r.key.clone(), metric_names(&r.manifest["metrics"], true))).filter(|(_, m)| !m.is_empty()).collect();
         let want: std::collections::BTreeMap<String, Vec<String>> = [
             ("bigcommerce", "Placed Order"),
-            ("cloudbeds", "Reservation Confirmed"),
             ("eventbrite", "Placed Order"),
             ("guesty", "Reservation Confirmed"),
             ("hostaway", "Reservation Confirmed"),

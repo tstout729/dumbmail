@@ -17,6 +17,11 @@
     "payload": {
       "resource_type": "ITEM_SHIP_NOTIFY",
       "resource_url": "https://ssapi2.shipstation.com/shipments?storeID=123456&batchId=12345678&includeShipmentItems=True"
+    },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
     }
   }
 }

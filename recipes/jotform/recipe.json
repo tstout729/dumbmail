@@ -42,7 +42,8 @@
       "paths": [
         "/submission/{id}"
       ],
-      "id": "^[0-9]{1,24}$"
+      "id": "^[0-9]{1,24}$",
+      "per_hour": 1000
     }
   },
   "redact": [
@@ -51,18 +52,24 @@
     "keep:responseCode",
     "keep:content.id",
     "keep:content.form_id",
-    "keep:content.answers.{setting:email_field}.answer",
-    "keep:content.answers.{setting:consent_field}.answer",
-    "keep:content.answers.{setting:copy_fields}.answer",
-    "keep:content.answers.{setting:copy_fields}.prettyFormat"
+    "keep:content.answers.{setting:email_field}[type=control_email].type",
+    "keep:content.answers.{setting:email_field}[type=control_email].answer",
+    "keep:content.answers.{setting:consent_field}[type=control_checkbox|control_radio|control_dropdown].type",
+    "keep:content.answers.{setting:consent_field}[type=control_checkbox|control_radio|control_dropdown].answer",
+    "keep:content.answers.{setting:copy_fields}[type=control_fullname|control_email|control_phone|control_textbox|control_number|control_datetime|control_dropdown|control_radio|control_checkbox].type",
+    "keep:content.answers.{setting:copy_fields}[type=control_fullname|control_email|control_phone|control_textbox|control_number|control_datetime|control_dropdown|control_radio|control_checkbox].answer",
+    "keep:content.answers.{setting:copy_fields}[type=control_fullname].answer.first",
+    "keep:content.answers.{setting:copy_fields}[type=control_fullname].answer.last"
   ],
   "setup": [
     "Create the integration from this recipe and copy its webhook URL. Keep it private: Jotform doesn't sign webhooks, so the URL is the secret.",
     "In Jotform, open My Account → API → Create New Key with Read Access, and save it as the credential api_key. If your account is on Jotform's EU servers, change api.jotform.com to eu-api.jotform.com in the Pull tab (hipaa-api.jotform.com for HIPAA accounts).",
     "Open the form in the Form Builder → Settings → Integrations → Webhooks, paste the webhook URL and complete the integration.",
-    "Set form_id in the integration's settings to the form's ID (the number in its address); submissions from other forms are ignored. Set email_field to the ID of the form's email question. The question IDs are the numbers in https://api.jotform.com/form/<form ID>/questions?apiKey=<your key>.",
-    "If the form asks for marketing consent, set consent_field to that question's ID and consent_value to the exact answer that means yes (for example \"Yes, send me emails\"): it's recorded on each Form Submitted event as marketing_consent. Set copy_fields to the IDs of the answers worth keeping on the event, for example [\"5\", \"7\"]. Nothing else from a submission is stored.",
-    "Send a test submission and check the delivery log: the webhook is followed by a fetch of the submission.",
+    "Set form_id in the integration's settings to the form's ID (the number in its address). It's required: nothing is recorded until it's set, and submissions from other forms are ignored.",
+    "Set email_field to the ID of the form's email question. To see the question IDs, call GET https://api.jotform.com/form/<form ID>/questions with your key in the APIKEY header.",
+    "Only questions of these types can be mapped: full name, email, phone, short text, number, date, dropdown, radio buttons and checkboxes. Addresses, payments, signatures and file uploads are never kept, even if you list them.",
+    "If the form asks for marketing consent with a checkbox, radio buttons or a dropdown, set consent_field to that question's ID and consent_value to the exact answer that means yes (for example \"Yes, send me emails\"): it's recorded on each Form Submitted event as marketing_consent. Set copy_fields to the IDs of the answers worth keeping on the event, for example [\"5\", \"7\"]. Nothing else from a submission is stored.",
+    "Send a test submission and check the delivery log: the webhook is followed by a fetch of the submission. DumbMail looks up at most 1,000 submissions an hour for this integration; past that, webhooks wait and are tried again.",
     "People this adds are held back from marketing. A form submission isn't an opt-in (anyone can type an address into a form), so nobody is subscribed. To add people who ticked the consent question to your marketing, send them a confirmation (double opt-in) first."
   ],
   "flows": []

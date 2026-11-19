@@ -41,6 +41,12 @@
       ]
     },
     "payload": {
+      "advancedOptions": {
+        "customField1": "Gift wrap, code 5150",
+        "source": "web",
+        "storeId": 123456,
+        "warehouseId": 16079
+      },
       "amountPaid": 218.73,
       "billTo": {
         "addressVerified": null,
@@ -110,11 +116,17 @@
       "received_at": "2026-11-17T17:01:00.000Z",
       "status": 200
     },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
+    },
     "source": "fetch"
   },
   "sensitive": [
     "code 5150",
     "Happy birthday from Mom",
-    "12223 LOWDEN LN"
+    "12223 LOWDEN LN",
+    "Gift wrap, code 5150"
   ]
 }

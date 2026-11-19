@@ -2,7 +2,7 @@
   "key": "shipstation",
   "name": "ShipStation",
   "category": "Shipping",
-  "description": "ShipStation shipments become Order Shipped events on the order's customer, once per shipment, with the carrier, service, tracking number and ship date. ShipStation's webhooks only point at a batch of shipments, so DumbMail fetches them, and each shipped order, with your ShipStation API key. Customers are held back from marketing: a shipment isn't consent.",
+  "description": "ShipStation shipments become Order Shipped events on the order's customer, once per shipment, for the stores you choose, with the carrier, service, tracking number and ship date. ShipStation's webhooks only point at a batch of shipments, so DumbMail fetches them, and each shipped order, with your ShipStation API key. Customers are held back from marketing: a shipment isn't consent.",
   "metrics": [
     "Order Shipped"
   ],
@@ -29,7 +29,9 @@
       "help": "The same page."
     }
   ],
-  "settings": {},
+  "settings": {
+    "store_ids": []
+  },
   "pull": {
     "method": "GET",
     "url": "https://ssapi.shipstation.com/shipments",
@@ -54,7 +56,11 @@
       "id": "^[0-9]{1,20}$",
       "context": [
         "shipments"
-      ]
+      ],
+      "identity": "record_and_context",
+      "per_minute": 40,
+      "per_hour": 2000,
+      "reset_header": "X-Rate-Limit-Reset"
     }
   },
   "redact": [
@@ -74,21 +80,23 @@
     "keep:pages",
     "keep:orderId",
     "keep:orderNumber",
-    "keep:customerEmail"
+    "keep:customerEmail",
+    "keep:advancedOptions.storeId"
   ],
   "setup": [
     "Create the integration from this recipe and copy its webhook URL. Keep it private: ShipStation doesn't sign webhooks, so the URL is the secret.",
     "In ShipStation, open Settings → Account → API Settings and save the API key and secret as the credentials api_key and api_secret.",
-    "In ShipStation, open Settings → Integrations → Integration Partners → Webhooks (or Settings → Account → Webhooks), add a webhook for On Items Shipped (SHIP_NOTIFY) with the webhook URL, for all stores or one store, and save.",
+    "Set store_ids in the integration's settings to the IDs of the ShipStation stores to record, for example [\"123456\"]. It's required: nothing is recorded until it's set, and orders from other stores are ignored.",
+    "In ShipStation, open Settings → Integrations → Integration Partners → Webhooks and add a webhook for On Orders Shipped (SHIP_NOTIFY; or On Items Shipped, ITEM_SHIP_NOTIFY) with the webhook URL, for one store or all, and save. Both fire when a label is created.",
     "Create a label for a test order and check the delivery log: the webhook is followed by a fetch of the batch's shipments, then of each order.",
-    "Review the draft shipping flow and turn it on. It's a service message about the customer's own order, so it reaches people held back from marketing.",
-    "ShipStation allows 40 API requests a minute. A large batch is read a page at a time; when ShipStation says to wait, DumbMail waits for the time it gives.",
+    "Review the draft shipping flow and turn it on. It's a service message about the customer's own order, so it reaches people held back from marketing. Someone with two shipments labelled at the same moment gets one email, not two.",
+    "ShipStation allows 40 API requests a minute: DumbMail keeps to that, and when ShipStation says to wait, every waiting lookup waits for the time it gives. It looks up at most 2,000 records an hour for this integration. One webhook reads a batch of up to 2,500 shipments (50 pages); a bigger batch shows as a failed delivery instead of being cut short.",
     "Addresses, items and labels are never stored: only the fields the recipe reads are kept."
   ],
   "flows": [
     {
       "name": "ShipStation: order shipped",
-      "description": "When a shipment's label is created, tells the customer their order is on its way, with the carrier and tracking number. A service message about their own order.",
+      "description": "When a shipment's label is created, tells the customer their order is on its way, with the carrier and tracking number. A service message about their own order. One email per person at a time: shipments labelled together for the same person send one email.",
       "trigger": {
         "type": "metric",
         "metric": "Order Shipped",

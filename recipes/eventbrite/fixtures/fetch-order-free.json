@@ -1,13 +1,10 @@
 {
   "description": "A free order (the documented example's gross is 0.00): Registered for Event, not an order",
-  "doc": "https://www.eventbrite.com/platform/docs/order-lookup (example order; personal data replaced)",
+  "doc": "https://www.eventbrite.com/platform/docs/order-lookup (example order) with fields from https://www.eventbrite.com/platform/api#/reference/order (costs, refund request and refund item fields); personal data replaced",
   "expect": [
     {
       "email": "kennedy.example@example.com",
       "first_name": "Kennedy",
-      "keys": {
-        "eventbrite_order": "1234567890"
-      },
       "last_name": "Example",
       "type": "upsert_profile"
     },
@@ -73,12 +70,24 @@
     },
     "request": {
       "method": "GET",
+      "query": [
+        [
+          "expand",
+          "refund_requests"
+        ]
+      ],
       "url": "https://www.eventbriteapi.com/v3/orders/1234567890/"
     },
     "response": {
       "headers": {},
       "received_at": "2026-11-17T17:00:00.000Z",
       "status": 200
+    },
+    "settings": {
+      "event_ids": [
+        "123456",
+        "12345"
+      ]
     },
     "source": "fetch"
   }

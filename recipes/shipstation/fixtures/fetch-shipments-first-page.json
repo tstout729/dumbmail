@@ -423,6 +423,11 @@
       "received_at": "2026-11-17T17:00:00.000Z",
       "status": 200
     },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
+    },
     "source": "fetch"
   },
   "sensitive": [

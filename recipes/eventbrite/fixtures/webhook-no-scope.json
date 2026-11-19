@@ -1,0 +1,24 @@
+{
+  "description": "Before event_ids is set nothing is looked up",
+  "doc": "https://www.eventbrite.com/platform/docs/webhooks (example payload; config fields from the same page)",
+  "expect": [
+    {
+      "message": "set event_ids in the integration's settings to the events to record",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_url": "https://www.eventbriteapi.com/v3/orders/1234567890/",
+      "config": {
+        "action": "order.placed",
+        "endpoint_url": "https://dumbmail.example/webhooks/in/x",
+        "user_id": "1548223516143",
+        "webhook_id": "157236"
+      }
+    },
+    "settings": {
+      "event_ids": []
+    }
+  }
+}

@@ -2,15 +2,11 @@
   "key": "cloudbeds",
   "name": "Cloudbeds",
   "category": "Hotels",
-  "description": "Cloudbeds reservations become events on the main guest's profile: Reservation Booked (once), Reservation Confirmed (each version of its status and dates), Reservation Cancelled and Checked Out. Each reservation is also kept as a reservation object (status, dates, nights, guests, total, balance, and whether it's paid in full), checked again every hour for arrivals in the next week, so the pre-arrival email goes only to stays Cloudbeds reports as paid in full. Guests are held back from marketing: they booked, they didn't sign up.",
+  "description": "Cloudbeds reservations become events on the main guest's profile: Cloudbeds Reservation Confirmed (once), Cloudbeds Reservation Cancelled and Cloudbeds Checked Out. Each reservation is also kept as a Cloudbeds reservation (its own type: status, dates, nights, guests, total, balance, and whether it's paid in full), checked again every hour for arrivals in the next week. Guests are held back from marketing: they booked, they didn't sign up. No revenue is recorded.",
   "metrics": [
-    "Reservation Booked",
-    {
-      "name": "Reservation Confirmed",
-      "purchase": true
-    },
-    "Reservation Cancelled",
-    "Checked Out"
+    "Cloudbeds Reservation Confirmed",
+    "Cloudbeds Reservation Cancelled",
+    "Cloudbeds Checked Out"
   ],
   "docs": [
     "https://developers.cloudbeds.com/docs/webhooks-1",
@@ -35,8 +31,7 @@
   ],
   "settings": {
     "property_id": "",
-    "payment_check_days": 7,
-    "currency": ""
+    "payment_check_days": 7
   },
   "pull": {
     "method": "GET",
@@ -118,9 +113,9 @@
   ],
   "object_types": [
     {
-      "key": "reservation",
-      "name": "Reservation",
-      "plural": "Reservations",
+      "key": "cloudbeds_reservation",
+      "name": "Cloudbeds reservation",
+      "plural": "Cloudbeds reservations",
       "title_field": "reservation_id",
       "fields": [
         {
@@ -189,79 +184,14 @@
   "setup": [
     "Create the integration from this recipe and copy its webhook URL.",
     "In Cloudbeds, create an API key with the read:reservation scope and save it as the credential api_key.",
-    "Pick a long random value and save it as the integration's signing secret. Cloudbeds doesn't sign webhooks; it sends this value in a header instead.",
+    "Pick a long random value and save it as the integration's signing secret. Cloudbeds doesn't sign webhooks (their timestamp isn't signed either); it sends this value in a header instead, and every webhook only names a reservation that DumbMail then fetches.",
     "Create four webhooks with Cloudbeds' API: POST https://api.cloudbeds.com/api/v1.3/postWebhook (form fields) with object=reservation, action=created, endpointUrl=<webhook URL>, authHeaderName=X-Webhook-Token and authHeaderValue=<the same value>. Repeat with action=status_changed, action=dates_changed and action=deleted. Add ?propertyID=<id> to the address if your key covers several properties.",
     "If the key covers several properties and this integration is for one of them, set property_id in the settings; reservations for other properties are ignored.",
-    "Optional: set currency in the settings (for example USD) to record each booking's total as revenue on Reservation Booked. Cloudbeds' reservation doesn't say which currency it's in.",
     "Make a test reservation and check the delivery log: each webhook is followed by a fetch of the reservation.",
-    "Every hour, DumbMail lists confirmed reservations arriving in the next payment_check_days days (7 by default) and fetches each one again, because Cloudbeds sends no webhook when a payment is taken.",
-    "Guests are held back from marketing. The pre-arrival flow is a service message about their own stay, so it still reaches them. Review it, edit the email, and turn it on. It never includes door codes or other access details; add those yourself only through a channel that checks payment.",
-    "Guest documents, addresses, cards, notes and custom fields are never stored: only the fields the recipe reads are kept from each answer."
+    "Every hour, DumbMail lists confirmed reservations arriving in the next payment_check_days days (7 by default) and fetches each one again: a payment changes the reservation's balance but sends no reservation webhook. Paid in full means Cloudbeds reports a balance of exactly zero and payments equal to the total.",
+    "Reservations are kept as their own type, Cloudbeds reservation, so flows built for other booking systems never act on them. This recipe ships no pre-arrival email: build one on Cloudbeds reservations yourself if you want it, and never put door codes or other access details in it.",
+    "No revenue is recorded. Cloudbeds reports money it has taken as posted transactions (its accounting/transaction webhook), which this recipe doesn't read.",
+    "Guests are held back from marketing. Guest documents, addresses, cards, notes and custom fields are never stored: only the fields the recipe reads are kept from each answer."
   ],
-  "flows": [
-    {
-      "name": "Cloudbeds: pre-arrival",
-      "description": "Two days before check-in at 10am, a note about the guest's stay. Only while the reservation is confirmed and Cloudbeds reported it paid in full in a check at most three hours old and at least as new as the reservation's last change: checked when it's due. It follows the newest dates. A service message, with placeholders and no access details.",
-      "trigger": {
-        "type": "object_date",
-        "object_type": "reservation",
-        "field": "check_in",
-        "offset_days": -2,
-        "hour": 10,
-        "relationship": "guest",
-        "filters": [
-          {
-            "field": "status",
-            "op": "eq",
-            "value": "confirmed"
-          },
-          {
-            "field": "paid_in_full",
-            "op": "eq",
-            "value": true
-          },
-          {
-            "field": "paid_checked_at",
-            "op": "gte",
-            "value": {
-              "field": "$as_of"
-            }
-          },
-          {
-            "field": "paid_checked_at",
-            "op": "within_last_days",
-            "value": 0.125
-          }
-        ]
-      },
-      "definition": {
-        "entry": "o1",
-        "settings": {
-          "service_messages": true
-        },
-        "nodes": [
-          {
-            "id": "o1",
-            "type": "email",
-            "name": "Before you arrive",
-            "next": null,
-            "content": {
-              "subject": "See you soon",
-              "preheader": "Check-in is {{ object.check_in|date }}",
-              "blocks": [
-                {
-                  "type": "heading",
-                  "text": "Your stay starts in two days"
-                },
-                {
-                  "type": "text",
-                  "html": "<p>Hi {{ first_name|default('there') }}, we're getting ready for you.</p><p>Check-in: {{ object.check_in|date }}<br>Check-out: {{ object.check_out|date }}<br>Reservation: {{ object.reservation_id }}</p><p>Reply to this email if you have any questions before you arrive.</p>"
-                }
-              ]
-            }
-          }
-        ]
-      }
-    }
-  ]
+  "flows": []
 }

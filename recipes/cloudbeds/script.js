@@ -1,30 +1,31 @@
 // Cloudbeds → DumbMail
 //
 // Cloudbeds' reservation webhooks are thin (`{"event": "reservation/created", "reservationID":
-// "31415926", "propertyID": 12345, ...}`) and unsigned: they're checked by the secret header given
-// when the webhook was created. So each one only names a reservation, and DumbMail fetches it from
-// Cloudbeds' API (GET /api/v1.3/getReservation): everything recorded comes from that answer, never
-// from the webhook. Cloudbeds sends no webhook when a payment is taken, so an hourly check (the
-// pull) lists confirmed reservations arriving in the next few days and fetches each one again.
-// See README.md for the Cloudbeds page behind each assumption.
+// "31415926", "propertyID": 12345, "timestamp": ...}`) and unsigned: they're checked by the secret
+// header given when the webhook was created, and their `timestamp` (unsigned) isn't used. Each one
+// only names a reservation; DumbMail fetches it from Cloudbeds' API (GET /api/v1.3/getReservation)
+// and everything recorded comes from that answer. An hourly check (the pull) lists confirmed
+// reservations arriving in the next few days and fetches each one again, so the payment evidence
+// stays fresh. See README.md for the Cloudbeds page behind each assumption.
 //
-// Each fetched reservation is kept as a `reservation` object (status, dates, nights, guests, total,
-// balance, and whether it's paid in full) linked to its main guest, versioned by when DumbMail
-// received the answer, so an older answer never overwrites a newer one. Paid in full only on exact
-// evidence: a total above zero, a balance of exactly zero, and payments of at least the total;
-// anything missing or contradictory is not paid. The pre-arrival flow also wants that evidence to
-// be at most three hours old.
-// Events: Reservation Booked (once), Reservation Confirmed (once per version of its status and
-// dates), Reservation Cancelled (once), Checked Out (once). Guests are held back from marketing:
-// Cloudbeds has no marketing opt-in. Documents, addresses, cards and notes are never kept.
+// Each fetched reservation is kept as a `cloudbeds_reservation` object (its own type, so flows
+// built for other booking systems never act on it), versioned by when DumbMail sent the request
+// for it: an answer to an earlier request never overwrites a later one, and a deletion beats every
+// answer requested before it was handled. Every field is written each time, a missing one cleared.
+// Paid in full only on exact evidence, compared exactly in decimal (no floating point): a booked
+// status, a total above zero, a grand total equal to it, a balance of exactly zero and payments
+// equal to the total. Anything missing or inexact is not paid.
+// Events: Cloudbeds Reservation Confirmed (once per reservation), Cloudbeds Reservation Cancelled
+// (once), Cloudbeds Checked Out (once). They carry no money: revenue would need Cloudbeds' posted
+// transactions, which this recipe doesn't read. Guests are held back from marketing: Cloudbeds has
+// no marketing opt-in. Documents, addresses, cards and notes are never kept.
 
 var BOOKED = ["confirmed", "checked_in", "checked_out"];
 var ID = /^[A-Za-z0-9]{1,40}$/;
 var PATH = "/api/v1.3/getReservation";
-// Webhooks that change what's recorded; the reservation is fetched for each.
-var FETCH_ON = ["reservation/created", "reservation/status_changed", "reservation/dates_changed", "reservation/accommodation_changed", "reservation/accommodation_type_changed"];
 // The pull lists 100 a page (Cloudbeds' maximum); a lookup per row.
 var PAGE = 100;
+var TYPE = "cloudbeds_reservation";
 
 function str(v) {
   return v === undefined || v === null || v === "" ? null : String(v);
@@ -45,8 +46,8 @@ function iso(s) {
 }
 
 function day(s) {
-  var m = /^(\d{4}-\d\d-\d\d)/.exec(String(s || ""));
-  return m ? m[1] : undefined;
+  var m = /^(\d{4}-\d\d-\d\d)$/.exec(String(s || "").slice(0, 10));
+  return m ? m[1] : null;
 }
 
 function e164(p) {
@@ -56,23 +57,29 @@ function e164(p) {
   return s.charAt(0) === "+" && d.length >= 8 && d.length <= 15 ? "+" + d : undefined;
 }
 
-function cents(n) {
-  return typeof n === "number" && isFinite(n) ? Math.round(n * 100) : null;
+// An amount as an exact whole number of millionths (a BigInt), from a JSON number or a plain
+// decimal string; anything else (exponents, more than six decimals, text) is null.
+function exact(v) {
+  var s = typeof v === "number" && isFinite(v) ? String(v) : typeof v === "string" ? v.trim() : null;
+  var m = s === null ? null : /^(-?)(\d{1,15})(?:\.(\d{1,6}))?$/.exec(s);
+  if (!m) return null;
+  var n = BigInt(m[2]) * 1000000n + BigInt(((m[3] || "") + "000000").slice(0, 6));
+  return m[1] === "-" ? -n : n;
 }
 
-// Exact evidence only: a booked status, a total above zero, a balance of exactly zero, and
-// (balanceDetailed) payments of at least the total, with its grand total, when given, equal to it.
+// Exact evidence only: a booked status, a total above zero, balanceDetailed's grand total equal to
+// it, a balance of exactly zero and payments equal to the total.
 function paidInFull(d) {
   if (BOOKED.indexOf(String(d.status || "")) < 0) return false;
-  var total = cents(d.total);
-  if (!(total > 0)) return false;
-  if (typeof d.balance !== "number" || d.balance !== 0) return false;
+  var total = exact(d.total);
+  if (total === null || total <= 0n) return false;
+  var balance = exact(d.balance);
+  if (balance === null || balance !== 0n) return false;
   var b = d.balanceDetailed;
   if (!b || typeof b !== "object" || Array.isArray(b)) return false;
-  var paid = cents(b.paid);
-  if (paid === null || paid < total) return false;
-  if (b.grandTotal !== undefined && b.grandTotal !== null && cents(b.grandTotal) !== total) return false;
-  return true;
+  var grand = exact(b.grandTotal);
+  var paid = exact(b.paid);
+  return grand !== null && paid !== null && grand === total && paid === total;
 }
 
 function mainGuest(d) {
@@ -92,24 +99,32 @@ function guests(d) {
       if (isFinite(c)) n += c;
     });
   });
-  return seen ? n : undefined;
+  return seen ? n : null;
 }
 
 function nights(a, b) {
   var x = Date.parse(a + "T00:00:00Z");
   var y = Date.parse(b + "T00:00:00Z");
-  return isFinite(x) && isFinite(y) && y > x ? Math.round((y - x) / 86400000) : undefined;
+  return isFinite(x) && isFinite(y) && y > x ? Math.round((y - x) / 86400000) : null;
 }
 
-// The reservation as fetched at `observed` (when DumbMail received Cloudbeds' answer).
-function reservation(d, observed, settings) {
+// The query of the request a fetch made: its `query` pairs (and any in its URL).
+function requestQuery(req) {
+  var q = {};
+  var url = String((req && req.url) || "");
+  var i = url.indexOf("?");
+  if (i >= 0) url.slice(i + 1).split("&").forEach(function (kv) { var p = kv.split("="); if (p[0]) q[decodeURIComponent(p[0])] = decodeURIComponent(p.slice(1).join("=")); });
+  ((req && Array.isArray(req.query)) ? req.query : []).forEach(function (kv) { if (Array.isArray(kv) && kv.length === 2) q[String(kv[0])] = String(kv[1]); });
+  return q;
+}
+
+// The reservation as Cloudbeds answered a request DumbMail sent at `asked`.
+function reservation(d, asked, settings) {
   var id = str(d.reservationID);
-  if (!id || !ID.test(id)) return [{ type: "log", message: "no reservation in the answer" }];
   if (settings.property_id && str(d.propertyID) !== String(settings.property_id)) return [{ type: "log", message: "reservation " + id + " is for another property" }];
-  var status = String(d.status || "");
+  var status = str(d.status);
   var start = day(d.startDate);
   var end = day(d.endDate);
-  var modified = iso(d.dateModified) || iso(d.dateCreated);
   var g = mainGuest(d);
   var email = d.isAnonymized === true ? null : str(d.guestEmail);
   var out = [];
@@ -123,17 +138,15 @@ function reservation(d, observed, settings) {
   } else if (d.isAnonymized === true) {
     out.push({ type: "log", message: "reservation " + id + "'s guest was anonymized; no profile is written" });
   }
-  var paid = paidInFull(d);
-  var fields = clean({
-    reservation_id: id, status: status, property_id: str(d.propertyID), check_in: start, check_out: end, nights: nights(start, end),
+  // Every field, every time: what this answer doesn't say is cleared, never left from before.
+  var fields = {
+    reservation_id: id, status: status, property_id: str(d.propertyID), check_in: start, check_out: end, nights: start && end ? nights(start, end) : null,
     guests: guests(d), total: typeof d.total === "number" ? d.total : null, balance: typeof d.balance === "number" ? d.balance : null,
-    source_channel: str(d.source),
-  });
-  fields.paid_in_full = paid;
-  fields.paid_checked_at = observed;
+    source_channel: str(d.source), paid_in_full: paidInFull(d), paid_checked_at: asked,
+  };
   out.push({
-    type: "upsert_object", object_type: "reservation", external_id: "cloudbeds:" + id, fields: fields,
-    profiles: email ? [{ email: email, relationship: "guest" }] : [], replace_links: ["guest"], as_of: observed,
+    type: "upsert_object", object_type: TYPE, external_id: "cloudbeds:" + id, fields: fields,
+    profiles: email ? [{ email: email, relationship: "guest" }] : [], replace_links: ["guest"], as_of: asked,
   });
   if (!email) {
     out.push({ type: "log", message: "reservation " + id + " has no guest email; only its object is kept" });
@@ -141,21 +154,12 @@ function reservation(d, observed, settings) {
   }
   var who = { email: email };
   var props = clean({ reservation_id: id, status: status, property_id: str(d.propertyID), check_in: start, check_out: end, nights: fields.nights, guests: fields.guests, source_channel: str(d.source) });
+  var created = iso(d.dateCreated) || iso(d.dateModified);
   if (BOOKED.indexOf(status) >= 0) {
-    var booked = { type: "track_event", metric: "Reservation Booked", profile: who, time: iso(d.dateCreated) || modified, unique_id: "cloudbeds:" + id + ":booked", properties: props };
-    // Revenue only in a currency: getReservation doesn't say which, so it comes from the settings.
-    if (settings.currency && typeof d.total === "number" && d.total > 0) {
-      booked.value = d.total;
-      booked.properties = clean(Object.assign({ currency: String(settings.currency) }, props));
-    }
-    out.push(booked);
-    if (status !== "checked_out" && modified && start && end) {
-      out.push({ type: "track_event", metric: "Reservation Confirmed", profile: who, time: modified, unique_id: "cloudbeds:" + id + ":confirmed:" + [modified, status, start, end].join(":"), properties: props });
-    }
-    if (status === "checked_out") out.push({ type: "track_event", metric: "Checked Out", profile: who, time: modified, unique_id: "cloudbeds:" + id + ":checked_out", properties: props });
+    out.push({ type: "track_event", metric: "Cloudbeds Reservation Confirmed", profile: who, time: created, unique_id: "cloudbeds:" + id + ":confirmed", properties: props });
+    if (status === "checked_out") out.push({ type: "track_event", metric: "Cloudbeds Checked Out", profile: who, time: iso(d.dateModified) || asked, unique_id: "cloudbeds:" + id + ":checked_out", properties: props });
   } else if (status === "canceled") {
-    var when = iso(d.dateCancelledUTC) || modified;
-    out.push({ type: "track_event", metric: "Reservation Cancelled", profile: who, time: when, unique_id: "cloudbeds:" + id + ":cancelled", properties: props });
+    out.push({ type: "track_event", metric: "Cloudbeds Reservation Cancelled", profile: who, time: iso(d.dateCancelledUTC) || iso(d.dateModified) || asked, unique_id: "cloudbeds:" + id + ":cancelled", properties: props });
   } else {
     out.push({ type: "log", message: "reservation " + id + " is " + (status || "without a status") + "; only its object is updated" });
   }
@@ -209,15 +213,24 @@ function swept(input) {
   return out;
 }
 
+function fetched(input) {
+  var body = input.payload || {};
+  var want = requestQuery(input.request).reservationID;
+  var asked = iso(input.request && input.request.sent_at);
+  if (!want || !asked) return [{ type: "log", message: "not a lookup DumbMail made (no reservation id or request time)" }];
+  // A deleted (or unknown) reservation isn't returned: nothing is written, so it stays as it was.
+  if (body.success !== true || !body.data) return [{ type: "log", message: "Cloudbeds didn't return reservation " + want }];
+  if (str(body.data.reservationID) !== want) return [{ type: "log", message: "the answer isn't reservation " + want }];
+  return reservation(body.data, asked, input.settings || {});
+}
+
+// Webhooks that change what's recorded; the reservation is fetched for each.
+var FETCH_ON = ["reservation/created", "reservation/status_changed", "reservation/dates_changed", "reservation/accommodation_changed", "reservation/accommodation_type_changed"];
+
 function handle(input) {
   var s = input.settings || {};
   if (input.source === "pull") return swept(input);
-  if (input.source === "fetch") {
-    var body = input.payload || {};
-    if (body.success !== true || !body.data) return [{ type: "log", message: "Cloudbeds didn't return the reservation" }];
-    var observed = iso(input.response && input.response.received_at) || iso(input.now);
-    return reservation(body.data, observed, s);
-  }
+  if (input.source === "fetch") return fetched(input);
   var e = input.payload || {};
   var ev = String(e.event || "");
   var id = str(e.reservationID !== undefined ? e.reservationID : e.reservationId);
@@ -225,12 +238,15 @@ function handle(input) {
   if (ev.indexOf("reservation/") !== 0) return [{ type: "log", message: "ignored Cloudbeds event " + (ev || "(none)") }];
   if (!id || !ID.test(id)) return [{ type: "log", message: "ignored " + ev + " without a reservation id" }];
   if (s.property_id && prop !== String(s.property_id)) return [{ type: "log", message: "ignored " + ev + " for another property (" + prop + ")" }];
-  // A deleted reservation can't be fetched any more. It's marked deleted (never paid) as of when
-  // this webhook is handled: later than any answer fetched before the deletion (versions are
-  // DumbMail's receive times, so Cloudbeds' own clock isn't mixed in), so none can bring it back.
+  // A deleted reservation can't be fetched any more. It's marked deleted (not paid) as of when this
+  // webhook is handled, which is after every request for it sent before then: none of their
+  // answers can bring it back. Only a later answer in which Cloudbeds returns it again does.
   if (ev === "reservation/deleted") {
     var at = iso(input.now);
-    return [{ type: "upsert_object", object_type: "reservation", external_id: "cloudbeds:" + id, fields: { reservation_id: id, status: "deleted", paid_in_full: false, paid_checked_at: at }, as_of: at }];
+    return [{
+      type: "upsert_object", object_type: TYPE, external_id: "cloudbeds:" + id,
+      fields: { reservation_id: id, status: "deleted", check_in: null, check_out: null, nights: null, paid_in_full: false, paid_checked_at: at }, as_of: at,
+    }];
   }
   if (FETCH_ON.indexOf(ev) < 0) return [{ type: "log", message: "ignored Cloudbeds event " + ev }];
   return [{ type: "next_request", url: PATH, query: lookup(id, prop) }];

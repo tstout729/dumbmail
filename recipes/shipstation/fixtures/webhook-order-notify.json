@@ -11,6 +11,11 @@
     "payload": {
       "resource_type": "ORDER_NOTIFY",
       "resource_url": "https://ssapi.shipstation.com/orders?storeID=123456&importBatch=1ab23c4d-12ab-1abc-a1bc-a12b12cdabcd"
+    },
+    "settings": {
+      "store_ids": [
+        "123456"
+      ]
     }
   }
 }
