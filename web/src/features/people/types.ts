@@ -40,7 +40,7 @@ export type PeopleSummary = {
   notes: ProfileNote[];
 };
 
-export type SuppressionReason = "unsubscribed" | "hard_bounce" | "complaint" | "manual" | "pending" | "not_subscribed";
+export type SuppressionReason = "unsubscribed" | "hard_bounce" | "complaint" | "manual" | "pending" | "not_subscribed" | "marketing_hold";
 
 export type Suppression = {
   profile_id: string;

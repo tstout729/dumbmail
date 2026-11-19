@@ -180,13 +180,28 @@ async fn consent_history_rows_cant_be_changed() {
     h.cleanup().await;
 }
 
-/// A lint, not proof: it finds raw SQL in `src` that writes a consent, suppression or opt-out column
-/// outside the files that record history (an UPDATE ... SET col = ..., or an INSERT INTO profiles
-/// naming one in its column list), in any case and spacing. It can't see SQL built at runtime from
-/// column names; those paths need behaviour tests (see `consent_history_records_every_path`).
+/// A lint, not proof: it finds raw SQL in `src` that writes a consent, suppression, hold or ad
+/// opt-out column (an UPDATE profiles ... SET col = ..., one that sets a column named at runtime
+/// (`SET {col} =`), or an INSERT INTO profiles naming one in its column list), in any case and
+/// spacing. Such SQL may only appear in the consent helpers themselves, or in a set-based writer
+/// listed below that records its rows with `people::consent::record_written_in` (or the upsert's
+/// `after_upsert` / `after_address_change`) in the same transaction; each of those has a behaviour
+/// test. It can't see SQL assembled any other way; those paths need behaviour tests too (see
+/// `consent_history_records_every_path` and `main_modules_record_their_consent_changes`).
 #[test]
 fn consent_writes_go_through_the_history() {
-    let allowed = ["src/audience.rs", "src/features/people/consent.rs", "src/features/people/merge.rs"];
+    // The helpers themselves.
+    let helpers = ["src/features/people/consent.rs", "src/features/people/merge.rs"];
+    // Set-based writers: their own SQL, recorded in the same transaction.
+    let recorded = [
+        ("src/audience.rs", "after_upsert"),
+        ("src/api/audience.rs", "after_address_change"),
+        ("src/features/klaviyo_import/profiles.rs", "record_written_in"),
+        ("src/features/integrations/actions.rs", "record_written_in"),
+        ("src/features/shopify/customers.rs", "record_written_in"),
+        // Creates a profile with an identifier column chosen at runtime (no consent columns).
+        ("src/features/push/client.rs", "record_written_in"),
+    ];
     let cols = ["email_consent", "sms_consent", "email_suppressed_reason", "sms_suppressed_reason", "ads_opt_out", "marketing_hold"];
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let mut stack = vec![std::path::PathBuf::from("src")];
@@ -202,21 +217,24 @@ fn consent_writes_go_through_the_history() {
                 continue;
             }
             let rel = path.to_string_lossy().replace('\\', "/");
-            if allowed.contains(&rel.as_str()) {
+            if helpers.contains(&rel.as_str()) {
                 continue;
             }
-            let text = squash(&std::fs::read_to_string(&path).unwrap());
+            let raw = std::fs::read_to_string(&path).unwrap();
+            if let Some((_, call)) = recorded.iter().find(|(f, _)| *f == rel) {
+                assert!(raw.contains(call), "{rel} writes consent columns itself and must record them with people::consent::{call}");
+                continue;
+            }
+            let text = squash(&raw);
             for start in ["update profiles", "insert into profiles"] {
                 for (i, _) in text.match_indices(start) {
                     // The statement up to the end of its string literal.
                     let stmt: String = text[i..].chars().take_while(|c| *c != '"').collect();
-                    let writes = cols.iter().any(|c| {
-                        if start == "update profiles" {
-                            stmt.contains(&format!("{c} =")) || stmt.contains(&format!("{c}="))
-                        } else {
-                            stmt.split(')').next().is_some_and(|list| list.contains(c))
-                        }
-                    });
+                    let writes = if start == "update profiles" {
+                        cols.iter().any(|c| stmt.contains(&format!("{c} =")) || stmt.contains(&format!("{c}="))) || stmt.contains("set {")
+                    } else {
+                        stmt.split(')').next().is_some_and(|list| cols.iter().any(|c| list.contains(c)) || list.contains('{'))
+                    };
                     if writes {
                         offenders.push(format!("{rel}: {}", stmt.chars().take(100).collect::<String>()));
                     }
@@ -225,8 +243,6 @@ fn consent_writes_go_through_the_history() {
         }
     }
     assert!(offenders.is_empty(), "consent written without recording history (use features::people::consent):\n{}", offenders.join("\n"));
-    let audience = std::fs::read_to_string("src/audience.rs").unwrap();
-    assert!(audience.contains("people::consent::after_upsert"), "the shared upsert must record its consent changes");
 }
 
 #[tokio::test]

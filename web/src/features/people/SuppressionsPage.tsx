@@ -28,6 +28,7 @@ import {
 } from "../../components/ui";
 import { formatDateTime, formatNumber, formatPhone, fullName, pluralize } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
+import { useCan } from "../team/api";
 import { toast } from "../../lib/toast";
 import { suppressionsExportUrl, useSuppress, useSuppressions, useUnsuppress } from "./api";
 import { BulkProgress } from "./BulkActions";
@@ -42,6 +43,7 @@ const reasonTone: Record<SuppressionReason, Tone> = {
   manual: "amber",
   pending: "blue",
   not_subscribed: "gray",
+  marketing_hold: "amber",
 };
 
 const reasonOptions: { value: SuppressionReason; label: string }[] = [
@@ -51,9 +53,13 @@ const reasonOptions: { value: SuppressionReason; label: string }[] = [
   { value: "manual", label: "Suppressed by hand" },
   { value: "pending", label: "Hasn't confirmed sign-up" },
   { value: "not_subscribed", label: "Never agreed to texts" },
+  { value: "marketing_hold", label: "Held back from marketing" },
 ];
 
 export function SuppressionsPage() {
+  const canWrite = useCan("audience.write");
+  const canLift = useCan("campaigns.send");
+  const canExport = useCan("export");
   const { account } = useSession();
   const tz = account.timezone;
   const [channel, setChannel] = useState<"all" | Channel>("all");
@@ -82,12 +88,16 @@ export function SuppressionsPage() {
         description="Everyone who can't get your marketing emails or texts, and why."
         actions={
           <>
-            <a href={suppressionsExportUrl(filters)} download className={buttonClass("secondary", "md")}>
-              <Download className="size-3.5" /> Export CSV
-            </a>
-            <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
-              Suppress addresses
-            </Button>
+            {canExport ? (
+              <a href={suppressionsExportUrl(filters)} download className={buttonClass("secondary", "md")}>
+                <Download className="size-3.5" /> Export CSV
+              </a>
+            ) : null}
+            {canWrite ? (
+              <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
+                Suppress addresses
+              </Button>
+            ) : null}
           </>
         }
       />
@@ -168,11 +178,11 @@ export function SuppressionsPage() {
                 </Td>
                 <Td className="whitespace-nowrap text-zinc-600">{r.since ? formatDateTime(r.since, tz) : "Before history started"}</Td>
                 <Td className="text-right">
-                  {r.can_unsuppress ? (
+                  {r.can_unsuppress && canLift ? (
                     <Button size="sm" onClick={() => setLifting(r)}>
                       Lift
                     </Button>
-                  ) : (
+                  ) : r.can_unsuppress ? null : (
                     <Button size="sm" variant="ghost" onClick={() => setWhyNot(r)}>
                       Why not?
                     </Button>

@@ -62,11 +62,13 @@ fn flag_set_sql(a: &str, key: &str) -> String {
     format!("COALESCE(lower(btrim({a}.properties->>'{key}', E' \\t\\r\\n\\f')) NOT IN ('false', '0', 'no', ''), false)")
 }
 
-/// True when the profile opted out of ads: `ads_opt_out`, `do_not_sell` or `gpc` set (see
-/// `flag_set_sql`), or `ads_consent` present and false-like. `ads_consent` never grants anything.
+/// True when the profile opted out of ads: the profile's own "do not sell or share" flag
+/// (`profiles.ads_opt_out`, see `features::people`), an `ads_opt_out`, `do_not_sell` or `gpc`
+/// property set (see `flag_set_sql`), or `ads_consent` present and false-like. `ads_consent` never
+/// grants anything.
 pub fn opted_out_sql(a: &str) -> String {
     format!(
-        "({} OR {} OR {} OR COALESCE(lower(btrim({a}.properties->>'ads_consent', E' \\t\\r\\n\\f')) IN ('false', '0', 'no', ''), false))",
+        "(COALESCE({a}.ads_opt_out, false) OR {} OR {} OR {} OR COALESCE(lower(btrim({a}.properties->>'ads_consent', E' \\t\\r\\n\\f')) IN ('false', '0', 'no', ''), false))",
         flag_set_sql(a, "ads_opt_out"),
         flag_set_sql(a, "do_not_sell"),
         flag_set_sql(a, "gpc"),

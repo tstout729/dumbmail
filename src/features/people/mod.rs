@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 pub use consent::{record_consent_change, with_source, Change, Channel, ConsentSource};
 
+use super::team::access::{self, rule, Access, Perm, RouteRule, ToolRule};
+use super::team::audit;
 use super::{Feature, McpDoc};
 use crate::api::ApiJson;
 use crate::auth::Ctx;
@@ -36,6 +38,86 @@ use crate::state::AppState;
 pub struct Module;
 
 const NOTE_MAX: usize = 5_000;
+
+/// Who may do what (see `team::access` and "Permissions" in docs/PEOPLE.md). Anything showing
+/// people's data needs profile read; changes need audience write; lifting a suppression needs
+/// campaign send; downloads of many people need export; privacy requests, erasure and "do not sell
+/// or share" need `privacy.manage` (admins and the owner). Bulk actions and file downloads also
+/// check the permission for the action or the file's kind (`bulk_perms`, `file_perm`).
+static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/people/profiles/{id}", Perm::ProfilesRead),
+    rule("GET", "/api/people/profiles/{id}/consent", Perm::ProfilesRead),
+    rule("PATCH", "/api/people/profiles/{id}/privacy", Perm::Privacy),
+    rule("GET", "/api/people/profiles/{id}/notes", Perm::ProfilesRead),
+    rule("POST", "/api/people/profiles/{id}/notes", Perm::AudienceWrite),
+    rule("DELETE", "/api/people/profiles/{id}/notes/{note_id}", Perm::AudienceWrite),
+    rule("GET", "/api/people/suppressions", Perm::ProfilesRead),
+    rule("POST", "/api/people/suppressions", Perm::AudienceWrite),
+    rule("GET", "/api/people/suppressions/export", Perm::Export),
+    rule("POST", "/api/people/suppressions/unsuppress", Perm::CampaignSend),
+    rule("GET", "/api/people/duplicates", Perm::ProfilesRead),
+    rule("POST", "/api/people/merge", Perm::AudienceWrite),
+    rule("GET", "/api/people/bulk", Perm::ProfilesRead),
+    rule("POST", "/api/people/bulk", Perm::AudienceWrite),
+    rule("GET", "/api/people/bulk/{id}", Perm::ProfilesRead),
+    rule("POST", "/api/people/privacy/export", Perm::Privacy),
+    rule("POST", "/api/people/privacy/delete", Perm::Privacy),
+    rule("GET", "/api/people/privacy/requests", Perm::Privacy),
+    rule("GET", "/api/people/privacy/requests/{id}", Perm::Privacy),
+    rule("GET", "/api/people/files/{id}", Perm::Export),
+];
+
+static TOOL_RULES: &[ToolRule] = &[
+    ToolRule { name: "get_consent_history", perm: Perm::ProfilesRead },
+    ToolRule { name: "list_suppressions", perm: Perm::ProfilesRead },
+    ToolRule { name: "suppress_profiles", perm: Perm::AudienceWrite },
+    ToolRule { name: "unsuppress_profile", perm: Perm::CampaignSend },
+    ToolRule { name: "find_duplicate_profiles", perm: Perm::ProfilesRead },
+    ToolRule { name: "merge_profiles", perm: Perm::AudienceWrite },
+    ToolRule { name: "start_bulk_action", perm: Perm::AudienceWrite },
+    ToolRule { name: "get_bulk_action", perm: Perm::ProfilesRead },
+    ToolRule { name: "export_person_data", perm: Perm::Privacy },
+    ToolRule { name: "delete_person_data", perm: Perm::Privacy },
+    ToolRule { name: "list_privacy_requests", perm: Perm::Privacy },
+    ToolRule { name: "set_do_not_sell", perm: Perm::Privacy },
+    ToolRule { name: "list_profile_notes", perm: Perm::ProfilesRead },
+    ToolRule { name: "add_profile_note", perm: Perm::AudienceWrite },
+    ToolRule { name: "delete_profile_note", perm: Perm::AudienceWrite },
+];
+
+/// What a bulk action needs besides audience write: adding to a list can start that list's flows
+/// (so it also needs the right to turn flows live), deleting people is an erasure, exporting copies
+/// their data out.
+pub fn bulk_perms(action: &str) -> &'static [Perm] {
+    match action {
+        "add_to_list" => &[Perm::FlowLive],
+        "delete" => &[Perm::Privacy],
+        "export" => &[Perm::Export],
+        _ => &[],
+    }
+}
+
+fn require_bulk(ctx: &Ctx, action: &str) -> AppResult<()> {
+    for p in bulk_perms(action) {
+        access::require(ctx, *p)?;
+    }
+    Ok(())
+}
+
+/// The permission a stored file's download needs, by its kind.
+fn file_perm(kind: &str) -> Perm {
+    if kind == "privacy_export" { Perm::Privacy } else { Perm::Export }
+}
+
+/// A bulk action as the caller may see it: the download link only with export permission.
+fn bulk_for(ctx: &Ctx, mut v: Value) -> Value {
+    if !access::allows(ctx, Perm::Export) {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("file_url");
+        }
+    }
+    v
+}
 
 pub async fn load_profile(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Profile> {
     sqlx::query_as::<_, Profile>(&format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1 AND p.account_id = $2"))
@@ -146,6 +228,9 @@ struct PrivacyBody {
 
 async fn privacy_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<PrivacyBody>) -> AppResult<Json<Value>> {
     let changed = consent::set_ads_opt_out(&s.db, ctx.account_id, id, b.ads_opt_out, &ConsentSource::from_ctx(&ctx)).await?;
+    if changed {
+        audit::audit(&s, &ctx, "people.do_not_sell", Some(&id.to_string()), json!({"on": b.ads_opt_out})).await;
+    }
     Ok(Json(json!({"ads_opt_out": b.ads_opt_out, "changed": changed})))
 }
 
@@ -193,7 +278,16 @@ async fn suppressions_export_h(State(s): State<AppState>, ctx: Ctx, Query(q): Qu
 
 async fn suppress_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<suppression::SuppressBody>) -> AppResult<Json<Value>> {
     let src = ConsentSource::from_ctx(&ctx).method("suppression_list");
-    Ok(Json(suppression::suppress_many(&s, ctx.account_id, &b, &src).await?))
+    let out = suppression::suppress_many(&s, ctx.account_id, &b, &src).await?;
+    audit_suppress(&s, &ctx, &out).await;
+    Ok(Json(out))
+}
+
+/// An audit entry for a suppression request that did something (not a dry run).
+async fn audit_suppress(s: &AppState, ctx: &Ctx, out: &Value) {
+    if out["dry_run"].as_bool() != Some(true) {
+        audit::audit(s, ctx, "people.suppress", None, json!({"addresses": out["count"], "suppressed": out["suppressed"], "bulk_id": out["bulk_action"]["id"]})).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -224,7 +318,15 @@ pub async fn unsuppress(db: &PgPool, account_id: Uuid, b: &UnsuppressBody, src: 
 }
 
 async fn unsuppress_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<UnsuppressBody>) -> AppResult<Json<Value>> {
-    Ok(Json(unsuppress(&s.db, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx)).await?))
+    let out = unsuppress(&s.db, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx)).await?;
+    audit_unsuppress(&s, &ctx, &b, &out).await;
+    Ok(Json(out))
+}
+
+async fn audit_unsuppress(s: &AppState, ctx: &Ctx, b: &UnsuppressBody, out: &Value) {
+    if out["ok"].as_bool() == Some(true) {
+        audit::audit(s, ctx, "people.unsuppress", Some(&b.profile_id.to_string()), json!({"channel": b.channel})).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -237,23 +339,52 @@ async fn duplicates_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<Limit
 }
 
 async fn merge_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<merge::MergeBody>) -> AppResult<Json<Value>> {
-    Ok(Json(merge::merge(&s.db, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx)).await?))
+    let out = merge::merge(&s.db, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx)).await?;
+    audit_merge(&s, &ctx, &b, &out).await;
+    Ok(Json(out))
+}
+
+async fn audit_merge(s: &AppState, ctx: &Ctx, b: &merge::MergeBody, out: &Value) {
+    if out["merged"].as_bool() == Some(true) {
+        audit::audit(s, ctx, "people.merge", Some(&b.keep_id.to_string()), json!({"merged_profile_id": b.merge_id})).await;
+    }
+}
+
+/// Start (or preview) a bulk action, with the action's own permission checked first.
+async fn start_bulk(s: &AppState, ctx: &Ctx, b: &bulk::BulkBody, src: &ConsentSource) -> AppResult<Value> {
+    require_bulk(ctx, &b.action)?;
+    let out = bulk::start(s, ctx.account_id, b, src).await?;
+    if b.confirm && out["id"].is_string() {
+        let id = out["id"].as_str().unwrap_or_default().to_string();
+        audit::audit(s, ctx, "people.bulk_action", Some(&id), json!({"action": b.action, "total": out["total"]})).await;
+    }
+    Ok(out)
 }
 
 async fn bulk_start_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<bulk::BulkBody>) -> AppResult<Json<Value>> {
-    Ok(Json(bulk::start(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx)).await?))
+    Ok(Json(start_bulk(&s, &ctx, &b, &ConsentSource::from_ctx(&ctx)).await?))
 }
 
 async fn bulk_list_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<LimitQuery>) -> AppResult<Json<Value>> {
-    Ok(Json(json!({"data": bulk::recent(&s.db, ctx.account_id, q.limit.unwrap_or(20)).await?})))
+    let data: Vec<Value> = bulk::recent(&s.db, ctx.account_id, q.limit.unwrap_or(20)).await?.into_iter().map(|v| bulk_for(&ctx, v)).collect();
+    Ok(Json(json!({"data": data})))
 }
 
 async fn bulk_get_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(bulk::get(&s.db, ctx.account_id, id).await?))
+    Ok(Json(bulk_for(&ctx, bulk::get(&s.db, ctx.account_id, id).await?)))
+}
+
+async fn audit_privacy(s: &AppState, ctx: &Ctx, action: &str, out: &Value) {
+    if out["dry_run"].as_bool() != Some(true) {
+        let target = out["request_id"].as_str().or(out["id"].as_str()).map(String::from);
+        audit::audit(s, ctx, action, target.as_deref(), json!({"profiles": out["deleted"].as_u64().or(out["found"].as_u64())})).await;
+    }
 }
 
 async fn export_person_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<privacy::PersonQuery>) -> AppResult<Json<Value>> {
-    Ok(Json(privacy::export_person(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx).method("privacy_request")).await?))
+    let out = privacy::export_person(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx).method("privacy_request")).await?;
+    audit_privacy(&s, &ctx, "people.privacy_export", &out).await;
+    Ok(Json(out))
 }
 
 async fn request_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -261,7 +392,9 @@ async fn request_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) ->
 }
 
 async fn delete_person_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<privacy::PersonQuery>) -> AppResult<Json<Value>> {
-    Ok(Json(privacy::delete_person(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx).method("privacy_request")).await?))
+    let out = privacy::delete_person(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx).method("privacy_request")).await?;
+    audit_privacy(&s, &ctx, "people.privacy_delete", &out).await;
+    Ok(Json(out))
 }
 
 async fn requests_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
@@ -270,7 +403,8 @@ async fn requests_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<PageQue
 }
 
 async fn file_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Response> {
-    let (_kind, name, ct, bytes) = privacy::file(&s.db, ctx.account_id, id).await?;
+    let (kind, name, ct, bytes) = privacy::file(&s.db, ctx.account_id, id).await?;
+    access::require(&ctx, file_perm(&kind))?;
     Ok(download(&name, &ct, bytes))
 }
 
@@ -319,17 +453,39 @@ async fn mcp(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<Va
             };
             suppression::list(db, acct, &q).await
         }
-        "suppress_profiles" => suppression::suppress_many(state, acct, &from(a.clone())?, &src.method("suppression_list")).await,
-        "unsuppress_profile" => unsuppress(db, acct, &from(a.clone())?, &src).await,
+        "suppress_profiles" => {
+            let out = suppression::suppress_many(state, acct, &from(a.clone())?, &src.method("suppression_list")).await?;
+            audit_suppress(state, ctx, &out).await;
+            Ok(out)
+        }
+        "unsuppress_profile" => {
+            let b: UnsuppressBody = from(a.clone())?;
+            let out = unsuppress(db, acct, &b, &src).await?;
+            audit_unsuppress(state, ctx, &b, &out).await;
+            Ok(out)
+        }
         "find_duplicate_profiles" => Ok(json!({"groups": merge::find_duplicates(db, acct, a["limit"].as_i64().unwrap_or(50)).await?})),
-        "merge_profiles" => merge::merge(db, acct, &from(a.clone())?, &src).await,
-        "start_bulk_action" => bulk::start(state, acct, &from(a.clone())?, &src).await,
+        "merge_profiles" => {
+            let b: merge::MergeBody = from(a.clone())?;
+            let out = merge::merge(db, acct, &b, &src).await?;
+            audit_merge(state, ctx, &b, &out).await;
+            Ok(out)
+        }
+        "start_bulk_action" => start_bulk(state, ctx, &from(a.clone())?, &src).await,
         "get_bulk_action" => match a["id"].as_str().filter(|s| !s.is_empty()) {
-            Some(_) => bulk::get(db, acct, uuid_arg(a, "id")?).await,
-            None => Ok(json!({"bulk_actions": bulk::recent(db, acct, 10).await?})),
+            Some(_) => Ok(bulk_for(ctx, bulk::get(db, acct, uuid_arg(a, "id")?).await?)),
+            None => Ok(json!({"bulk_actions": bulk::recent(db, acct, 10).await?.into_iter().map(|v| bulk_for(ctx, v)).collect::<Vec<_>>()})),
         },
-        "export_person_data" => privacy::export_person(state, acct, &from(a.clone())?, &src.method("privacy_request")).await,
-        "delete_person_data" => privacy::delete_person(state, acct, &from(a.clone())?, &src.method("privacy_request")).await,
+        "export_person_data" => {
+            let out = privacy::export_person(state, acct, &from(a.clone())?, &src.method("privacy_request")).await?;
+            audit_privacy(state, ctx, "people.privacy_export", &out).await;
+            Ok(out)
+        }
+        "delete_person_data" => {
+            let out = privacy::delete_person(state, acct, &from(a.clone())?, &src.method("privacy_request")).await?;
+            audit_privacy(state, ctx, "people.privacy_delete", &out).await;
+            Ok(out)
+        }
         "list_privacy_requests" => {
             if a["id"].as_str().is_some_and(|s| !s.is_empty()) {
                 return privacy::request(db, acct, uuid_arg(a, "id")?).await;
@@ -341,6 +497,9 @@ async fn mcp(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<Va
             let id = resolve_profile(db, acct, a).await?;
             let v = a["do_not_sell"].as_bool().ok_or_else(|| AppError::bad("`do_not_sell` (true or false) is required"))?;
             let changed = consent::set_ads_opt_out(db, acct, id, v, &src).await?;
+            if changed {
+                audit::audit(state, ctx, "people.do_not_sell", Some(&id.to_string()), json!({"on": v})).await;
+            }
             Ok(json!({"profile_id": id, "do_not_sell_or_share": v, "changed": changed}))
         }
         "list_profile_notes" => {
@@ -440,6 +599,10 @@ impl Feature for Module {
 
     fn mcp_tools(&self) -> Vec<Value> {
         mcp_tools()
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTES, tools: TOOL_RULES }
     }
 
     async fn mcp_call(&self, state: &AppState, ctx: &Ctx, name: &str, args: &Value) -> Option<AppResult<Value>> {

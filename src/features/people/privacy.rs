@@ -139,6 +139,18 @@ pub async fn apply_tombstones_in(conn: &mut PgConnection, account_id: Uuid, prof
     Ok(consent::apply(conn, account_id, profile_id, &before, &after, &src).await?)
 }
 
+/// [`apply_tombstones_in`] for many profiles the caller holds, looking the salt up once.
+pub async fn apply_tombstones_many_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid], src: &ConsentSource) -> AppResult<()> {
+    let salt: Option<String> = sqlx::query_scalar("SELECT salt FROM privacy_salts WHERE account_id = $1").bind(account_id).fetch_optional(&mut *conn).await?;
+    if salt.is_none() {
+        return Ok(());
+    }
+    for id in ids {
+        apply_tombstones_in(conn, account_id, *id, src).await?;
+    }
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct Doomed {
     id: Uuid,
@@ -250,6 +262,13 @@ pub async fn erase_people_in(conn: &mut PgConnection, account_id: Uuid, ids: &[U
     removed.insert("suppression_records_kept".into(), json!(kept));
     let people = doomed.into_iter().map(|d| (d.id, d.state.email, d.state.phone_number, d.external_id)).collect();
     Ok((removed, people))
+}
+
+/// Tell webhook endpoints who an erasure removed (`profile.deleted`), after it committed.
+pub async fn tell_deleted(db: &PgPool, account_id: Uuid, people: &[ErasedPerson]) {
+    for (id, email, phone_number, external_id) in people {
+        crate::features::webhooks::profile_deleted(db, account_id, json!({"id": id, "email": email, "phone_number": phone_number, "external_id": external_id})).await;
+    }
 }
 
 /// Erase one profile in a transaction of its own. Returns what it held (email, phone number,
@@ -395,7 +414,7 @@ pub async fn export_person(state: &AppState, account_id: Uuid, q: &PersonQuery, 
         return Ok(json!({"request_id": id, "status": "done", "found": 0, "note": "Nobody with that address is in this account, so there's nothing to export."}));
     }
     let id = log_request(&mut tx, account_id, "export", "building", &p, src, json!({"found": true})).await?;
-    crate::jobs::enqueue(&mut *tx, EXPORT_JOB, json!({"request_id": id, "account_id": account_id, "profile_ids": p.profile_ids}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, EXPORT_JOB, json!({"request_id": id, "account_id": account_id, "profile_ids": p.profile_ids}), None).await?;
     tx.commit().await?;
     Ok(json!({
         "request_id": id, "status": "building", "found": p.profile_ids.len(),
@@ -434,11 +453,12 @@ pub async fn delete_person(state: &AppState, account_id: Uuid, q: &PersonQuery, 
         }));
     }
     let mut tx = state.db.begin().await?;
-    let removed = erase_in(&mut tx, account_id, &p.profile_ids).await?;
+    let (removed, people) = erase_people_in(&mut tx, account_id, &p.profile_ids).await?;
     let deleted = removed.get("profiles").and_then(Value::as_u64).unwrap_or(0);
     let files = removed.get("export_files").and_then(Value::as_u64).unwrap_or(0);
     let id = log_request(&mut tx, account_id, "delete", "done", &p, src, json!({"deleted_profiles": deleted, "export_files_deleted": files})).await?;
     tx.commit().await?;
+    tell_deleted(&state.db, account_id, &people).await;
     Ok(json!({"request_id": id, "deleted": deleted, "removed": removed, "export_files_deleted": files}))
 }
 

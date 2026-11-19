@@ -288,6 +288,11 @@ fn clash(e: &anyhow::Error) -> bool {
 }
 
 impl Run<'_> {
+    /// How this import's consent changes appear in consent history (features::people).
+    fn consent_source(&self) -> crate::features::people::ConsentSource {
+        crate::features::people::ConsentSource::new("klaviyo_import", "system").with_detail("import_id", json!(self.imp.id))
+    }
+
     fn hold_never(&self) -> bool {
         self.imp.options["never_subscribed"] == "hold"
     }
@@ -331,6 +336,7 @@ impl Run<'_> {
         let (se, sp, sx) = if with_ids { (ke.clone(), kp.clone(), col(&|k| k.ext.clone())) } else { (none.clone(), none.clone(), none) };
         let mut tx: Tx = self.begin().await?;
         sqlx::query(LOCK_SQL).bind(self.imp.account_id).bind(&pid).execute(&mut *tx).await?;
+        let before = crate::features::people::consent::snapshot_in(&mut tx, self.imp.account_id, &pid).await?;
         // A new statement after the lock: it reads every row as it is now, and nobody can change them until commit.
         let res: Vec<WroteRow> = sqlx::query_as(&merge_sql())
             .bind(self.imp.account_id)
@@ -353,6 +359,10 @@ impl Run<'_> {
             .bind(CONSENT_HISTORY)
             .fetch_all(&mut *tx)
             .await?;
+        // Each change goes in consent history, and a deleted person's suppression record for the
+        // final address beats an imported "subscribed" (features::people), in this transaction.
+        let written: Vec<Uuid> = res.iter().map(|r| r.1).collect();
+        crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &before, &written, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
         write_locales(&mut tx, &pid, &rows.iter().map(|(_, k, _)| k.locale.clone()).collect::<Vec<_>>()).await?;
         tx.commit().await?;
         Ok(res.into_iter().map(wrote).collect())
@@ -407,6 +417,8 @@ impl Run<'_> {
         .bind(rows.iter().map(|(_, k)| k.created).collect::<Vec<_>>())
         .fetch_all(&mut *tx)
         .await?;
+        let made: Vec<Uuid> = res.iter().map(|r| r.0).collect();
+        crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &Default::default(), &made, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
         write_locales(&mut tx, &ids, &rows.iter().map(|(_, k)| k.locale.clone()).collect::<Vec<_>>()).await?;
         tx.commit().await?;
         Ok(res
@@ -461,6 +473,14 @@ impl Run<'_> {
             return Ok(());
         }
         let mut tx: Tx = self.begin().await?;
+        // Everyone these touch, locked and read first, so consent history gets each change (features::people).
+        let touched: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND (email = ANY($2) OR phone_number = ANY($3)) ORDER BY id FOR UPDATE")
+            .bind(self.imp.account_id)
+            .bind(&emails)
+            .bind(&phones)
+            .fetch_all(&mut *tx)
+            .await?;
+        let before = crate::features::people::consent::snapshot_in(&mut tx, self.imp.account_id, &touched).await?;
         if !emails.is_empty() {
             sqlx::query(
                 "WITH up AS (
@@ -492,6 +512,7 @@ impl Run<'_> {
             .execute(&mut *tx)
             .await?;
         }
+        crate::features::people::consent::record_written_in(&mut tx, self.imp.account_id, &before, &touched, &self.consent_source()).await.map_err(|e| anyhow::anyhow!("recording consent: {e}"))?;
         tx.commit().await?;
         Ok(())
     }

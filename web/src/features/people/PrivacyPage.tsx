@@ -23,9 +23,22 @@ import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useDeletePerson, useExportPerson, usePrivacyRequests } from "./api";
 import { ExportReady } from "./ProfilePanels";
+import { useCan } from "../team/api";
 import type { DeleteResult, ExportResult, PersonInput } from "./types";
 
 export function PrivacyPage() {
+  if (!useCan("privacy.manage")) {
+    return (
+      <Page>
+        <PageHeader title="Privacy requests" description="When someone asks for a copy of their data, or asks you to delete it." />
+        <EmptyState icon={<FileSearch className="size-5" />} title="Only admins and the owner can handle privacy requests" description="Ask an owner or admin to export or delete someone's data." />
+      </Page>
+    );
+  }
+  return <PrivacyRequests />;
+}
+
+function PrivacyRequests() {
   const { account } = useSession();
   const tz = account.timezone;
   const [by, setBy] = useState<"email" | "phone_number">("email");

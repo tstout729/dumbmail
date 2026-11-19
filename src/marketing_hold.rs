@@ -35,14 +35,12 @@ pub fn push_campaign_filter(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) 
 }
 
 /// Hold a profile that was just created by a source without an opt-in. Never call this for a
-/// profile that already existed. A subscribed profile is never held (the trigger clears it).
-pub async fn hold_new_profile<'e>(db: impl PgExecutor<'e>, account_id: Uuid, profile_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("UPDATE profiles SET marketing_hold = true WHERE id = $1 AND account_id = $2 AND email_consent <> 'subscribed'")
-        .bind(profile_id)
-        .bind(account_id)
-        .execute(db)
-        .await?;
-    Ok(())
+/// profile that already existed. A subscribed profile is never held (the trigger clears it). The
+/// hold is recorded in the profile's consent history (`features::people::consent::set_hold_in`).
+pub async fn hold_new_profile(db: &sqlx::PgPool, account_id: Uuid, profile_id: Uuid, src: &crate::features::people::ConsentSource) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    crate::features::people::consent::set_hold_in(&mut tx, account_id, profile_id, true, src).await?;
+    tx.commit().await
 }
 
 /// The SQL condition (on `profiles p`, with the sending flow's id at `flow_param`, NULL for a

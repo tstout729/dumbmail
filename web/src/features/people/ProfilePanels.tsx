@@ -4,6 +4,7 @@ import { CheckCircle2, Download, GitMerge, History, Loader2, Mail, MessageSquare
 import { Button, Card, ConfirmDialog, IconButton, Modal, Skeleton, Textarea, Toggle, cx } from "../../components/ui";
 import { formatDate, formatDateTime, formatPhone, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { useCan } from "../team/api";
 import { useAddNote, useConsentPage, useDeleteNote, useExportPerson, usePeopleSummary, usePrivacyRequest, useSetAdsOptOut } from "./api";
 import { MergePicker } from "./MergeDialog";
 import type { ChannelReach, ConsentEvent, ExportResult } from "./types";
@@ -44,6 +45,8 @@ function ReachRow({ icon, label, reach, tz }: { icon: ReactNode; label: string; 
 export function ProfileSidePanels({ profileId, email, phone, tz }: PanelProps) {
   const summary = usePeopleSummary(profileId);
   const ads = useSetAdsOptOut(profileId);
+  const canPrivacy = useCan("privacy.manage");
+  const canWrite = useCan("audience.write");
   const exportPerson = useExportPerson();
   const [exported, setExported] = useState<ExportResult | null>(null);
   const [merging, setMerging] = useState(false);
@@ -72,22 +75,28 @@ export function ProfileSidePanels({ profileId, email, phone, tz }: PanelProps) {
                   : "They haven't asked. Turn on if they ask you not to sell or share their data."}
               </p>
             </div>
-            <Toggle checked={s.ads_opt_out} disabled={ads.isPending} onChange={(v) => ads.mutate(v)} label="Do not sell or share" />
+            <Toggle checked={s.ads_opt_out} disabled={ads.isPending || !canPrivacy} onChange={(v) => ads.mutate(v)} label="Do not sell or share" />
           </div>
-          <div className="flex flex-wrap gap-2 border-t border-zinc-100 pt-3">
-            <Button
-              size="sm"
-              icon={<Download className="size-3.5" />}
-              disabled={!email && !phone}
-              loading={exportPerson.isPending}
-              onClick={() => exportPerson.mutate(email ? { email } : { phone_number: phone ?? "" }, { onSuccess: setExported })}
-            >
-              Export their data
-            </Button>
-            <Button size="sm" icon={<GitMerge className="size-3.5" />} onClick={() => setMerging(true)}>
-              Merge with…
-            </Button>
-          </div>
+          {canPrivacy || canWrite ? (
+            <div className="flex flex-wrap gap-2 border-t border-zinc-100 pt-3">
+              {canPrivacy ? (
+                <Button
+                  size="sm"
+                  icon={<Download className="size-3.5" />}
+                  disabled={!email && !phone}
+                  loading={exportPerson.isPending}
+                  onClick={() => exportPerson.mutate(email ? { email } : { phone_number: phone ?? "" }, { onSuccess: setExported })}
+                >
+                  Export their data
+                </Button>
+              ) : null}
+              {canWrite ? (
+                <Button size="sm" icon={<GitMerge className="size-3.5" />} onClick={() => setMerging(true)}>
+                  Merge with…
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </Card>
       <NotesCard profileId={profileId} notes={s.notes} tz={tz} />
@@ -139,6 +148,7 @@ export function ExportReady({ result, tz, onClose }: { result: ExportResult; tz:
 function NotesCard({ profileId, notes, tz }: { profileId: string; notes: { id: string; author: string; body: string; created_at: string }[]; tz: string }) {
   const add = useAddNote(profileId);
   const remove = useDeleteNote(profileId);
+  const canWrite = useCan("audience.write");
   const [body, setBody] = useState("");
   const [confirm, setConfirm] = useState<string | null>(null);
   const onSubmit = (e: FormEvent) => {
@@ -148,23 +158,29 @@ function NotesCard({ profileId, notes, tz }: { profileId: string; notes: { id: s
   };
   return (
     <Card title="Notes">
-      <form onSubmit={onSubmit} className="space-y-2">
-        <Textarea value={body} onChange={(e) => setBody(e.target.value)} placeholder="Add a note for your team. The person never sees it." rows={2} maxLength={5000} aria-label="New note" />
-        <div className="flex justify-end">
-          <Button type="submit" size="sm" variant="primary" disabled={!body.trim()} loading={add.isPending}>
-            Add note
-          </Button>
-        </div>
-      </form>
+      {canWrite ? (
+        <form onSubmit={onSubmit} className="space-y-2">
+          <Textarea value={body} onChange={(e) => setBody(e.target.value)} placeholder="Add a note for your team. The person never sees it." rows={2} maxLength={5000} aria-label="New note" />
+          <div className="flex justify-end">
+            <Button type="submit" size="sm" variant="primary" disabled={!body.trim()} loading={add.isPending}>
+              Add note
+            </Button>
+          </div>
+        </form>
+      ) : notes.length === 0 ? (
+        <p className="text-sm text-zinc-500">No notes yet.</p>
+      ) : null}
       {notes.length > 0 ? (
         <ul className="mt-3 space-y-3 border-t border-zinc-100 pt-3">
           {notes.map((n) => (
             <li key={n.id} className="group text-sm">
               <div className="flex items-start justify-between gap-2">
                 <p className="min-w-0 whitespace-pre-wrap break-words text-zinc-800">{n.body}</p>
-                <IconButton label="Delete note" size="sm" className="opacity-60 group-hover:opacity-100" onClick={() => setConfirm(n.id)}>
-                  <Trash2 className="size-3.5" />
-                </IconButton>
+                {canWrite ? (
+                  <IconButton label="Delete note" size="sm" className="opacity-60 group-hover:opacity-100" onClick={() => setConfirm(n.id)}>
+                    <Trash2 className="size-3.5" />
+                  </IconButton>
+                ) : null}
               </div>
               <div className="mt-0.5 text-xs text-zinc-500" title={formatDateTime(n.created_at, tz)}>
                 {n.author} · {formatRelative(n.created_at)}

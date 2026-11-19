@@ -149,6 +149,7 @@ struct Row {
     email_suppressed_reason: Option<String>,
     sms_suppressed_reason: Option<String>,
     ads_opt_out: bool,
+    marketing_hold: bool,
     created_at: DateTime<Utc>,
     last_event_at: Option<DateTime<Utc>>,
 }
@@ -163,11 +164,12 @@ impl Row {
             email_suppressed_reason: self.email_suppressed_reason.clone(),
             sms_suppressed_reason: self.sms_suppressed_reason.clone(),
             ads_opt_out: self.ads_opt_out,
+            marketing_hold: self.marketing_hold,
         }
     }
 }
 
-const ROW_COLS: &str = "id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_suppressed_reason, sms_suppressed_reason, ads_opt_out, created_at, last_event_at";
+const ROW_COLS: &str = "id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_suppressed_reason, sms_suppressed_reason, ads_opt_out, marketing_hold, created_at, last_event_at";
 
 /// The more restrictive of two consents: unsubscribed, then waiting to confirm, then never
 /// subscribed, then subscribed.
@@ -248,6 +250,8 @@ fn combine(keep: &Row, other: &Row, choices: &HashMap<String, String>) -> AppRes
         email_suppressed_reason: stronger_suppression(keep.email_suppressed_reason.clone(), other.email_suppressed_reason.clone()),
         sms_suppressed_reason: stronger_suppression(keep.sms_suppressed_reason.clone(), other.sms_suppressed_reason.clone()),
         ads_opt_out: keep.ads_opt_out || other.ads_opt_out,
+        // Held if either was (the database lets go of it when the merged email consent is subscribed).
+        marketing_hold: keep.marketing_hold || other.marketing_hold,
         created_at: keep.created_at.min(other.created_at),
         last_event_at: keep.last_event_at.max(other.last_event_at),
     };
@@ -259,7 +263,7 @@ fn row_json(r: &Row) -> Value {
         "id": r.id, "email": r.email, "phone_number": r.phone_number, "external_id": r.external_id, "first_name": r.first_name,
         "last_name": r.last_name, "properties": r.properties, "email_consent": r.email_consent, "sms_consent": r.sms_consent,
         "email_suppressed_reason": r.email_suppressed_reason, "sms_suppressed_reason": r.sms_suppressed_reason,
-        "ads_opt_out": r.ads_opt_out, "created_at": r.created_at, "last_event_at": r.last_event_at,
+        "ads_opt_out": r.ads_opt_out, "marketing_hold": r.marketing_hold && r.email_consent != "subscribed", "created_at": r.created_at, "last_event_at": r.last_event_at,
     })
 }
 
@@ -311,13 +315,13 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
     let r = &merged.row;
     // Free the identifiers first: they're unique per account.
     sqlx::query("UPDATE profiles SET email = NULL, phone_number = NULL, external_id = NULL WHERE id = $1").bind(other.id).execute(&mut *tx).await?;
-    sqlx::query(
+    let held: bool = sqlx::query_scalar(
         "UPDATE profiles SET email = $2, phone_number = $3, external_id = $4, first_name = $5, last_name = $6, properties = $7,
                 email_consent = $8, sms_consent = $9, email_suppressed_reason = $10, sms_suppressed_reason = $11,
                 ads_opt_out = $12, ads_opt_out_at = CASE WHEN $12 AND NOT ads_opt_out THEN now() ELSE ads_opt_out_at END,
                 ads_opt_out_source = CASE WHEN $12 AND NOT ads_opt_out THEN 'merge' ELSE ads_opt_out_source END,
-                created_at = $13, last_event_at = $14, updated_at = now()
-         WHERE id = $1",
+                created_at = $13, last_event_at = $14, marketing_hold = $15, updated_at = now()
+         WHERE id = $1 RETURNING marketing_hold",
     )
     .bind(keep.id)
     .bind(&r.email)
@@ -333,12 +337,15 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
     .bind(r.ads_opt_out)
     .bind(r.created_at)
     .bind(r.last_event_at)
-    .execute(&mut *tx)
+    .bind(r.marketing_hold)
+    .fetch_one(&mut *tx)
     .await?;
     let src = ConsentSource { method: "merge", ..src.clone() }.with_detail("merged_profile_id", json!(other.id));
     // The merged state is never less restrictive than the kept one, so a failed history write can't
     // block it (see consent::record_diff).
-    consent::record_diff(&mut tx, account_id, keep.id, Some(&keep.state()), &r.state(), &src).await?;
+    let saved = ConsentState { marketing_hold: held, ..r.state() };
+    consent::note_address_change(&mut tx, account_id, keep.id, &keep.state(), &saved, &src).await?;
+    consent::record_diff(&mut tx, account_id, keep.id, Some(&keep.state()), &saved, &src).await?;
     // Addresses that don't survive the merge keep their suppression record, so a later import of
     // one of them can't come back more contactable.
     let keep_addrs: Vec<&str> = [r.email.as_deref(), r.phone_number.as_deref()].into_iter().flatten().collect();

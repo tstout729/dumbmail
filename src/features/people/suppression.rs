@@ -13,7 +13,12 @@ use crate::error::{AppError, AppResult};
 use crate::models::{normalize_email, normalize_phone};
 use crate::state::AppState;
 
-pub const REASONS: &[&str] = &["unsubscribed", "hard_bounce", "complaint", "manual", "pending", "not_subscribed"];
+pub const REASONS: &[&str] = &["unsubscribed", "hard_bounce", "complaint", "manual", "pending", "not_subscribed", "marketing_hold"];
+
+/// Why an email address is blocked, as one reason (the strongest), and when it's blocked at all.
+/// A marketing hold (`crate::marketing_hold`) is its own reason, never a manual suppression.
+const EMAIL_REASON: &str = "COALESCE(p.email_suppressed_reason, CASE p.email_consent WHEN 'unsubscribed' THEN 'unsubscribed' WHEN 'pending' THEN 'pending' ELSE 'marketing_hold' END)";
+const EMAIL_BLOCKED: &str = "(p.email_suppressed_reason IS NOT NULL OR p.email_consent IN ('unsubscribed', 'pending') OR p.marketing_hold)";
 /// Addresses suppressed in the request itself; more go to a background job.
 pub const INLINE_MAX: usize = 200;
 pub const REQUEST_MAX: usize = 100_000;
@@ -34,13 +39,18 @@ pub struct SuppressionQuery {
 fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &str, q: &SuppressionQuery) -> AppResult<()> {
     qb.push(
         "FROM (
-            SELECT p.id, 'email' AS channel, p.email AS address, p.first_name, p.last_name, p.updated_at,
-                   COALESCE(p.email_suppressed_reason, CASE p.email_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'pending' END) AS reason
+            SELECT p.id, 'email' AS channel, p.email AS address, p.first_name, p.last_name, p.updated_at, ",
+    )
+    .push(EMAIL_REASON)
+    .push(
+        " AS reason
             FROM profiles p WHERE p.account_id = ",
     )
     .push_bind(account_id)
+    .push(" AND p.email IS NOT NULL AND ")
+    .push(EMAIL_BLOCKED)
     .push(
-        " AND p.email IS NOT NULL AND (p.email_suppressed_reason IS NOT NULL OR p.email_consent IN ('unsubscribed', 'pending'))
+        "
             UNION ALL
             SELECT p.id, 'sms', p.phone_number, p.first_name, p.last_name, p.updated_at,
                    COALESCE(p.sms_suppressed_reason, CASE p.sms_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'not_subscribed' END)
@@ -52,7 +62,8 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
          ) s
          LEFT JOIN LATERAL (
             SELECT e.occurred_at, e.method, e.message_id, e.actor_user_id FROM consent_events e
-            WHERE e.profile_id = s.id AND e.channel = s.channel AND e.new_value = s.reason AND e.field IN ('consent', 'suppression')
+            WHERE e.profile_id = s.id AND ((e.channel = s.channel AND e.new_value = s.reason AND e.field IN ('consent', 'suppression'))
+                                        OR (s.reason = 'marketing_hold' AND e.channel = 'marketing' AND e.field = 'hold' AND e.new_value = 'on'))
             ORDER BY e.occurred_at DESC LIMIT 1
          ) ev ON true
          WHERE true",
@@ -107,6 +118,7 @@ fn reason_text(channel: &str, reason: &str) -> &'static str {
         (_, "manual") => "Suppressed by hand",
         (_, "pending") => "Hasn't confirmed sign-up",
         (_, "not_subscribed") => "Never agreed to texts",
+        (_, "marketing_hold") => "Held back from marketing (added without an opt-in)",
         _ => "Suppressed",
     }
 }
@@ -134,13 +146,13 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> AppRes
             })
         })
         .collect();
-    let counts: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT 'email', COALESCE(email_suppressed_reason, CASE email_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'pending' END), count(*)
-         FROM profiles WHERE account_id = $1 AND email IS NOT NULL AND (email_suppressed_reason IS NOT NULL OR email_consent IN ('unsubscribed', 'pending')) GROUP BY 2
+    let counts: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "SELECT 'email', {EMAIL_REASON}, count(*)
+         FROM profiles p WHERE p.account_id = $1 AND p.email IS NOT NULL AND {EMAIL_BLOCKED} GROUP BY 2
          UNION ALL
-         SELECT 'sms', COALESCE(sms_suppressed_reason, CASE sms_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'not_subscribed' END), count(*)
-         FROM profiles WHERE account_id = $1 AND phone_number IS NOT NULL AND (sms_suppressed_reason IS NOT NULL OR sms_consent <> 'subscribed') GROUP BY 2",
-    )
+         SELECT 'sms', COALESCE(p.sms_suppressed_reason, CASE p.sms_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'not_subscribed' END), count(*)
+         FROM profiles p WHERE p.account_id = $1 AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent <> 'subscribed') GROUP BY 2"
+    ))
     .bind(account_id)
     .fetch_all(db)
     .await?;

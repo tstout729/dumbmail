@@ -274,7 +274,7 @@ async fn confirm(state: &AppState, account_id: Uuid, b: &BulkBody, params: &Valu
         }
     }
     queued?;
-    crate::jobs::enqueue(&mut *tx, JOB, json!({"bulk_id": set_id}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, JOB, json!({"bulk_id": set_id}), None).await?;
     tx.commit().await?;
     super::privacy::ensure_erasure_marker(&state.db, account_id).await?;
     get(&state.db, account_id, set_id).await
@@ -314,7 +314,7 @@ pub async fn start_address_job(state: &AppState, account_id: Uuid, addresses: &[
             .execute(&mut *tx)
             .await?;
     }
-    crate::jobs::enqueue(&mut *tx, JOB, json!({"bulk_id": id}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, JOB, json!({"bulk_id": id}), None).await?;
     tx.commit().await?;
     super::privacy::ensure_erasure_marker(&state.db, account_id).await?;
     get(&state.db, account_id, id).await
@@ -425,6 +425,7 @@ async fn run_batch(state: &AppState, id: Uuid) -> AppResult<()> {
     // Targets merged away or deleted since the preview have no id any more: they're skipped.
     let ids: Vec<Uuid> = targets.iter().filter_map(|t| t.1).collect();
     let mut done: i64 = 0;
+    let mut erased = Vec::new();
     match action.as_str() {
         "add_to_list" => {
             let list: Uuid = params["list_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| AppError::bad("bulk action has no list"))?;
@@ -486,8 +487,9 @@ async fn run_batch(state: &AppState, id: Uuid) -> AppResult<()> {
             }
         }
         "delete" => {
-            let removed = super::privacy::erase_in(&mut tx, account_id, &ids).await?;
+            let (removed, people) = super::privacy::erase_people_in(&mut tx, account_id, &ids).await?;
             done = removed.get("profiles").and_then(Value::as_i64).unwrap_or(0);
+            erased = people;
         }
         "export" => {
             let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Value)> = sqlx::query_as(
@@ -533,8 +535,9 @@ async fn run_batch(state: &AppState, id: Uuid) -> AppResult<()> {
         .bind((n - done).max(0) as i32)
         .execute(&mut *tx)
         .await?;
-    crate::jobs::enqueue(&mut *tx, JOB, json!({"bulk_id": id}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, JOB, json!({"bulk_id": id}), None).await?;
     tx.commit().await?;
+    super::privacy::tell_deleted(&state.db, account_id, &erased).await;
     Ok(())
 }
 

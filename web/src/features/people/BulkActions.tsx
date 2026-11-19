@@ -5,6 +5,7 @@ import { Badge, Button, Checkbox, Drawer, Field, InlineError, Input, Menu, Modal
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { useBulkAction, useBulkCount, useRecentBulk, useStartBulk } from "./api";
 import type { BulkAction, BulkActionName, BulkInput, BulkSelection, Channel } from "./types";
+import { useCan } from "../team/api";
 
 const actionLabels: Record<BulkActionName, string> = {
   add_to_list: "Add to list",
@@ -29,6 +30,9 @@ const doneLabels: Record<string, string> = {
 
 const destructive: BulkActionName[] = ["remove_from_list", "clear_property", "suppress", "delete"];
 
+/** What each action needs besides audience.write (the server checks the same). */
+const extraPermission: Partial<Record<BulkActionName, string>> = { add_to_list: "flows.live", delete: "privacy.manage", export: "export" };
+
 type BarProps = {
   /** Profiles picked by hand on this page. */
   selected: Set<string>;
@@ -50,6 +54,16 @@ export function BulkActionsBar({ selected, onClearSelection, filters, total, pag
   const selection: BulkSelection = picking ? { profile_ids: [...selected] } : filters;
   const scope = picking ? pluralize(selected.size, "selected profile") : `all ${formatNumber(total)} matching`;
   const pageAllSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id));
+  const canWrite = useCan("audience.write");
+  const allowed = {
+    "flows.live": useCan("flows.live"),
+    "privacy.manage": useCan("privacy.manage"),
+    export: useCan("export"),
+  } as Record<string, boolean>;
+  const actions = (Object.keys(actionLabels) as BulkActionName[]).filter((a) => {
+    const extra = extraPermission[a];
+    return canWrite && (!extra || allowed[extra]);
+  });
 
   return (
     <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
@@ -81,14 +95,16 @@ export function BulkActionsBar({ selected, onClearSelection, filters, total, pag
         <Button size="sm" variant="ghost" icon={<History className="size-3.5" />} onClick={() => setHistory(true)}>
           Bulk history
         </Button>
-        <Menu
-          trigger={(props) => (
-            <Button size="sm" disabled={total === 0 && selected.size === 0} {...props}>
-              Bulk actions <ChevronDown className="size-3.5" />
-            </Button>
-          )}
-          items={(Object.keys(actionLabels) as BulkActionName[]).map((a) => ({ label: `${actionLabels[a]}: ${scope}`, danger: a === "delete", onSelect: () => setAction(a) }))}
-        />
+        {actions.length > 0 ? (
+          <Menu
+            trigger={(props) => (
+              <Button size="sm" disabled={total === 0 && selected.size === 0} {...props}>
+                Bulk actions <ChevronDown className="size-3.5" />
+              </Button>
+            )}
+            items={actions.map((a) => ({ label: `${actionLabels[a]}: ${scope}`, danger: a === "delete", onSelect: () => setAction(a) }))}
+          />
+        ) : null}
       </div>
       {action ? <BulkDialog action={action} selection={selection} onClose={() => setAction(null)} /> : null}
       {history ? <BulkHistory onClose={() => setHistory(false)} /> : null}

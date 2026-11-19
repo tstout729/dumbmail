@@ -7,6 +7,7 @@ import { formatDate, formatPhone, fullName, pluralize } from "../../lib/format";
 import { useDuplicates } from "./api";
 import { MergeDialog } from "./MergeDialog";
 import type { DuplicateGroup } from "./types";
+import { useCan } from "../team/api";
 
 const reasonLabels: Record<DuplicateGroup["reason"], string> = {
   email: "Same email",
@@ -22,6 +23,7 @@ function keyText(g: DuplicateGroup): string {
 }
 
 export function DuplicatesPage() {
+  const canMerge = useCan("audience.write");
   const { account } = useSession();
   const dupes = useDuplicates();
   const [merging, setMerging] = useState<{ keep: string; merge: string } | null>(null);
@@ -71,7 +73,7 @@ export function DuplicatesPage() {
                       </Link>
                       <span className="flex items-center gap-2">
                         <StatusBadge status={p.email_consent} />
-                        {first && p.id !== first.id ? (
+                        {first && p.id !== first.id && canMerge ? (
                           <Button size="sm" icon={<GitMerge className="size-3.5" />} onClick={() => setMerging({ keep: first.id, merge: p.id })}>
                             Review merge
                           </Button>

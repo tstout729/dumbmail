@@ -193,6 +193,7 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         // and shipping updates) reach it while it's held.
         let tag = source_tag(shop);
         let phone = if email.is_some() { None } else { phone };
+        let mut tx = db.begin().await?;
         let r: Result<P, sqlx::Error> = sqlx::query_as(
             "INSERT INTO profiles (id, account_id, email, phone_number, first_name, last_name, source, marketing_hold, email_source, phone_source)
              VALUES ($1, $2, $3, $4, $5, $6, $7, true, CASE WHEN $3::text IS NULL THEN NULL ELSE $7 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $7 END)
@@ -205,7 +206,7 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         .bind(first)
         .bind(last)
         .bind(&tag)
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await;
         match r {
             Ok(p) => {
@@ -213,8 +214,14 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
                     .bind(account_id)
                     .bind(shop)
                     .bind(p.id)
-                    .execute(db)
+                    .execute(&mut *tx)
                     .await?;
+                // The hold goes in its consent history, and a deleted person's suppression record for
+                // the address applies, in this transaction (features::people).
+                crate::features::people::consent::record_written_in(&mut tx, account_id, &Default::default(), &[p.id], &consent_source(shop))
+                    .await
+                    .map_err(|e| sqlx::Error::Protocol(format!("recording consent: {e}")))?;
+                tx.commit().await?;
                 return Ok(Some(p));
             }
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => continue,
@@ -222,6 +229,11 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         }
     }
     Ok(None)
+}
+
+/// How Shopify's consent changes appear in consent history (features::people).
+fn consent_source(shop: &str) -> crate::features::people::ConsentSource {
+    crate::features::people::ConsentSource::new("integration", "system").with_detail("integration", json!("shopify")).with_detail("shop", json!(shop))
 }
 
 /// The marker for addresses and profiles this app brought in (`email_source`, `phone_source`,
@@ -234,29 +246,30 @@ pub fn source_tag(shop: &str) -> String {
 /// service-message flow can reach a held person there. Its email consent starts over (never
 /// subscribed): consent never comes from somewhere else. False if another profile has the address or
 /// this one got one.
-async fn attach_email(db: &PgPool, shop: &str, id: Uuid, email: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE profiles SET email = $2, email_consent = 'never_subscribed', email_source = $3, updated_at = now() WHERE id = $1 AND email IS NULL")
-        .bind(id)
-        .bind(email)
-        .bind(source_tag(shop))
-        .execute(db)
-        .await;
-    match r {
-        Ok(r) => Ok(r.rows_affected() == 1),
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
-        Err(e) => Err(e),
-    }
+async fn attach_email(db: &PgPool, account_id: Uuid, shop: &str, id: Uuid, email: &str) -> sqlx::Result<bool> {
+    attach(db, account_id, shop, id, "UPDATE profiles SET email = $2, email_consent = 'never_subscribed', email_source = $3, updated_at = now() WHERE id = $1 AND email IS NULL", email).await
 }
 
-async fn attach_phone(db: &PgPool, shop: &str, id: Uuid, phone: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE profiles SET phone_number = $2, sms_consent = 'never_subscribed', phone_source = $3, updated_at = now() WHERE id = $1 AND phone_number IS NULL")
-        .bind(id)
-        .bind(phone)
-        .bind(source_tag(shop))
-        .execute(db)
-        .await;
+async fn attach_phone(db: &PgPool, account_id: Uuid, shop: &str, id: Uuid, phone: &str) -> sqlx::Result<bool> {
+    attach(db, account_id, shop, id, "UPDATE profiles SET phone_number = $2, sms_consent = 'never_subscribed', phone_source = $3, updated_at = now() WHERE id = $1 AND phone_number IS NULL", phone).await
+}
+
+/// Give the profile an address with `sql`, in one transaction with its consent history: the old
+/// and new address, the consent that starts over, and a deleted person's suppression record for
+/// the new address (features::people).
+async fn attach(db: &PgPool, account_id: Uuid, shop: &str, id: Uuid, sql: &str, value: &str) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let Some(before) = crate::features::people::consent::lock(&mut tx, account_id, id).await? else { return Ok(false) };
+    let r = sqlx::query(sql).bind(id).bind(value).bind(source_tag(shop)).execute(&mut *tx).await;
     match r {
-        Ok(r) => Ok(r.rows_affected() == 1),
+        Ok(r) if r.rows_affected() == 1 => {
+            crate::features::people::consent::record_written_in(&mut tx, account_id, &std::collections::HashMap::from([(id, before)]), &[id], &consent_source(shop))
+                .await
+                .map_err(|e| sqlx::Error::Protocol(format!("recording consent: {e}")))?;
+            tx.commit().await?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
         Err(e) => Err(e),
     }
@@ -282,31 +295,33 @@ async fn newer_consent(db: &mut sqlx::PgConnection, account_id: Uuid, channel: &
     Ok(won.is_some())
 }
 
-/// Apply Shopify's email state to the profile that has exactly this address. Conditional on the
-/// current row, so a DumbMail unsubscribe or a suppression written a moment ago still wins.
-async fn apply_email_state(db: &mut sqlx::PgConnection, id: Uuid, email: &str, state: Option<&str>) -> sqlx::Result<()> {
-    let sql = match state {
-        Some("SUBSCRIBED") => {
-            "UPDATE profiles SET email_consent = 'subscribed', updated_at = now()
-             WHERE id = $1 AND email = $2 AND email_consent IN ('never_subscribed', 'pending') AND email_suppressed_reason IS NULL"
-        }
-        Some("UNSUBSCRIBED") => "UPDATE profiles SET email_consent = 'unsubscribed', updated_at = now() WHERE id = $1 AND email = $2 AND email_consent <> 'unsubscribed'",
-        // Shopify can't email this address (invalid) or erased it (redacted): never leave it subscribed.
-        Some("INVALID" | "REDACTED") => "UPDATE profiles SET email_consent = 'unsubscribed', updated_at = now() WHERE id = $1 AND email = $2 AND email_consent IN ('subscribed', 'pending')",
-        _ => return Ok(()),
-    };
-    sqlx::query(sql).bind(id).bind(email).execute(db).await?;
-    Ok(())
+/// Apply Shopify's email state to the profile that has exactly this address. Under the row lock
+/// and through the consent helpers (features::people), so a DumbMail unsubscribe or a suppression
+/// written a moment ago still wins, and each change is in consent history.
+async fn apply_email_state(db: &mut sqlx::PgConnection, account_id: Uuid, shop: &str, id: Uuid, email: &str, state: Option<&str>) -> anyhow::Result<()> {
+    apply_state(db, account_id, shop, id, crate::features::people::Channel::Email, email, state).await
 }
 
-async fn apply_sms_state(db: &mut sqlx::PgConnection, id: Uuid, phone: &str, state: Option<&str>) -> sqlx::Result<()> {
-    let sql = match state {
-        Some("SUBSCRIBED") => "UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND phone_number = $2 AND sms_consent IN ('never_subscribed', 'pending')",
-        Some("UNSUBSCRIBED") => "UPDATE profiles SET sms_consent = 'unsubscribed', updated_at = now() WHERE id = $1 AND phone_number = $2 AND sms_consent <> 'unsubscribed'",
-        Some("INVALID" | "REDACTED") => "UPDATE profiles SET sms_consent = 'unsubscribed', updated_at = now() WHERE id = $1 AND phone_number = $2 AND sms_consent IN ('subscribed', 'pending')",
+async fn apply_sms_state(db: &mut sqlx::PgConnection, account_id: Uuid, shop: &str, id: Uuid, phone: &str, state: Option<&str>) -> anyhow::Result<()> {
+    apply_state(db, account_id, shop, id, crate::features::people::Channel::Sms, phone, state).await
+}
+
+async fn apply_state(db: &mut sqlx::PgConnection, account_id: Uuid, shop: &str, id: Uuid, ch: crate::features::people::Channel, addr: &str, state: Option<&str>) -> anyhow::Result<()> {
+    use crate::features::people::consent;
+    let (new, only_from): (&str, Option<&[&str]>) = match state {
+        // An opt-in only lifts "never subscribed" or "waiting to confirm", never an unsubscribe or a suppression.
+        Some("SUBSCRIBED") => ("subscribed", Some(&["never_subscribed", "pending"])),
+        Some("UNSUBSCRIBED") => ("unsubscribed", None),
+        // Shopify can't reach this address (invalid) or erased it (redacted): never leave it subscribed.
+        Some("INVALID" | "REDACTED") => ("unsubscribed", Some(&["subscribed", "pending"])),
         _ => return Ok(()),
     };
-    sqlx::query(sql).bind(id).bind(phone).execute(db).await?;
+    let Some(cur) = consent::lock(db, account_id, id).await? else { return Ok(()) };
+    if cur.address(ch) != Some(addr) || (new == "subscribed" && cur.suppressed(ch).is_some()) {
+        return Ok(());
+    }
+    let src = consent_source(shop).with_detail("shopify_state", json!(state));
+    consent::set_consent_in(db, account_id, id, ch, new, only_from, &src).await?;
     Ok(())
 }
 
@@ -347,7 +362,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
         Some(e) => match by_email(db, account_id, e).await? {
             Some(p) => Some(p),
             None => match &linked {
-                Some(l) if l.email.is_none() && attach_email(db, shop, l.id, e).await? => Some(P { email: Some(e.clone()), ..l.clone() }),
+                Some(l) if l.email.is_none() && attach_email(db, account_id, shop, l.id, e).await? => Some(P { email: Some(e.clone()), ..l.clone() }),
                 _ => create(db, account_id, shop, Some(e), None, first, last).await?,
             },
         },
@@ -355,7 +370,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
             Some(ph) => match by_phone(db, account_id, ph).await? {
                 Some(p) => Some(p),
                 None => match &linked {
-                    Some(l) if l.phone_number.is_none() && attach_phone(db, shop, l.id, ph).await? => Some(P { phone_number: Some(ph.clone()), ..l.clone() }),
+                    Some(l) if l.phone_number.is_none() && attach_phone(db, account_id, shop, l.id, ph).await? => Some(P { phone_number: Some(ph.clone()), ..l.clone() }),
                     _ => create(db, account_id, shop, None, Some(ph), first, last).await?,
                 },
             },
@@ -373,7 +388,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
         // leave the time recorded and the change (an unsubscribe, say) unapplied.
         let mut tx = db.begin().await?;
         if newer_consent(&mut tx, account_id, "email", e, c.email_state.as_deref(), parse_time(c.email_updated_at.as_deref())).await? {
-            apply_email_state(&mut tx, main.id, e, c.email_state.as_deref()).await?;
+            apply_email_state(&mut tx, account_id, shop, main.id, e, c.email_state.as_deref()).await?;
         }
         tx.commit().await?;
     }
@@ -382,7 +397,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
     if let Some(ph) = &phone {
         let sms_owner = match by_phone(db, account_id, ph).await? {
             Some(p) => Some(p.id),
-            None if main.phone_number.is_none() && attach_phone(db, shop, main.id, ph).await? => Some(main.id),
+            None if main.phone_number.is_none() && attach_phone(db, account_id, shop, main.id, ph).await? => Some(main.id),
             None => create(db, account_id, shop, None, Some(ph), first, last).await?.map(|p| p.id),
         };
         if let Some(owner) = sms_owner {
@@ -392,7 +407,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
             note_profile(db, account_id, shop, Some(c.id), owner).await?;
             let mut tx = db.begin().await?;
             if newer_consent(&mut tx, account_id, "sms", ph, c.sms_state.as_deref(), parse_time(c.sms_updated_at.as_deref())).await? {
-                apply_sms_state(&mut tx, owner, ph, c.sms_state.as_deref()).await?;
+                apply_sms_state(&mut tx, account_id, shop, owner, ph, c.sms_state.as_deref()).await?;
             }
             tx.commit().await?;
         }

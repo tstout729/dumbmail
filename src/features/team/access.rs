@@ -226,10 +226,14 @@ pub enum Perm {
     /// Connect or disconnect the Shopify store, start, pause or cancel its history import, resync its
     /// products and download privacy-request exports (personal data). Admins and owners.
     ShopifyManage,
+    /// Privacy requests: export everything held about one person, erase people (one, or in bulk),
+    /// set "do not sell or share", read the privacy request log and download personal exports
+    /// (features::people). Admins and owners.
+    Privacy,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 47] = [
+    pub const ALL: [Perm; 48] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -277,6 +281,7 @@ impl Perm {
         Perm::IntegrationsManage,
         Perm::AdAudiencesManage,
         Perm::ShopifyManage,
+        Perm::Privacy,
     ];
 
     /// Stable name used in the API (`me.permissions`) and docs.
@@ -330,6 +335,7 @@ impl Perm {
             IntegrationsManage => "integrations.manage",
             AdAudiencesManage => "ad_audiences.manage",
             ShopifyManage => "shopify.manage",
+            Privacy => "privacy.manage",
         }
     }
 
@@ -340,7 +346,7 @@ impl Perm {
             Public | Me | Mcp | OwnLogin | TwoFactorStep | SwitchAccount | ConfirmIdentity | Security | Ownership | TransactionalSend => return None,
             AudienceRead | ProfilesRead => (Area::Audience, false),
             // An export copies people's data out, so a read-only key can't start or fetch one.
-            AudienceWrite | Export | Import => (Area::Audience, true),
+            AudienceWrite | Export | Import | Privacy => (Area::Audience, true),
             MessagingRead => (Area::Messaging, false),
             CampaignDraft | TestSend | CampaignManage | CampaignSend | FlowEdit | FlowLive => (Area::Messaging, true),
             ContentRead => (Area::Content, false),
