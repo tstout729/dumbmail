@@ -211,7 +211,7 @@ async fn take_help_slot(conn: &mut PgConnection, account_id: Uuid, phone: &str) 
 }
 
 fn static_purpose(p: &str) -> Option<&'static str> {
-    ["auto_reply", "keyword_reply", "confirmation", "optin_request", "help"].into_iter().find(|k| *k == p)
+    ["auto_reply", "keyword_reply", "confirmation", "optin_request", "help", "agent_reply"].into_iter().find(|k| *k == p)
 }
 
 /// Queue an automatic text answering `rx`: written down first (its id is the message's id, so it

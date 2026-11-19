@@ -89,6 +89,7 @@ impl Harness {
             anthropic_api_base: None,
             translation_daily_chars: 200_000,
             price_translation_per_1000_chars: 0.0,
+            price_agent_conversation: 0.0,
             meta_app_id: None,
             meta_app_secret: None,
             google_ads_client_id: None,
