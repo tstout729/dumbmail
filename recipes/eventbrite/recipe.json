@@ -96,7 +96,7 @@
     "Still in Account settings → Developer links, open Webhooks → Add webhook. Paste the webhook URL, pick the event (or All events), tick Order placed, Order updated, Order refunded and Attendee checked in, and save. Click Test to send a test delivery.",
     "Place a test order and check the delivery log: each webhook is followed by a fetch of the order with its refund request.",
     "Placed Order is recorded only for an order Eventbrite shows as placed with a payment processor fee (paid through a payment processor); free orders and orders paid some other way are Registered for Event, with no value. A refund counts once Eventbrite marks it processed, for the amount it processed.",
-    "DumbMail looks up at most 1,000 records an hour for this integration (Eventbrite allows 2,000 calls an hour per token); past that, webhooks wait and are tried again.",
+    "DumbMail looks up at most 1,000 records an hour for this integration (Eventbrite allows 2,000 calls an hour per token); past that, the next lookups wait until the hour frees up (nothing is dropped).",
     "Buyers and attendees are held back from marketing: buying a ticket isn't consent. Eventbrite's own opt-in preferences (contact_list_preferences) aren't read. Flows marked as service messages (an order follow-up, say) still reach them.",
     "Barcodes, answers to custom questions and addresses are never stored: only the fields the recipe reads are kept."
   ],

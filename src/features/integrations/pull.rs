@@ -85,10 +85,9 @@ pub struct FetchRules {
     /// lookup is refused unless its path, once rendered and normalised, does too. Default `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    /// Lookups this integration may queue in an hour (default 1,000, at most 10,000): counted in
-    /// the database when each one is reserved. Past it, the webhook (or page) that asked waits and
-    /// is tried again later.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Requests an hour this integration's lookups may make (1 to 10,000), when the recipe declares
+    /// it: counted in the database from the requests sent. A lookup over it waits for room (it isn't
+    /// refused and uses up none of its tries). Without it there's no hourly limit.
     pub per_hour: Option<u32>,
     /// Requests a minute this integration's credentials may make (the app's documented rate, e.g.
     /// ShipStation's 40). A lookup over it waits for room.
@@ -104,9 +103,6 @@ pub struct FetchRules {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
 }
-
-/// Default lookups an integration may queue in an hour.
-pub const DEFAULT_LOOKUPS_PER_HOUR: u32 = 1000;
 
 fn default_fetch_id() -> String {
     "^[0-9]{1,20}$".into()
@@ -145,11 +141,6 @@ impl FetchRules {
             return Err(AppError::bad("fetch identity is record or record_and_context"));
         }
         Ok(())
-    }
-
-    /// Lookups this integration may queue in an hour.
-    pub fn lookups_per_hour(&self) -> i64 {
-        i64::from(self.per_hour.unwrap_or(DEFAULT_LOOKUPS_PER_HOUR))
     }
 
     /// Whether each context is its own piece of work (see `identity`).

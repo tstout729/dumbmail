@@ -1408,21 +1408,6 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
         crate::auth::sha256_hex(&format!("{}\n{}", next.url.as_deref().unwrap_or(""), query.join("&")))
     };
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut **tx).await?;
-    // The integration's lookup budget for the hour, counted under the account's lock: a lookup
-    // that would join a waiting one costs nothing; a new one past the budget is refused, and the
-    // webhook (or page) that asked for it is tried again later.
-    let budget = rules.as_ref().map_or(i64::from(super::pull::DEFAULT_LOOKUPS_PER_HOUR), |r| r.lookups_per_hour());
-    let (joins, used): (bool, i64) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM integration_deliveries WHERE integration_id = $1 AND message_id = $2 AND source = 'fetch' AND status = 'pending' AND body IS NULL),
-                (SELECT count(*) FROM integration_deliveries WHERE integration_id = $1 AND source = 'fetch' AND created_at > now() - interval '1 hour')",
-    )
-    .bind(integ.id)
-    .bind(format!("fetch:{key}"))
-    .fetch_one(&mut **tx)
-    .await?;
-    if !joins && used >= budget {
-        return Err(Refused::Busy(format!("the integration's lookups for this hour ({budget}) are used up; the fetch will be asked for again")));
-    }
     let (mine, all): (i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE integration_id = $1), count(*) FROM integration_deliveries
          WHERE account_id = $2 AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL))",
@@ -1510,14 +1495,20 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
     .await?;
     let Some((integration_id, request)) = row else { return Ok(()) };
     let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
-    // These credentials' cooldown (the app said to wait, after a 429) and their rate (`per_minute`)
-    // hold for every lookup of the integration, not only the one that was refused: checked here,
-    // under the account's lock, so a lookup that comes due early waits for its turn.
-    let per_minute = integ.pull_config().and_then(|c| c.fetch).and_then(|r| r.per_minute).map(i64::from);
-    let (cool_until, recent, oldest): (Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+    // These credentials' cooldown (the app said to wait, after a 429) and, when the recipe declares
+    // them, their rate (`per_minute`) and hourly budget (`per_hour`) hold for every lookup of the
+    // integration: checked here, under the account's lock, from the requests actually sent. A
+    // lookup over any of them isn't refused or dropped, and uses up none of its tries: it waits
+    // until there's room, then runs.
+    let declared = integ.pull_config().and_then(|c| c.fetch);
+    let per_minute = declared.as_ref().and_then(|r| r.per_minute).map(i64::from);
+    let per_hour = declared.as_ref().and_then(|r| r.per_hour).map(i64::from);
+    let (cool_until, recent, oldest, hour, hour_oldest): (Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>, i64, Option<DateTime<Utc>>) = sqlx::query_as(
         "SELECT max((request->>'cooldown_until')::timestamptz) FILTER (WHERE request ? 'cooldown_until'),
                 count(*) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute'),
-                min((request->>'sent_at')::timestamptz) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute')
+                min((request->>'sent_at')::timestamptz) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 minute'),
+                count(*) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 hour'),
+                min((request->>'sent_at')::timestamptz) FILTER (WHERE (request->>'sent_at')::timestamptz > now() - interval '1 hour')
          FROM integration_deliveries WHERE integration_id = $1 AND source = 'fetch' AND created_at > now() - interval '1 day'",
     )
     .bind(integration_id)
@@ -1525,10 +1516,15 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
     .await?;
     let claimed_at = Utc::now();
     let mut wait_until = cool_until.filter(|t| *t > claimed_at);
+    let mut later = |room: DateTime<Utc>| wait_until = Some(wait_until.map_or(room, |w| w.max(room)));
     if let (Some(max), Some(first)) = (per_minute, oldest) {
         if recent >= max {
-            let room = first + chrono::Duration::seconds(61);
-            wait_until = Some(wait_until.map_or(room, |w| w.max(room)));
+            later(first + chrono::Duration::seconds(61));
+        }
+    }
+    if let (Some(max), Some(first)) = (per_hour, hour_oldest) {
+        if hour >= max {
+            later(first + chrono::Duration::seconds(3601));
         }
     }
     if let Some(at) = wait_until {

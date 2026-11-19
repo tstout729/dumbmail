@@ -2082,8 +2082,13 @@ async fn eventbrite_records_money_only_from_verified_records_within_its_events()
     h.cleanup().await;
 }
 
+/// Make the stand-in hour pass: requests sent so far count as sent two hours ago.
+async fn an_hour_passes(h: &Harness) {
+    sqlx::query("UPDATE integration_deliveries SET request = jsonb_set(request, '{sent_at}', to_jsonb((now() - interval '2 hours')::text)) WHERE request ? 'sent_at'").execute(&h.state.db).await.unwrap();
+}
+
 #[tokio::test]
-async fn lookups_stay_within_the_hourly_budget() {
+async fn over_the_hourly_budget_webhooks_wait_and_lose_nothing() {
     let mut h = integ_harness!();
     h.signup().await;
     h.credit(5.0).await;
@@ -2098,18 +2103,78 @@ async fn lookups_stay_within_the_hourly_budget() {
         e.post_as(&h, &eventbrite_order_hook(id, "order.placed"), &json!({}), &json!({}), "").await;
     }
     let orders = |seen: &Seen| seen.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/v3/orders/")).count();
-    assert_eq!(orders(&seen), 2, "the third lookup is past the hour's budget");
-    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'buyer5003@example.com'").await, 0);
-    let held: String = sqlx::query_scalar("SELECT error FROM integration_deliveries WHERE source = 'webhook' AND error IS NOT NULL ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
-    assert!(held.contains("lookups for this hour (2)"), "{held}");
-    // Retrying within the hour still finds no room.
+    assert_eq!(orders(&seen), 2, "two requests this hour");
+    // Nothing failed and no try was used up: every webhook is done, and the third lookup waits for
+    // the hour to free up.
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'webhook' AND (status <> 'ok' OR error IS NOT NULL OR attempts > 1)").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending' AND (request->'fetch'->>'attempts')::int = 0 AND next_attempt_at > now() + interval '50 minutes'").await, 1);
+    // Due early (a retry sweep), it still waits.
     retry_now(&h).await;
     assert_eq!(orders(&seen), 2);
-    // An hour later there's room again: the waiting webhook is looked up.
-    sqlx::query("UPDATE integration_deliveries SET created_at = created_at - interval '2 hours' WHERE source = 'fetch'").execute(&h.state.db).await.unwrap();
+    an_hour_passes(&h).await;
     retry_now(&h).await;
     assert_eq!(orders(&seen), 3);
-    assert_eq!(values(&h, "Placed Order", "buyer5003@example.com").await, vec![29.95]);
+    for id in ["5001", "5002", "5003"] {
+        assert_eq!(values(&h, "Placed Order", &format!("buyer{id}@example.com")).await, vec![29.95], "{id}: recorded once");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn over_the_hourly_budget_a_pulls_lookups_wait_and_lose_nothing() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let book: Book = Default::default();
+    let (seen, base) = mock_cloudbeds(book.clone(), std::sync::Arc::new(Gate::default())).await;
+    let c = install(&mut h, "cloudbeds", Sign::Header("X-Webhook-Token"), "cb-webhook-token-0001", false).await;
+    wire(&mut h, &c, &base, json!({"api_key": "cb-api-key-0001"}), None).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", c.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["fetch"]["per_hour"] = json!(2);
+    h.ok("PATCH", &format!("/api/integrations/{}", c.id), Some(json!({"pull": pull}))).await;
+    for n in 1..=5 {
+        let id = format!("200{n}");
+        book.lock().unwrap().insert(id.clone(), cloudbeds_res(&id, &format!("guest{n}@example.com"), 0.0, 241.8, "confirmed"));
+    }
+    // The hourly check lists five arrivals: all five lookups are kept, two run now.
+    h.ok("POST", &format!("/api/integrations/{}/pull", c.id), Some(json!({}))).await;
+    h.drain().await;
+    let reads = |seen: &Seen| seen.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/api/v1.3/getReservation?")).count();
+    assert_eq!(reads(&seen), 2);
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'pull' AND error IS NOT NULL").await, 0, "no lookups were skipped");
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending'").await, 3);
+    an_hour_passes(&h).await;
+    retry_now(&h).await;
+    assert_eq!(reads(&seen), 4);
+    an_hour_passes(&h).await;
+    retry_now(&h).await;
+    assert_eq!(reads(&seen), 5);
+    assert_eq!(events(&h, "Cloudbeds Reservation Confirmed").await, 5, "each reservation once");
+    assert_eq!(cloudbeds_paid(&h).await.len(), 5);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_recipe_that_declares_no_budget_has_no_hourly_limit() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let (store, base) = mock_bigcommerce().await;
+    let b = bigcommerce_with_mock(&mut h, &base).await;
+    let (integration, account): (uuid::Uuid, uuid::Uuid) = sqlx::query_as("SELECT id, account_id FROM integrations WHERE id = $1::uuid").bind(&b.id).fetch_one(&h.state.db).await.unwrap();
+    // Two thousand lookups were already sent this hour.
+    sqlx::query(
+        "INSERT INTO integration_deliveries (id, integration_id, account_id, source, status, request, created_at)
+         SELECT gen_random_uuid(), $1, $2, 'fetch', 'ok', jsonb_build_object('sent_at', now() - interval '10 minutes'), now() - interval '10 minutes' FROM generate_series(1, 2000)",
+    )
+    .bind(integration)
+    .bind(account)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    b.post(&h, "webhook-order-created.json").await;
+    assert_eq!(order_reads(&store, "218"), 1, "BigCommerce declares no budget: the order is read at once");
+    assert_eq!(events(&h, "Placed Order").await, 1);
     h.cleanup().await;
 }
 

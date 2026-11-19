@@ -204,7 +204,7 @@ In a pull, fetch another page. In a webhook, look up the record it names: many a
 - Only the `context` keys listed are kept; the context is put through the redact list's removals, sealed (it isn't shown in the delivery's request record), counted in the payload budget, and handed to the run on the answer as `input.context` (up to 16 KB).
 - The lookup is reserved in the same step that marks the webhook done: a delivery row (source `fetch`) that counts against the limits on work waiting to run, unique on the record (its path and query) while it's outstanding, so a second webhook for the same record joins it, and its context replaces the first one's. Only the job holding it makes the request, never before the row's due time (a retry wait or the app's cooldown), and only once the payload budget has room for a whole answer: that room is reserved before the request and held until the answer is stored, so a request that worked is never repeated for lack of space.
 - An answer that says "not yet" (404, 409, 425, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes, or after the wait the app asked for (BigCommerce's `X-Rate-Limit-Time-Reset-Ms`, then `Retry-After`, then the header named in `reset_header`, ShipStation's `X-Rate-Limit-Reset`; up to two hours). That wait holds for every lookup of the integration (its credentials), not only the one that was refused.
-- Budget and rate: an integration queues at most `per_hour` lookups an hour (default 1,000, at most 10,000), counted in the database as each one is reserved; past it, the webhook or page that asked waits and is tried again. `per_minute` (the app's documented rate, ShipStation's 40) keeps its requests to that many a minute; a lookup over it waits its turn.
+- Budget and rate, when the recipe declares them: `per_hour` (1 to 10,000) and `per_minute` (the app's documented rate, ShipStation's 40) cap the requests an integration's lookups make, counted in the database from the requests sent. A lookup over either isn't refused or dropped and uses up none of its tries: every lookup is kept, and one over the limit waits until there's room, then runs. Integrations that declare neither have no such limit (as before).
 - `identity`: by default a lookup is the record (its path and query), and a second callback's context replaces the first's while it waits. With `record_and_context` each context is its own piece of work (ShipStation's lookups of an order carry a batch's shipments, and a second batch must never replace them).
 - The answer is kept on that row (redacted) and the script runs on it with `input.request`, `input.response` and `input.context`. That run may look up once more (up to 3 lookups from one webhook), for example a refund, then its order. A replay runs the current script again, which decides afresh what to look up.
 
@@ -325,7 +325,7 @@ Events from integrations start flows like any other events, and `{{ event.proper
 | Delivery log | 30 days; 256 MB of payloads per account, checked when each one arrives |
 | Pulls at once | 1 per account, 4 in total (`INTEGRATION_PULL_SLOTS`); fetches share these slots |
 | Fetches from one webhook | 3, each `context` up to 16 KB |
-| Lookups per integration | 1,000 an hour by default (`per_hour`, up to 10,000) |
+| Lookup requests per integration | No limit unless the recipe declares `per_hour` (up to 10,000) or `per_minute`; over it, lookups wait |
 
 ## Recipes
 

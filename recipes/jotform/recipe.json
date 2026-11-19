@@ -69,7 +69,7 @@
     "Set email_field to the ID of the form's email question. To see the question IDs, call GET https://api.jotform.com/form/<form ID>/questions with your key in the APIKEY header.",
     "Only questions of these types can be mapped: full name, email, phone, short text, number, date, dropdown, radio buttons and checkboxes. Addresses, payments, signatures and file uploads are never kept, even if you list them.",
     "If the form asks for marketing consent with a checkbox, radio buttons or a dropdown, set consent_field to that question's ID and consent_value to the exact answer that means yes (for example \"Yes, send me emails\"): it's recorded on each Form Submitted event as marketing_consent. Set copy_fields to the IDs of the answers worth keeping on the event, for example [\"5\", \"7\"]. Nothing else from a submission is stored.",
-    "Send a test submission and check the delivery log: the webhook is followed by a fetch of the submission. DumbMail looks up at most 1,000 submissions an hour for this integration; past that, webhooks wait and are tried again.",
+    "Send a test submission and check the delivery log: the webhook is followed by a fetch of the submission. DumbMail looks up at most 1,000 submissions an hour for this integration; past that, the next lookups wait until the hour frees up (nothing is dropped).",
     "People this adds are held back from marketing. A form submission isn't an opt-in (anyone can type an address into a form), so nobody is subscribed. To add people who ticked the consent question to your marketing, send them a confirmation (double opt-in) first."
   ],
   "flows": []
