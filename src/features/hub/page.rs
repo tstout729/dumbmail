@@ -18,8 +18,9 @@ pub struct Frame<'a> {
     pub font: &'static str,
     /// The hub's path, e.g. `/hub/<key>`.
     pub base: String,
-    /// The session's form token (signed in only).
+    /// The token every form carries: the session's, or this browser's before sign-in.
     pub token: Option<String>,
+    pub signed_in: bool,
     /// Drawn inside the store's panel (no outer margin).
     pub embed: bool,
     /// The dashboard's preview: nothing works, links go nowhere.
@@ -38,6 +39,7 @@ impl<'a> Frame<'a> {
             font: settings.font.css(),
             base: super::session::cookie_path(account),
             token: None,
+            signed_in: false,
             embed,
             preview: false,
             settings,
@@ -102,10 +104,7 @@ fn document(f: &Frame<'_>, title: &str, body: &str) -> String {
         None => format!("<span>{}</span>", esc(&f.name)),
     };
     let banner = if f.preview { r#"<div class="banner">Preview with a made-up shopper. Nothing here works.</div>"# } else { "" };
-    let sign_out = match (&f.token, f.preview) {
-        (Some(_), _) | (None, true) => f.form("/signout", r#"<button class="btn secondary small" type="submit">Sign out</button>"#, ""),
-        _ => String::new(),
-    };
+    let sign_out = if f.signed_in || f.preview { f.form("/signout", r#"<button class="btn secondary small" type="submit">Sign out</button>"#, "") } else { String::new() };
     let notice = f.notice.as_deref().map(|n| format!(r#"<p class="notice" role="status">{}</p>"#, esc(n))).unwrap_or_default();
     let error = f.error.as_deref().map(|n| format!(r#"<p class="error" role="alert">{}</p>"#, esc(n))).unwrap_or_default();
     format!(
@@ -154,6 +153,13 @@ pub fn code_page(f: &Frame<'_>, email: &str) -> String {
         f.href("")
     );
     document(f, &format!("Enter your code · {}", f.name), &body)
+}
+
+/// A sign-in link from an email: one button whose POST uses it (a mail scanner only GETs).
+pub fn link_page(f: &Frame<'_>, link: &str) -> String {
+    let form = f.form("/link", &format!(r#"<input type="hidden" name="link" value="{}"><button class="btn" type="submit">Continue to your account</button>"#, esc(link)), "");
+    let body = format!(r#"<section><h1>Your account</h1><p class="muted">You're signing in from the link in your email.</p>{form}</section>"#);
+    document(f, &format!("Sign in · {}", f.name), &body)
 }
 
 /// The hub isn't on (or the link was wrong).
@@ -385,7 +391,17 @@ pub fn hub_page_with(f: &Frame<'_>, v: &View, all_orders: bool) -> String {
         let links: String = nav.iter().map(|(id, label)| format!(r##"<li><a href="#{id}">{label}</a></li>"##)).collect();
         body.push_str(&format!(r#"<nav aria-label="Sections"><ul>{links}</ul></nav>"#));
     }
+    if !v.trusted {
+        body.push_str(r#"<section><h2>Orders and bookings</h2><p class="empty">We can't show orders or bookings for this email address here. If you've ordered from us, contact us and we'll help.</p></section>"#);
+    }
     body.push_str(&sections);
+    if f.signed_in || f.preview {
+        body.push_str(&f.form(
+            "/signout",
+            r#"<input type="hidden" name="everywhere" value="1"><button class="btn secondary small" type="submit">Sign out on all devices</button>"#,
+            "actions",
+        ));
+    }
     document(f, &format!("Your account · {}", f.name), &body)
 }
 

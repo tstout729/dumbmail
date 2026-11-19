@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
-use crate::features::objects::types::{self as object_types, ObjectType};
+use crate::features::objects::types::{self as object_types, FieldDef, Kind, ObjectType};
 use crate::models::Account;
 use crate::state::AppState;
 
@@ -24,6 +24,7 @@ pub const MAX_QUESTION: usize = 200;
 pub const MAX_ANSWER: usize = 2000;
 pub const MAX_LABEL: usize = 40;
 pub const MAX_CONTACT_URL: usize = 500;
+pub const MAX_PANEL_ORIGINS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +103,14 @@ pub struct ObjectChoice {
     /// The fields shown, in this order ("show in hub").
     #[serde(default)]
     pub fields: Vec<String>,
+    /// Free-text fields (text, lists, open choices) the store confirmed "never contain an address,
+    /// door code, wifi password or other access detail". Only these free-text fields show.
+    #[serde(default)]
+    pub cleared: Vec<String>,
+    /// Kept with the settings, never taken from a request: each cleared field's definition when it
+    /// was confirmed. A changed definition (a new label, type or options) clears the confirmation.
+    #[serde(default)]
+    pub fingerprints: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +135,9 @@ pub struct Settings {
     /// Buttons and links; the account's brand colour when empty.
     pub accent_color: Option<String>,
     pub font: Font,
+    /// The exact origins (https://shop.example) whose pages may show the hub in a panel; the
+    /// website's own origin when empty.
+    pub panel_origins: Vec<String>,
 }
 
 impl Default for Settings {
@@ -141,6 +153,7 @@ impl Default for Settings {
             contact_label: None,
             accent_color: None,
             font: Font::System,
+            panel_origins: Vec::new(),
         }
     }
 }
@@ -162,6 +175,7 @@ pub struct Patch {
     #[serde(default, deserialize_with = "nullable")]
     pub accent_color: Option<Option<String>>,
     pub font: Option<Font>,
+    pub panel_origins: Option<Vec<String>>,
 }
 
 /// `null` clears a field; leaving it out keeps it.
@@ -179,13 +193,15 @@ pub fn patch_schema() -> Value {
         "object_types": {"type": "array", "maxItems": MAX_OBJECT_TYPES, "description": "Custom object types shown under Bookings and subscriptions, with the fields shown for each.", "items": {"type": "object", "properties": {
             "type": {"type": "string", "description": "The object type's key, e.g. reservation."},
             "kind": {"type": "string", "enum": ["booking", "subscription", "other"], "description": "booking: access and address fields can never be shown."},
-            "fields": {"type": "array", "maxItems": MAX_FIELDS_PER_TYPE, "items": {"type": "string"}, "description": "Field keys to show, in order. Sensitive fields are refused."}
+            "fields": {"type": "array", "maxItems": MAX_FIELDS_PER_TYPE, "items": {"type": "string"}, "description": "Field keys to show, in order. Sensitive fields are refused. Free-text fields (text, lists, choices without fixed options) also need to be in cleared."},
+            "cleared": {"type": "array", "maxItems": MAX_FIELDS_PER_TYPE, "items": {"type": "string"}, "description": "Free-text fields you confirm never contain an address, door code, wifi password or other access detail. A confirmation lapses when the field's definition changes."}
         }, "required": ["type"], "additionalProperties": false}},
         "help": {"type": "array", "maxItems": MAX_HELP, "items": {"type": "object", "properties": {"question": {"type": "string", "maxLength": MAX_QUESTION}, "answer": {"type": "string", "maxLength": MAX_ANSWER}}, "required": ["question", "answer"], "additionalProperties": false}},
         "contact_url": {"type": ["string", "null"], "maxLength": MAX_CONTACT_URL, "description": "Where \"Contact us\" goes: https://... or mailto:..."},
         "contact_label": {"type": ["string", "null"], "maxLength": MAX_LABEL},
         "accent_color": {"type": ["string", "null"], "description": "Hex colour for buttons and links; your brand colour when null."},
-        "font": {"type": "string", "enum": ["system", "sans", "serif"]}
+        "font": {"type": "string", "enum": ["system", "sans", "serif"]},
+        "panel_origins": {"type": "array", "maxItems": MAX_PANEL_ORIGINS, "items": {"type": "string"}, "description": "Exact https origins (https://shop.example) whose pages may show the hub in a panel. Empty: your website's origin."}
     })
 }
 
@@ -226,10 +242,28 @@ pub fn access_like(key: &str, label: Option<&str>) -> bool {
     all.iter().any(|w| ACCESS_WORDS.contains(&w.as_str())) || ["address", "password", "passcode", "wifi", "lockbox", "doorcode", "accesscode", "gatecode", "keycode"].iter().any(|w| joined.contains(w))
 }
 
-/// Whether the hub may ever show this field of this type as the type is now.
-pub fn showable(t: &ObjectType, kind: ObjectKind, key: &str) -> bool {
+/// A field anyone could type anything into (text, a list, a choice without fixed options).
+pub fn free_text(def: &FieldDef) -> bool {
+    matches!(def.kind, Kind::Text | Kind::List) || (def.kind == Kind::Enum && def.options.is_empty())
+}
+
+/// A field definition's fingerprint: any change to it (label, type, options ...) changes this.
+pub fn fingerprint(def: &FieldDef) -> String {
+    crate::auth::sha256_hex(&serde_json::to_string(def).unwrap_or_default())[..16].to_string()
+}
+
+/// Whether the hub may show this field of this type as the type is now: chosen, never sensitive,
+/// for bookings never named like access or address details, and free text only while the store's
+/// confirmation for this exact definition stands.
+pub fn showable(t: &ObjectType, c: &ObjectChoice, key: &str) -> bool {
     let Some(def) = t.field(key) else { return false };
-    !t.is_sensitive(key) && !(kind == ObjectKind::Booking && access_like(key, def.label.as_deref()))
+    if !c.fields.iter().any(|f| f == key) || t.is_sensitive(key) {
+        return false;
+    }
+    if c.kind == ObjectKind::Booking && access_like(key, def.label.as_deref()) {
+        return false;
+    }
+    !free_text(def) || c.fingerprints.get(key).is_some_and(|fp| *fp == fingerprint(def))
 }
 
 fn clean_text(s: &str, max: usize, what: &str) -> AppResult<String> {
@@ -241,7 +275,10 @@ fn clean_text(s: &str, max: usize, what: &str) -> AppResult<String> {
 }
 
 /// Check and tidy a whole set of settings against the account's object types as they are now.
-pub async fn check(db: &PgPool, account_id: Uuid, mut s: Settings) -> AppResult<Settings> {
+/// `choices_given`: the object types came with this change (so their fields are checked strictly
+/// and their confirmations taken afresh); otherwise the stored ones stay as they are, and pages
+/// still show only what [`showable`] allows.
+pub async fn check(db: &PgPool, account_id: Uuid, mut s: Settings, choices_given: bool) -> AppResult<Settings> {
     s.button_label = clean_text(&s.button_label, MAX_LABEL, "The button label")?;
     if s.button_label.is_empty() {
         s.button_label = "My account".into();
@@ -255,11 +292,15 @@ pub async fn check(db: &PgPool, account_id: Uuid, mut s: Settings) -> AppResult<
         if !seen.insert(c.type_key.clone()) {
             return Err(AppError::bad(format!("{:?} is listed twice", c.type_key)));
         }
+        if !choices_given {
+            continue;
+        }
         let t = object_types::by_key(db, account_id, &c.type_key).await?.ok_or_else(|| AppError::bad(format!("There's no object type {:?}", c.type_key)))?;
-        if c.fields.len() > MAX_FIELDS_PER_TYPE {
+        if c.fields.len() > MAX_FIELDS_PER_TYPE || c.cleared.len() > MAX_FIELDS_PER_TYPE {
             return Err(AppError::bad(format!("Choose at most {MAX_FIELDS_PER_TYPE} fields for {}", t.name)));
         }
         let mut fields_seen = std::collections::HashSet::new();
+        c.fingerprints.clear();
         for f in &c.fields {
             if !fields_seen.insert(f.as_str()) {
                 return Err(AppError::bad(format!("{f:?} is listed twice for {}", t.name)));
@@ -271,8 +312,33 @@ pub async fn check(db: &PgPool, account_id: Uuid, mut s: Settings) -> AppResult<
             if c.kind == ObjectKind::Booking && access_like(f, def.label.as_deref()) {
                 return Err(AppError::bad(format!("{f:?} looks like access or address details, which a booking never shows in the hub")));
             }
+            if free_text(def) {
+                if !c.cleared.iter().any(|k| k == f) {
+                    return Err(AppError::bad(format!(
+                        "{f:?} is free text: confirm it never contains an address, door code, wifi password or other access detail (add it to cleared) to show it"
+                    )));
+                }
+                c.fingerprints.insert(f.clone(), fingerprint(def));
+            }
+        }
+        // Confirmations only for fields shown and free text.
+        c.cleared.retain(|k| c.fingerprints.contains_key(k));
+    }
+    if s.panel_origins.len() > MAX_PANEL_ORIGINS {
+        return Err(AppError::bad(format!("Add at most {MAX_PANEL_ORIGINS} sites for the panel")));
+    }
+    let mut origins = Vec::new();
+    for o in &s.panel_origins {
+        let o = o.trim();
+        if o.is_empty() {
+            continue;
+        }
+        let origin = exact_origin(o).ok_or_else(|| AppError::bad(format!("{o:?} isn't a site address like https://shop.example")))?;
+        if !origins.contains(&origin) {
+            origins.push(origin);
         }
     }
+    s.panel_origins = origins;
     if s.help.len() > MAX_HELP {
         return Err(AppError::bad(format!("Add at most {MAX_HELP} help entries")));
     }
@@ -294,6 +360,42 @@ pub async fn check(db: &PgPool, account_id: Uuid, mut s: Settings) -> AppResult<
         Some(_) => return Err(AppError::bad("The accent colour must be a hex colour like #1f6f5c")),
     };
     Ok(s)
+}
+
+/// `https://host[:port]` from a site address (no path, query or credentials); None otherwise.
+pub fn exact_origin(raw: &str) -> Option<String> {
+    let u = url::Url::parse(raw.trim()).ok()?;
+    if u.scheme() != "https" || u.host_str().is_none() || !u.username().is_empty() || u.password().is_some() || !matches!(u.path(), "" | "/") || u.query().is_some() || u.fragment().is_some() {
+        return None;
+    }
+    Some(u.origin().ascii_serialization())
+}
+
+/// The origins whose pages may frame the hub in a panel: the store's approved list, else its
+/// website's exact origin. Empty when the hub can't open in a panel at all.
+pub fn panel_origins(account: &Account, s: &Settings) -> Vec<String> {
+    if embed_site(account).is_none() {
+        return Vec::new();
+    }
+    if !s.panel_origins.is_empty() {
+        return s.panel_origins.clone();
+    }
+    let site = account.website.as_deref().map(str::trim).filter(|w| !w.is_empty());
+    site.and_then(|w| exact_origin(&if w.contains("://") { w.to_string() } else { format!("https://{w}") }).or_else(|| {
+        url::Url::parse(w).ok().filter(|u| u.scheme() == "https").map(|u| u.origin().ascii_serialization())
+    }))
+    .into_iter()
+    .collect()
+}
+
+/// The launcher the snippet should load (`button` or `link`), when the hub is on and has one.
+pub async fn launcher(db: &PgPool, account_id: Uuid) -> AppResult<Option<&'static str>> {
+    let s = load(db, account_id).await?;
+    Ok(match (s.enabled, s.launcher) {
+        (true, Launcher::Button) => Some("button"),
+        (true, Launcher::Link) => Some("link"),
+        _ => None,
+    })
 }
 
 fn check_contact(u: &str) -> AppResult<String> {
@@ -354,8 +456,12 @@ pub async fn update(state: &AppState, ctx: &Ctx, body: Value) -> AppResult<Value
     if let Some(v) = p.sections {
         s.sections = v;
     }
+    let choices_given = p.object_types.is_some();
     if let Some(v) = p.object_types {
         s.object_types = v;
+    }
+    if let Some(v) = p.panel_origins {
+        s.panel_origins = v;
     }
     if let Some(v) = p.help {
         s.help = v;
@@ -372,7 +478,7 @@ pub async fn update(state: &AppState, ctx: &Ctx, body: Value) -> AppResult<Value
     if let Some(v) = p.font {
         s.font = v;
     }
-    let s = check(&state.db, ctx.account_id, s).await?;
+    let s = check(&state.db, ctx.account_id, s, choices_given).await?;
     save(&state.db, ctx.account_id, &s).await?;
     let action = match (was_enabled, s.enabled) {
         (false, true) => "hub.enable",
@@ -411,13 +517,27 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
             let fields: Vec<Value> = t
                 .fields
                 .iter()
-                .map(|f| json!({"key": f.key, "label": f.label, "type": f.kind, "sensitive": t.is_sensitive(&f.key), "access_like": access_like(&f.key, f.label.as_deref())}))
+                .map(|f| json!({"key": f.key, "label": f.label, "type": f.kind, "sensitive": t.is_sensitive(&f.key), "access_like": access_like(&f.key, f.label.as_deref()), "free_text": free_text(f)}))
                 .collect();
             json!({"key": t.key, "name": t.name, "plural": t.plural, "count": n, "fields": fields})
         })
         .collect();
+    let all_types = object_types::list(&state.db, account_id).await?.into_iter().map(|(t, _)| t).collect::<Vec<_>>();
     let mut out = serde_json::to_value(&s).map_err(anyhow::Error::from)?;
+    // Confirmations that still stand (a changed field definition dropped its own), never the
+    // stored fingerprints.
+    if let Some(list) = out["object_types"].as_array_mut() {
+        for (o, c) in list.iter_mut().zip(&s.object_types) {
+            let t = all_types.iter().find(|t| t.key == c.type_key);
+            let valid: Vec<&String> = c.cleared.iter().filter(|k| t.and_then(|t| t.field(k)).is_some_and(|d| c.fingerprints.get(*k).is_some_and(|fp| *fp == fingerprint(d)))).collect();
+            o["cleared"] = json!(valid);
+            if let Some(m) = o.as_object_mut() {
+                m.remove("fingerprints");
+            }
+        }
+    }
     out["url"] = json!(super::session::hub_url(state, &account));
+    out["panel_origins_in_use"] = json!(panel_origins(&account, &s));
     out["embed_site"] = json!(embed_site(&account));
     out["link_domain"] = json!({"domain": account.link_domain, "active": account.link_domain_status == "active"});
     out["available_types"] = json!(types);

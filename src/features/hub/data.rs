@@ -147,6 +147,9 @@ pub struct Prefs {
 /// Everything the hub page shows. A section the store turned off is `None`.
 pub struct View {
     pub first_name: Option<String>,
+    /// The person's email came from the store's own systems (see [`trusted_email`]). When false,
+    /// only their email preferences show.
+    pub trusted: bool,
     pub email: String,
     pub orders: Option<Vec<Order>>,
     pub more_orders: bool,
@@ -182,10 +185,38 @@ pub fn web_url(u: Option<String>) -> Option<String> {
     u.filter(|u| u.len() <= 2000).and_then(|u| url::Url::parse(&u).ok()).filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some()).map(|u| u.to_string())
 }
 
+/// "The profile's email came from a trusted source" (on `profiles p`): the API, MCP, the dashboard
+/// or an import (`api`), an integration or recipe (`integration:<id>`), Shopify, a Klaviyo import.
+/// Never set by the website snippet or a form, which can only fill an email a profile lacks; and
+/// cleared by the database whenever the email changes without a new source. Proving an inbox opens
+/// only what the store itself tied to that address.
+pub const TRUSTED_EMAIL_SQL: &str = "(p.email_source IS NOT NULL)";
+
+/// Whether this shopper's email came from a trusted source (see [`TRUSTED_EMAIL_SQL`]).
+pub async fn trusted_email(db: &PgPool, shopper: &Shopper) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(&format!("SELECT {TRUSTED_EMAIL_SQL} FROM profiles p WHERE p.id = $1 AND p.account_id = $2"))
+        .bind(shopper.profile_id)
+        .bind(shopper.account.id)
+        .fetch_optional(db)
+        .await?
+        .unwrap_or(false))
+}
+
 /// The whole page's data for this shopper, for the sections the store turned on.
 pub async fn view(db: &PgPool, shopper: &Shopper, s: &Settings, all_orders: bool) -> AppResult<View> {
-    let (first_name,): (Option<String>,) = sqlx::query_as("SELECT first_name FROM profiles WHERE id = $1 AND account_id = $2").bind(shopper.profile_id).bind(shopper.account.id).fetch_one(db).await?;
-    let mut v = View { first_name, email: shopper.email.clone(), orders: None, more_orders: false, records: None, picks: None, stock: None, prefs: None };
+    let (first_name, trusted): (Option<String>, bool) = sqlx::query_as(&format!("SELECT p.first_name, {TRUSTED_EMAIL_SQL} FROM profiles p WHERE p.id = $1 AND p.account_id = $2"))
+        .bind(shopper.profile_id)
+        .bind(shopper.account.id)
+        .fetch_one(db)
+        .await?;
+    let mut v = View { first_name, trusted, email: shopper.email.clone(), orders: None, more_orders: false, records: None, picks: None, stock: None, prefs: None };
+    if s.sections.preferences {
+        v.prefs = Some(prefs(db, shopper).await?);
+    }
+    // Orders, bookings and picks only for an address the store's own systems gave this person.
+    if !trusted {
+        return Ok(v);
+    }
     if s.sections.orders {
         let mut orders = orders(db, shopper).await?;
         let cap = if all_orders { MAX_ORDERS } else { ORDERS_FIRST };
@@ -200,9 +231,6 @@ pub async fn view(db: &PgPool, shopper: &Shopper, s: &Settings, all_orders: bool
     if s.sections.recommendations {
         v.picks = Some(picks(db, shopper).await?);
         v.stock = Some(stock_requests(db, shopper).await?);
-    }
-    if s.sections.preferences {
-        v.prefs = Some(prefs(db, shopper).await?);
     }
     Ok(v)
 }
@@ -240,7 +268,7 @@ fn add_shipment(acc: &mut Acc, metric: &str, p: &Value, account: &Account) {
     }
     let key = number.clone().or_else(|| text(p, "shipment_id")).or_else(|| text(p, "fulfillment_id")).or_else(|| url.clone()).unwrap_or_default();
     let expected = text(p, "expected_delivery").and_then(|d| {
-        DateTime::parse_from_rfc3339(&d).ok().map(|t| date(account, t.with_timezone(&Utc))).or_else(|| NaiveDate::parse_from_str(&d[..d.len().min(10)], "%Y-%m-%d").ok().map(|d| d.format("%b %-d, %Y").to_string()))
+        DateTime::parse_from_rfc3339(&d).ok().map(|t| date(account, t.with_timezone(&Utc))).or_else(|| d.get(..10).and_then(|day| NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()).map(|d| d.format("%b %-d, %Y").to_string()))
     });
     let carrier = text(p, "carrier").or_else(|| text(p, "tracking_company")).or_else(|| text(p, "courier"));
     // Events come newest first: the first status seen for a parcel is its latest.
@@ -318,7 +346,12 @@ pub async fn orders(db: &PgPool, shopper: &Shopper) -> AppResult<Vec<Order>> {
     let by_number: HashMap<String, String> = by_id.iter().filter_map(|(id, a)| a.order_number.clone().map(|n| (n.trim_start_matches('#').to_string(), id.clone()))).collect();
     let mut refunds: HashMap<String, f64> = HashMap::new();
     for (_, metric, p, value, _, _) in rows.iter().filter(|r| r.1 != "Placed Order") {
-        let key = text(p, "order_id").filter(|k| by_id.contains_key(k)).or_else(|| text(p, "order_number").and_then(|n| by_number.get(n.trim_start_matches('#')).cloned()));
+        // An event that names an order id belongs to that order or none; only one without an id is
+        // matched by the order's display number.
+        let key = match text(p, "order_id") {
+            Some(id) => by_id.contains_key(&id).then_some(id),
+            None => text(p, "order_number").and_then(|n| by_number.get(n.trim_start_matches('#')).cloned()),
+        };
         let Some(acc) = key.as_ref().and_then(|k| by_id.get_mut(k)) else { continue };
         match metric.as_str() {
             "Cancelled Order" => acc.cancelled = true,
@@ -400,6 +433,9 @@ pub async fn fill_items(db: &PgPool, account: &Account, orders: &mut [Order]) ->
 
 /// One order of this shopper's, with its items, or None when it isn't theirs.
 pub async fn order(db: &PgPool, shopper: &Shopper, id: &str) -> AppResult<Option<Order>> {
+    if !trusted_email(db, shopper).await? {
+        return Ok(None);
+    }
     let mut all = orders(db, shopper).await?;
     let Some(i) = all.iter().position(|o| o.id == id) else { return Ok(None) };
     let mut one = vec![all.swap_remove(i)];
@@ -449,24 +485,31 @@ pub async fn records(db: &PgPool, shopper: &Shopper, s: &Settings) -> AppResult<
         .fetch_all(db)
         .await?;
         for (fields,) in rows {
-            out.push(record(&shopper.account, &t, c.kind, &c.fields, fields.as_object().cloned().unwrap_or_default()));
+            out.push(record(&shopper.account, &t, c, fields.as_object().cloned().unwrap_or_default()));
         }
     }
     Ok(out)
 }
 
-fn record(account: &Account, t: &ObjectType, kind: ObjectKind, chosen: &[String], fields: Map<String, Value>) -> Record {
-    let shown = chosen
+fn record(account: &Account, t: &ObjectType, c: &settings::ObjectChoice, fields: Map<String, Value>) -> Record {
+    let shown = c
+        .fields
         .iter()
-        .filter(|k| settings::showable(t, kind, k))
+        .filter(|k| settings::showable(t, c, k))
         .filter_map(|k| {
             let def = t.field(k)?;
             let v = field_text(account, t, k, fields.get(k.as_str())?)?;
             Some((def.label.clone().unwrap_or_else(|| label_of(k)), v))
         })
         .collect();
-    let title = crate::features::objects::store::title_of(t, &fields).filter(|_| t.title_field.as_deref().is_none_or(|k| settings::showable(t, kind, k))).unwrap_or_else(|| t.name.clone());
-    Record { type_name: t.name.clone(), kind, title, fields: shown }
+    // The title is a field like any other: shown only when chosen and showable.
+    let title = t
+        .title_field
+        .as_deref()
+        .filter(|k| settings::showable(t, c, k))
+        .and_then(|_| crate::features::objects::store::title_of(t, &fields))
+        .unwrap_or_else(|| t.name.clone());
+    Record { type_name: t.name.clone(), kind: c.kind, title, fields: shown }
 }
 
 /// Picks for this shopper (verified, in-stock products).
@@ -577,7 +620,7 @@ pub fn sample(account: &Account, s: &Settings, types: &[ObjectType]) -> View {
             let fields = c
                 .fields
                 .iter()
-                .filter(|k| settings::showable(t, c.kind, k))
+                .filter(|k| settings::showable(t, c, k))
                 .filter_map(|k| {
                     let def = t.field(k)?;
                     let v = match def.kind {
@@ -597,6 +640,7 @@ pub fn sample(account: &Account, s: &Settings, types: &[ObjectType]) -> View {
         .collect();
     View {
         first_name: Some("Sam".into()),
+        trusted: true,
         email: "sam@example.com".into(),
         orders: s.sections.orders.then_some(orders),
         more_orders: false,

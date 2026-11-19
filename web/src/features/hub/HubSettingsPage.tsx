@@ -15,6 +15,7 @@ import {
   Segmented,
   Select,
   Skeleton,
+  TagInput,
   Textarea,
   Toggle,
 } from "../../components/ui";
@@ -39,7 +40,7 @@ export function HubSettingsPage() {
   );
 }
 
-type Draft = Omit<HubSettings, "url" | "embed_site" | "link_domain" | "available_types">;
+type Draft = Omit<HubSettings, "url" | "embed_site" | "panel_origins_in_use" | "link_domain" | "available_types">;
 
 function draftOf(s: HubSettings): Draft {
   return {
@@ -47,12 +48,13 @@ function draftOf(s: HubSettings): Draft {
     launcher: s.launcher,
     button_label: s.button_label,
     sections: { ...s.sections },
-    object_types: s.object_types.map((o) => ({ ...o, fields: [...o.fields] })),
+    object_types: s.object_types.map((o) => ({ ...o, fields: [...o.fields], cleared: [...(o.cleared ?? [])] })),
     help: s.help.map((h) => ({ ...h })),
     contact_url: s.contact_url,
     contact_label: s.contact_label,
     accent_color: s.accent_color,
     font: s.font,
+    panel_origins: [...s.panel_origins],
   };
 }
 
@@ -106,9 +108,15 @@ function HubForm({ s }: { s: HubSettings }) {
             </div>
           </Field>
           {s.embed_site ? (
-            <Notice tone="green" title={`Opens in a panel on ${s.embed_site}`}>
-              Your branded link domain ({s.link_domain.domain}) is part of your site, so the hub opens over your pages and shoppers stay signed in.
-            </Notice>
+            <>
+              <Notice tone="green" title={`Opens in a panel on ${s.panel_origins_in_use.join(", ") || s.embed_site}`}>
+                Your branded link domain ({s.link_domain.domain}) is part of your site, so the hub opens over your pages and shoppers stay signed in. Only the sites listed
+                here may show it; anywhere else it opens in a new tab.
+              </Notice>
+              <Field label="Sites that may show the panel" hint="Exact addresses like https://www.yourbrand.com. Empty: your website. Press Enter after each one.">
+                <TagInput value={d.panel_origins} onChange={(v) => set({ panel_origins: v })} placeholder="https://www.yourbrand.com" aria-label="Sites that may show the panel" />
+              </Field>
+            </>
           ) : (
             <Notice tone="gray" title="Opens in a new tab">
               {s.link_domain.active
@@ -142,10 +150,12 @@ function HubForm({ s }: { s: HubSettings }) {
               <Input value={d.button_label} maxLength={40} onChange={(e) => set({ button_label: e.target.value })} />
             </Field>
           ) : null}
-          <div>
-            <div className="mb-1 text-xs font-medium text-zinc-700">Your own link or button (works with every choice above)</div>
-            <CodeBlock code={'<a href="#" data-dumbmail-hub>My account</a>\n<button type="button" onclick="DumbMail.openHub()">My account</button>'} />
-          </div>
+          {d.launcher !== "off" ? (
+            <div>
+              <div className="mb-1 text-xs font-medium text-zinc-700">Your own link or button</div>
+              <CodeBlock code={'<a href="#" data-dumbmail-hub>My account</a>\n<button type="button" onclick="DumbMail.openHub()">My account</button>'} />
+            </div>
+          ) : null}
         </div>
       </Card>
 
@@ -239,7 +249,9 @@ function ObjectsCard({ types, value, onChange }: { types: HubAvailableType[]; va
       ) : (
         <div className="space-y-3">
           <p className="text-sm text-zinc-600">
-            Choose the records shoppers see and the fields shown for each. Only records linked to the shopper show. Sensitive fields never show, and for bookings, neither does anything about access or the address.
+            Choose the records shoppers see and the fields shown for each. Only records linked to the shopper show, and only to shoppers whose email came from your own
+            systems. Sensitive fields never show; for bookings, neither does anything about access or the address. Free-text fields show only once you confirm they never
+            hold access details.
           </p>
           {types.map((t) => {
             const c = choice(t.key);
@@ -250,7 +262,7 @@ function ObjectsCard({ types, value, onChange }: { types: HubAvailableType[]; va
                     label={t.plural}
                     description={`${t.count.toLocaleString()} record${t.count === 1 ? "" : "s"}`}
                     checked={!!c}
-                    onChange={(e) => setChoice(t.key, e.target.checked ? { type: t.key, kind: "other", fields: [] } : null)}
+                    onChange={(e) => setChoice(t.key, e.target.checked ? { type: t.key, kind: "other", fields: [], cleared: [] } : null)}
                   />
                   {c ? (
                     <Select
@@ -263,7 +275,7 @@ function ObjectsCard({ types, value, onChange }: { types: HubAvailableType[]; va
                           const f = t.fields.find((x) => x.key === k);
                           return f ? !blocked(f, kind) : false;
                         });
-                        setChoice(t.key, { ...c, kind, fields });
+                        setChoice(t.key, { ...c, kind, fields, cleared: c.cleared.filter((k) => fields.includes(k)) });
                       }}
                     >
                       <option value="booking">Bookings</option>
@@ -278,15 +290,32 @@ function ObjectsCard({ types, value, onChange }: { types: HubAvailableType[]; va
                       const why = blocked(f, c.kind);
                       const on = c.fields.includes(f.key);
                       const full = !on && c.fields.length >= MAX_FIELDS;
+                      const cleared = c.cleared.includes(f.key);
                       return (
-                        <Checkbox
-                          key={f.key}
-                          label={f.label || f.key}
-                          description={why ? `Can't be shown (${why})` : f.label ? f.key : undefined}
-                          checked={on && !why}
-                          disabled={!!why || full}
-                          onChange={(e) => setChoice(t.key, { ...c, fields: e.target.checked ? [...c.fields, f.key] : c.fields.filter((k) => k !== f.key) })}
-                        />
+                        <div key={f.key} className="space-y-1">
+                          <Checkbox
+                            label={f.label || f.key}
+                            description={why ? `Can't be shown (${why})` : f.label ? f.key : undefined}
+                            checked={on && !why}
+                            disabled={!!why || full}
+                            onChange={(e) =>
+                              setChoice(t.key, {
+                                ...c,
+                                fields: e.target.checked ? [...c.fields, f.key] : c.fields.filter((k) => k !== f.key),
+                                cleared: e.target.checked ? c.cleared : c.cleared.filter((k) => k !== f.key),
+                              })
+                            }
+                          />
+                          {on && !why && f.free_text ? (
+                            <Checkbox
+                              className="ml-6"
+                              label="Never contains an address, door code, wifi password or other access detail"
+                              description={cleared ? undefined : "Free text: tick this to show it. It resets if the field changes."}
+                              checked={cleared}
+                              onChange={(e) => setChoice(t.key, { ...c, cleared: e.target.checked ? [...c.cleared, f.key] : c.cleared.filter((k) => k !== f.key) })}
+                            />
+                          ) : null}
+                        </div>
                       );
                     })}
                   </div>

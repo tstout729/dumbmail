@@ -28,7 +28,7 @@ use crate::error::{AppError, AppResult};
 use crate::mcp::{obj, tool};
 use crate::state::AppState;
 
-pub use session::{current, hub_url_for, Shopper};
+pub use session::{current, end_sessions, hub_url_for, Shopper};
 
 /// Recorded when a signed-in shopper opens the hub (once per session a day).
 pub const OPENED_METRIC: &str = "Opened Hub";
@@ -49,6 +49,7 @@ static ROUTE_RULES: &[RouteRule] = &[
     public("GET", "/hub/{key}/orders/{order}"),
     public("POST", "/hub/{key}/code"),
     public("POST", "/hub/{key}/verify"),
+    public("POST", "/hub/{key}/link"),
     public("POST", "/hub/{key}/prefs"),
     public("POST", "/hub/{key}/stock/{id}/cancel"),
     public("POST", "/hub/{key}/signout"),

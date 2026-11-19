@@ -7,11 +7,12 @@
   window.__dumbmailHub = api;
   if (!C) { flush(); return; }
 
-  // The panel works only on the store's own site (same site as the hub's branded domain, so its
-  // sign-in cookie is sent); anywhere else the hub opens in a new tab.
+  // The panel works only on the pages the store approved (its website by default), which are the
+  // same site as the hub's branded domain, so its sign-in cookie is sent; the hub refuses to be
+  // framed anywhere else. Elsewhere it opens in a new tab.
   function sameSite() {
-    var s = C.embed_site, h = String(location.hostname || "").toLowerCase();
-    return !!s && (h === s || h.slice(-(s.length + 1)) === "." + s) && location.protocol === "https:";
+    var o = C.panel_origins || [];
+    return o.indexOf(location.origin) >= 0;
   }
 
   var panel = null, lastFocus = null;

@@ -119,9 +119,9 @@
     track: function (metric, properties, value) { if (metric) send(String(metric), properties || {}, value); return api; },
     profile: profile,
     showForm: function (id) { loadForms(function (forms) { forms.forEach(function (f) { if (f.id === id) show(f, true); }); }); return api; },
-    // The store's customer hub (its account page), when it's turned on: a panel on the store's own
-    // site, else a new tab. Links and buttons marked data-dumbmail-hub do the same.
-    openHub: function () { loadHub(function (h) { h.open(); }); return api; },
+    // The store's customer hub (its account page), when its launcher is on: a panel on the store's
+    // own site, else a new tab. Links and buttons marked data-dumbmail-hub do the same.
+    openHub: function () { loadForms(function () { if (HUB) loadHub(function (h) { h.open(); }); }); return api; },
     // Shopping helpers for custom sites. Each takes plain objects; see the Website page in DumbMail.
     viewedProduct: function (p) { offerProduct(item(p), "manual", 0); flushProduct(); return api; },
     addedToCart: function (p, cart) { addToCart(item(p), "manual", cart ? cartFrom(cart) : null); flushAdd(); return api; },
@@ -876,7 +876,7 @@
 
   // Run calls queued before the script loaded: window.dumbmail = window.dumbmail || []; dumbmail.push(["track", ...]) (window.postlark still works)
   var queued = ONLY_FORM ? null : window.dumbmail || window.postlark;
-  if (!ONLY_FORM) { window.dumbmail = window.postlark = api; if (!window.DumbMail) window.DumbMail = api; }
+  if (!ONLY_FORM) window.dumbmail = window.postlark = api;
   function runQueued() {
     if (ONLY_FORM) return;
     var q = (queued && (queued.q || (Array.isArray(queued) ? queued : null))) || window._dumbmailq || window._postlarkq || [];
@@ -890,13 +890,18 @@
   // The shared form renderer (src/form_render.js); the hosted page and the dashboard preview draw forms with it too.
   var FORMS_UI = __RENDERER__;
   var formsCache = null, showing = null, open = {}, scheduled = {}, teasers = {};
+  // The customer hub's launcher setting from the same config (null: off).
+  var HUB = null;
   function loadForms(cb) {
     if (formsCache) return cb(formsCache);
     fetch(BASE + "/client/forms?k=" + encodeURIComponent(KEY), { credentials: "omit" })
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (j.error) { if (TEST) test.warn("key", "DumbMail didn't accept this snippet's key. Copy the snippet from your Website page again."); return; }
-        formsCache = (j.data || []).map(withVersion); cb(formsCache);
+        formsCache = (j.data || []).map(withVersion);
+        HUB = (j.hub && (j.hub.launcher === "button" || j.hub.launcher === "link")) ? j.hub : null;
+        if (HUB) loadHub();
+        cb(formsCache);
       })
       .catch(function () { if (TEST) test.warn("network", "This page couldn't reach " + BASE + ". A Content-Security-Policy, firewall or ad blocker may be blocking it."); });
   }
@@ -1114,10 +1119,12 @@
   }
 
   // The customer hub's launcher (see the Customer hub settings in DumbMail) lives in its own small
-  // script, which does nothing when the hub is off.
+  // script, loaded (with the DumbMail.openHub() name) only when the storefront config says the
+  // store turned a launcher on; stores without one see no change.
   var hubLoading = false;
   function loadHub(cb) {
-    if (ONLY_FORM) return;
+    if (ONLY_FORM || !HUB || TEST) return;
+    if (!window.DumbMail) window.DumbMail = api;
     var h = window.__dumbmailHub;
     if (h) { if (cb) cb(h); return; }
     var q = window.__dumbmailHubQ = window.__dumbmailHubQ || [];
@@ -1132,7 +1139,7 @@
 
   function start() {
     if (!ONLY_FORM) {
-      if (!TEST) { loadPush(); loadHub(); }
+      if (!TEST) loadPush();
       PLATFORM = platform();
       if (TEST) { test.draw(); test.check("loaded", { platform: PLATFORM, version: VERSION, auto_track: AUTO, capture_emails: CAPTURE, identified: identified(), summary: "On " + location.host + (PLATFORM !== "custom" ? " · " + PLATFORM : "") }); }
       hookPage();

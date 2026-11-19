@@ -26,7 +26,9 @@ CREATE TABLE hub_codes (
     expires_at  timestamptz NOT NULL,
     -- Set once the email is handed to the provider's queue (claimed before sending).
     sent_at     timestamptz,
-    used_at     timestamptz
+    used_at     timestamptz,
+    -- The person's hub generation when the code was issued (see hub_generations).
+    generation  bigint NOT NULL DEFAULT 0
 );
 CREATE INDEX hub_codes_email_idx ON hub_codes(account_id, email_hash, created_at DESC);
 CREATE INDEX hub_codes_account_idx ON hub_codes(account_id, created_at DESC);
@@ -47,7 +49,28 @@ CREATE TABLE hub_sessions (
     created_at   timestamptz NOT NULL DEFAULT now(),
     last_seen_at timestamptz NOT NULL DEFAULT now(),
     expires_at   timestamptz NOT NULL,
-    revoked_at   timestamptz
+    revoked_at   timestamptz,
+    -- The person's hub generation when the session started (see hub_generations).
+    generation   bigint NOT NULL DEFAULT 0
 );
 CREATE INDEX hub_sessions_profile_idx ON hub_sessions(profile_id);
 CREATE INDEX hub_sessions_expires_idx ON hub_sessions(expires_at);
+
+-- Each person's hub generation. Sessions, sign-in links and codes record it when issued and work
+-- only while it's unchanged. It goes up when the person's email changes, on "sign out everywhere"
+-- and when they're merged, so a change of address ends access for good (an address changed away
+-- and back doesn't revive an old cookie). No row means 0.
+CREATE TABLE hub_generations (
+    profile_id  uuid PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+    account_id  uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    generation  bigint NOT NULL DEFAULT 0,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Sign-in links already used (a link works once). Only a hash of the link's token is kept.
+CREATE TABLE hub_used_links (
+    token_hash  text PRIMARY KEY,
+    account_id  uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    used_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX hub_used_links_used_idx ON hub_used_links(used_at);
