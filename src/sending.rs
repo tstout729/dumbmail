@@ -347,6 +347,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         crate::features::coupons::Prepared::Hold(until) => return Ok(Outcome::Deferred(until)),
     };
     coupons.fill(&mut ctx);
+    // `{{ hub_url }}`: the customer hub; in a real email, a one-time sign-in link (see features::hub).
+    crate::features::hub::session::fill(state, spec.account, p, spec.channel, spec.is_test, &mut ctx);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
     let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
     // Review request blocks and links are made for this person (see features::reviews).

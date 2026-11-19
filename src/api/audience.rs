@@ -212,6 +212,13 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
         if used {
             return Err(taken());
         }
+        // A new address ends the person's customer hub access first (sessions, sign-in links and
+        // codes made for the old one), so a failed write only signs them out.
+        let new_email = email.clone().flatten();
+        let email_changes = email.is_some() && before.email.is_some() && before.email != new_email;
+        if email_changes {
+            crate::features::hub::end_sessions(&state.db, id).await?;
+        }
         // The identity, and the SMS consent that goes with the number, in one statement: a
         // different number (or a first one) hasn't agreed to texts, so a subscription doesn't carry
         // over to it unless this request sets the SMS consent itself.
@@ -220,9 +227,12 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
                sms_consent = CASE WHEN $7::text IS NOT NULL THEN $7
                                   WHEN $4 AND p.phone_number IS DISTINCT FROM $5 AND p.sms_consent = 'subscribed' THEN 'never_subscribed'
                                   ELSE p.sms_consent END,
-               external_id = COALESCE($6, p.external_id), updated_at = now()
+               external_id = COALESCE($6, p.external_id),
+               email_source = CASE WHEN $2 AND $3::text IS NOT NULL AND (p.email IS DISTINCT FROM $3::text OR p.email_source IS NULL) THEN '{source}' ELSE p.email_source END,
+               updated_at = now()
              FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 AND account_id = $8 FOR UPDATE) old
-             WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
+             WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent",
+            source = core::TRUSTED_EMAIL_SOURCE
         );
         let saved = sqlx::query_as::<_, IdentitySaved>(&q)
             .bind(id)
@@ -239,6 +249,15 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
                 AppError::Conflict(_) => taken(),
                 other => other,
             })?;
+        // A changed address whose source was already ours: the database cleared the source with the
+        // change (it can't tell the same source writing a new address); mark it again.
+        if let (true, Some(e)) = (email_changes, new_email.as_deref()) {
+            sqlx::query(&format!("UPDATE profiles SET email_source = '{}' WHERE id = $1 AND email = $2 AND email_source IS NULL", core::TRUSTED_EMAIL_SOURCE))
+                .bind(id)
+                .bind(e)
+                .execute(&state.db)
+                .await?;
+        }
         // The consent this write replaced, as the write itself read it.
         let consent = (saved.old_email_consent.as_str(), saved.old_sms_consent.as_str());
         crate::features::webhooks::profile_saved(&state.db, account_id, Some(&before), Some(consent), &saved.profile, core::EventSource::Api).await;
