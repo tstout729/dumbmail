@@ -152,11 +152,17 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             email_consent = COALESCE($8, CASE WHEN {changed} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END),
                             sms_consent = COALESCE($9, CASE WHEN {new_phone} AND p.sms_consent = 'subscribed' THEN 'never_subscribed' ELSE p.sms_consent END),
                             email_suppressed_reason = CASE WHEN {changed} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
+                            email_source = CASE WHEN $2::text IS NULL THEN p.email_source WHEN p.email IS DISTINCT FROM $2::text OR p.email_source IS NULL THEN '{TRUSTED_EMAIL_SOURCE}' ELSE p.email_source END,
                             updated_at = now()
                          FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
                          WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 };
+                // A new address for this person ends their customer hub access first (sessions,
+                // sign-in links and codes made for the old one), so a failed write only signs them out.
+                if !fill_only && email_changes(p, email.as_deref()) {
+                    crate::features::hub::session::end_sessions(db, p.id).await?;
+                }
                 // The consent the update replaced, read by the update itself (the row is locked):
                 // a webhook reports a transition only if this write made it.
                 sqlx::query_as::<_, WithOldConsent>(&q)
@@ -178,8 +184,8 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
             None => {
                 let q = format!(
-                    "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'never_subscribed'), COALESCE($10, 'never_subscribed'))
+                    "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_source)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'never_subscribed'), COALESCE($10, 'never_subscribed'), CASE WHEN $3::text IS NOT NULL AND $11 THEN '{TRUSTED_EMAIL_SOURCE}' END)
                      RETURNING {PROFILE_COLS}"
                 );
                 sqlx::query_as::<_, Profile>(&q)
@@ -193,6 +199,7 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&props)
                     .bind(&input.email_consent)
                     .bind(&input.sms_consent)
+                    .bind(!fill_only)
                     .fetch_one(db)
                     .await
                     .map(|profile| Upserted { profile, created: true })
@@ -200,6 +207,17 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         };
         match res {
             Ok(mut u) => {
+                // A changed address whose source was already ours: the database cleared the source
+                // with the change (it can't tell the same source writing a new address); mark it again.
+                if let (false, Some(p), Some(e)) = (fill_only, &existing, email.as_deref()) {
+                    if email_changes(p, Some(e)) {
+                        sqlx::query(&format!("UPDATE profiles SET email_source = '{TRUSTED_EMAIL_SOURCE}' WHERE id = $1 AND email = $2 AND email_source IS NULL"))
+                            .bind(p.id)
+                            .bind(e)
+                            .execute(db)
+                            .await?;
+                    }
+                }
                 if let Some(l) = &locale {
                     u.profile.locale = crate::features::translations::save_locale(db, u.profile.id, l.as_deref(), fill_only).await?;
                 }
@@ -219,6 +237,17 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         }
     }
     Err(AppError::Conflict("could not save profile, please retry".into()))
+}
+
+/// What a trusted write (the API, MCP, the dashboard, an import) records as `profiles.email_source`
+/// for the address it gives. The public fill-only path (forms, the website script) never sets it.
+/// Integrations and Shopify record their own source. The customer hub opens a person's orders only
+/// for an address with a source (see `features::hub::data::TRUSTED_EMAIL_SQL`).
+pub const TRUSTED_EMAIL_SOURCE: &str = "api";
+
+/// Whether writing `email` replaces a different address the profile already has.
+fn email_changes(p: &Profile, email: Option<&str>) -> bool {
+    matches!((p.email.as_deref(), email), (Some(old), Some(new)) if old != new)
 }
 
 /// The public fill-only path (forms, the website script) on a profile an integration wrote (it has
@@ -310,7 +339,7 @@ pub async fn fill_location_from_timezone(db: &PgPool, profile_id: Uuid, tz: &str
 
 /// Metrics only DumbMail itself records, from a real stock or price change or a confirmed request:
 /// nobody may send them, not even with an API key. Feature modules add theirs here.
-pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock", "Submitted Review", "Ready To Review"];
+pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock", "Submitted Review", "Ready To Review", "Opened Hub", "Viewed Order in Hub"];
 
 /// Metrics the server records about messages, consent and sign-ups. Flows trust them, so a browser
 /// (the public `/client/events` endpoint) may not send them. The API and MCP still may (for imports).

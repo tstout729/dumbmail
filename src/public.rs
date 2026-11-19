@@ -247,21 +247,12 @@ async fn unsubscribe_post(State(state): State<AppState>, headers: HeaderMap, Pat
         let lists = crate::preferences::lists_for(&state.db, m.account_id, m.profile_id).await.unwrap_or_default();
         return page_in(&t, &t.get("prefs.title", ""), &crate::preferences::form_html_in(&t, &name, &lists, Some(&t.get(notice, ""))), &color).into_response();
     }
-    let col = if m.channel == "sms" { "sms_consent" } else { "email_consent" };
-    let changed: Result<Option<String>, _> = sqlx::query_scalar(&format!(
-        "UPDATE profiles p SET {col} = 'unsubscribed', updated_at = now() FROM (SELECT id, {col} AS before FROM profiles WHERE id = $1 FOR UPDATE) old
-         WHERE p.id = old.id AND old.before <> 'unsubscribed' RETURNING old.before"
-    ))
-    .bind(m.profile_id)
-    .fetch_optional(&state.db)
-    .await;
-    let _ = sqlx::query("UPDATE messages SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1").bind(id).execute(&state.db).await;
-    if let Ok(Some(before)) = changed {
-        let metric = if m.channel == "sms" { "Unsubscribed from SMS" } else { "Unsubscribed" };
-        let _ = msg_event(&state, &m, metric, json!({"method": "link"}), None).await;
-        let channel = if m.channel == "sms" { "sms" } else { "email" };
-        crate::features::webhooks::consent_changed(&state.db, m.account_id, m.profile_id, channel, &before, "unsubscribed", "unsubscribe_link", Some(m.id)).await;
+    let src = crate::preferences::OptOutSource { method: "link", reason: "unsubscribe_link", message: Some((m.id, m.campaign_id, m.flow_id, m.is_test)) };
+    let channel = if m.channel == "sms" { "sms" } else { "email" };
+    if let Err(e) = crate::preferences::opt_out(&state.db, m.account_id, m.profile_id, channel, &src).await {
+        tracing::error!(message = %m.id, error = %e.public_message(), "couldn't save an unsubscribe");
     }
+    let _ = sqlx::query("UPDATE messages SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1").bind(id).execute(&state.db).await;
     let a = account_for_msg(&state, &m).await;
     let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
     let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
@@ -593,7 +584,12 @@ async fn client_forms(State(state): State<AppState>, Query(q): Query<KeyQuery>) 
                 json!({"id": f.id, "kind": f.kind, "config": c})
             })
             .collect();
-        Ok(json!({"data": data}))
+        let mut out = json!({"data": data});
+        // The customer hub's launcher, only when it's on: the snippet loads it only then.
+        if let Some(launcher) = crate::features::hub::settings::launcher(&state.db, a.id).await? {
+            out["hub"] = json!({"launcher": launcher});
+        }
+        Ok(out)
     }
     .await;
     let mut r = cors(match res {
