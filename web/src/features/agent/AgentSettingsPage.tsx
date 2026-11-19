@@ -153,7 +153,7 @@ function AgentForm({ s }: { s: AgentSettings }) {
                   <li key={u} className="flex items-start gap-3 px-3 py-2.5">
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium text-zinc-900">{p?.title || u}</div>
-                      <div className="truncate text-xs text-zinc-500">{u}</div>
+                      {p?.title ? <div className="truncate text-xs text-zinc-500">{u}</div> : null}
                       {p?.error ? <div className="mt-0.5 text-xs text-red-700">{p.error}</div> : null}
                     </div>
                     {!p ? (
