@@ -21,7 +21,7 @@ Also while an account isn't approved:
 - Flow notifications go only to the account's members; while it's blocked, to nobody.
 - An account in review because of an engagement pause: its flow email waits (up to 3 days, like any flow message) instead of being skipped by the pause; campaigns stop as the pause stops them.
 
-WhatsApp follows the standing exactly like texts: campaigns, flow steps, inbox and keyword replies, tests (which go only to a team member's verified number) and its own final claim. Its opt-out answers always go; its sign-up confirmation goes before approval only in DumbMail's own wording. The text of a WhatsApp template, filled with the message's values, is screened like any message.
+WhatsApp follows the standing exactly like texts: campaigns, flow steps, inbox and keyword replies, tests (which go only to a team member's verified number) and its own final claim. Its opt-out answers always go; its sign-up confirmation goes before approval only in DumbMail's own wording. A WhatsApp message is screened like any message: its template's header, body and footer filled with the message's values, each button's words and where it goes (a tracked button's destination, or the template's address with the message's value in it), and the values as written. A message whose template can't be read is held for a person.
 
 Push isn't held for a pending or in-review account; a blocked account sends no push. Transactional email has its own restricted mode; a store's hub sign-in codes (a person asked for one) go from pending and in-review accounts, and not from a blocked one.
 

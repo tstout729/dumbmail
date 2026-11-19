@@ -1524,3 +1524,26 @@ async fn whatsapp_template_text_is_screened() {
     assert!(sends(&m).is_empty());
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn whatsapp_buttons_and_their_urls_are_screened() {
+    let (mut h, m) = wa_screened!();
+    setup(&mut h).await;
+    set_standing(&h, "approved").await;
+    let them = daytime_number(904);
+    let p = person(&mut h, &them, None).await;
+    subscribe(&mut h, &p).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "VIP"}))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/lists/{list}/members"), Some(json!({"profile_ids": [p]}))).await;
+    let order_t = template(&h, "order_update").await;
+    // The words ask people to sign in, and the only link is the template's button (shop.test, not the account's own).
+    let content = json!({"template_id": order_t, "header": "A-1", "body": {"1": "Sam, unusual sign-in. Verify your account", "2": "A-1"}, "buttons": {"0": "A-1"}});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Track", "channel": "whatsapp", "audience": {"include": [{"type": "list", "id": list}]}, "content": content}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("can't be sent"), "{v}");
+    let domains: Value = sqlx::query_scalar("SELECT signals->'link_domains' FROM screenings WHERE kind = 'content' ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert!(domains.to_string().contains("shop.test"), "the button's address was judged: {domains}");
+    assert!(sends(&m).is_empty());
+    h.cleanup().await;
+}

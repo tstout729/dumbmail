@@ -157,9 +157,14 @@ fn variant(channel: &str, c: &Value, label: &str, language: &str) -> (Value, boo
     let mut col = Collected::default();
     let (subject, preview) = if channel == "sms" || channel == "whatsapp" {
         let body = c["body"].as_str().unwrap_or("");
-        col.text.push(body.to_string());
-        for m in BARE_URL.find_iter(body) {
-            col.links.push((String::new(), m.as_str().to_string()));
+        if channel == "whatsapp" {
+            // Its buttons come as links with their words (see `whatsapp_text`).
+            col.html(body);
+        } else {
+            col.text.push(body.to_string());
+            for m in BARE_URL.find_iter(body) {
+                col.links.push((String::new(), m.as_str().to_string()));
+            }
         }
         if let Some(m) = c["media_url"].as_str().filter(|m| !m.is_empty()) {
             col.links.push((String::new(), m.to_string()));
@@ -262,18 +267,39 @@ async fn variants(state: &AppState, account: &Account, channel: &str, content: &
     Ok(out)
 }
 
-/// A WhatsApp message's text: its template filled with the message's values (and a sample person).
-/// False when it can't be read (no template, or it can't be filled): a person checks it.
+/// A WhatsApp message's text: its template filled with the message's values (and a sample person):
+/// header, body and footer, then each button's words and where it goes (written as an `<a>`, so
+/// the link is judged with its words). False when it can't be read (no template, or it can't be
+/// filled): a person checks it.
 async fn whatsapp_text(state: &AppState, account: &Account, content: &Value) -> (String, bool) {
     use crate::features::whatsapp::{content as wa, templates};
     let Ok(c) = wa::parse(content) else { return (String::new(), false) };
     let Some(tid) = c.template_id else { return (String::new(), false) };
     let Ok(t) = templates::get(&state.db, account.id, tid).await else { return (String::new(), false) };
     let ctx = crate::render::context(account, None, None, "");
-    match wa::render(&t, &c, &ctx, None) {
+    let (mut text, readable) = match wa::render(&t, &c, &ctx, None) {
         Ok(r) => (r.text, true),
         Err(_) => (serde_json::to_string(&t).unwrap_or_default(), false),
+    };
+    for (i, b) in t.component("BUTTONS").and_then(|b| b["buttons"].as_array()).into_iter().flatten().enumerate() {
+        let words = b["text"].as_str().unwrap_or("");
+        // A tracked button goes where the account set it to; otherwise the template's address with
+        // the message's own value in it.
+        let url = t.tracked_buttons.get(i.to_string()).and_then(|u| u.as_str()).map(str::to_string).or_else(|| {
+            b["url"].as_str().map(|u| match c.buttons.get(&i.to_string()) {
+                Some(v) => u.replace("{{1}}", v),
+                None => u.to_string(),
+            })
+        });
+        match url {
+            Some(u) => text.push_str(&format!("\n<a href=\"{}\">{}</a>", u.replace('"', "%22"), words.replace('<', "&lt;"))),
+            None => text.push_str(&format!("\n{words}")),
+        }
+        if let Some(phone) = b["phone_number"].as_str() {
+            text.push_str(&format!(" {phone}"));
+        }
     }
+    (text, readable)
 }
 
 /// What a check is about.
