@@ -59,7 +59,7 @@ type Condition =
   | { type: "consent"; channel: "email" | "sms"; status: Consent }
   | { type: "can_receive"; channel: "email" | "sms"; value?: boolean } // a send would reach them now
   | { type: "coupon"; coupon_id: string; action?: "given" | "redeemed"; op?: "has" | "has_not"; within_days?: number } // see COUPONS.md
-  | { type: "suppressed"; value?: boolean } // email suppressed after a hard bounce or complaint
+  | { type: "suppressed"; value?: boolean } // email or texts suppressed (a hard bounce, complaint or manual suppression)
   | ({ type: "form"; form_id?: string; op?: "has" | "has_not" } & Window) // signed up through a form (any form without form_id)
   | { type: "engagement"; channel: "email" | "sms" | "any"; engaged?: boolean; within_days: number }
   | { type: "message"; action: "received" | "opened" | "clicked"; campaign_id?: string; flow_id?: string; // exactly one of the two

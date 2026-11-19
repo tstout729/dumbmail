@@ -370,7 +370,19 @@ async fn link_profile(db: &PgPool, account_id: Uuid, to: &Recipient) -> AppResul
         "INSERT INTO profiles AS p (id, account_id, email, first_name, last_name) VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (account_id, email) WHERE email IS NOT NULL DO NOTHING RETURNING {PROFILE_COLS}"
     );
-    let created = sqlx::query_as::<_, Profile>(&q).bind(Uuid::now_v7()).bind(account_id).bind(&to.email).bind(&to.first_name).bind(&to.last_name).fetch_optional(db).await?;
+    let mut tx = db.begin().await?;
+    let created = sqlx::query_as::<_, Profile>(&q).bind(Uuid::now_v7()).bind(account_id).bind(&to.email).bind(&to.first_name).bind(&to.last_name).fetch_optional(&mut *tx).await?;
+    // A deleted person's suppression record for this address applies before anyone can use the
+    // profile (features::people).
+    let created = match created {
+        Some(p) => {
+            crate::features::people::consent::record_written_in(&mut tx, account_id, &Default::default(), &[p.id], &crate::features::people::consent::current_source()).await?;
+            let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
+            Some(sqlx::query_as::<_, Profile>(&q).bind(p.id).fetch_one(&mut *tx).await?)
+        }
+        None => None,
+    };
+    tx.commit().await?;
     match created {
         Some(p) => Ok(p),
         // Someone else created it a moment ago.

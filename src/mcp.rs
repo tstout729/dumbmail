@@ -89,10 +89,15 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
             // refused. Tools record their own changes in the audit log where they make them.
             let res = match crate::features::team::access::authorize_tool(state, ctx, &name, &args).await {
                 Err(e) => Err(e),
-                Ok(_) => match crate::features::mcp_call(state, ctx, &name, &args).await {
-                    Some(r) => r,
-                    None => call(state, ctx, &name, args).await,
-                },
+                Ok(_) => {
+                    crate::features::people::with_source(crate::features::people::ConsentSource::mcp(ctx), async {
+                        match crate::features::mcp_call(state, ctx, &name, &args).await {
+                            Some(r) => r,
+                            None => call(state, ctx, &name, args).await,
+                        }
+                    })
+                    .await
+                }
             };
             Ok(match res {
                 Ok(v) => {
@@ -810,7 +815,14 @@ async fn delete(state: &AppState, acct: Uuid, kind: &str, id: Uuid) -> AppResult
         "template" => "templates",
         "form" => "forms",
         "image" => "images",
-        "profile" => "profiles",
+        // A profile goes through the one erasure (features::people::privacy): everything keyed by
+        // it, its reviews, its stored exports, and a one-way code of a blocked address.
+        "profile" => {
+            let gone = crate::features::people::privacy::delete_profile_fully(&state.db, acct, id).await?;
+            let Some((email, phone_number, external_id)) = gone else { return Err(AppError::not_found(kind)) };
+            crate::features::webhooks::profile_deleted(&state.db, acct, json!({"id": id, "email": email, "phone_number": phone_number, "external_id": external_id})).await;
+            return Ok(json!({"deleted": true, "type": kind, "id": id}));
+        }
         _ => return Err(AppError::bad("type must be campaign, flow, segment, list, template, form, image or profile")),
     };
     let n = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1 AND account_id = $2")).bind(id).bind(acct).execute(&state.db).await?.rows_affected();

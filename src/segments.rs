@@ -1283,13 +1283,17 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             }
             qb.push(match channel {
                 Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold)",
-                Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed')",
+                Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND p.sms_suppressed_reason IS NULL)",
                 Channel::Push => crate::features::push::send::REACHABLE_SQL,
                 Channel::Whatsapp => crate::features::whatsapp::consent::REACHABLE_SQL,
             });
         }
         Condition::Suppressed { value } => {
-            qb.push(if *value { "(p.email_suppressed_reason IS NOT NULL)" } else { "(p.email_suppressed_reason IS NULL)" });
+            qb.push(if *value {
+                "(p.email_suppressed_reason IS NOT NULL OR p.sms_suppressed_reason IS NOT NULL)"
+            } else {
+                "(p.email_suppressed_reason IS NULL AND p.sms_suppressed_reason IS NULL)"
+            });
         }
         Condition::Language { op, value, values } => {
             let tags = language_tags(value, values).unwrap_or_default();

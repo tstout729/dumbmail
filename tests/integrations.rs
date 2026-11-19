@@ -1185,9 +1185,12 @@ async fn a_new_address_on_a_matched_profile_has_not_consented() {
     h.drain().await;
     let (email, consent): (String, String) = sqlx::query_as("SELECT email, email_consent FROM profiles WHERE phone_number = '+15035550111'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((email.as_str(), consent.as_str()), ("c2@example.com", "never_subscribed"));
-    // A signed-in member's explicit edit is unchanged: it keeps the consent.
+    // A signed-in member's edit of the email address: the new address hasn't agreed either, unless
+    // the edit sets the email consent itself (features::people, PR #18).
     let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE external_id = 'X5'").fetch_one(&h.state.db).await.unwrap();
     h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"email": "a5-new@example.com"}))).await;
+    assert_eq!(row("X5").await.1, "never_subscribed");
+    h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"email": "a5-newer@example.com", "email_consent": "subscribed"}))).await;
     assert_eq!(row("X5").await.1, "subscribed");
     h.cleanup().await;
 }

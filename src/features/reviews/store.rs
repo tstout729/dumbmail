@@ -614,26 +614,25 @@ pub async fn delete_reviews(conn: &mut PgConnection, account_id: Uuid, ids: &[Uu
 /// What a deleted profile held (for the callers' webhooks and audit entries).
 pub type DeletedProfile = (Option<String>, Option<String>, Option<String>);
 
-/// Delete a person and everything they wrote here, for the privacy tools and profile deletion:
+/// Delete a person and everything they wrote here, for the privacy tools and profile deletion.
+/// It's the one erasure (`features::people::privacy::erase_in`), which calls [`erase_reviews_in`]:
 /// the profile row is locked first (which also holds back any new review or request for them),
-/// then their reviews and photos go with the product summaries corrected, then the profile, all in
-/// one transaction. None when there's no such profile in this account.
+/// then their reviews and photos go with the product summaries corrected, then the profile and
+/// everything else keyed by it, all in one transaction. None when there's no such profile here.
 pub async fn delete_person(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> AppResult<Option<DeletedProfile>> {
-    let mut tx = db.begin().await?;
-    let found: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).fetch_optional(&mut *tx).await?;
-    if found.is_none() {
-        return Ok(None);
-    }
+    crate::features::people::privacy::delete_profile_fully(db, account_id, profile_id).await
+}
+
+/// The reviews part of erasing people, in the eraser's transaction, which already holds their
+/// profile rows: their requests (the order a review being saved takes them in: profile, request),
+/// then their reviews and photos, keeping the published summaries right.
+pub async fn erase_reviews_in(conn: &mut PgConnection, account_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
     super::hooks::point("delete_person", account_id).await.map_err(AppError::Internal)?;
-    // Then the person's requests: the order a review being saved takes them in (profile, request).
-    sqlx::query("SELECT id FROM review_requests WHERE profile_id = $1 ORDER BY id FOR UPDATE").bind(profile_id).execute(&mut *tx).await?;
-    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM reviews WHERE account_id = $1 AND profile_id = $2").bind(account_id).bind(profile_id).fetch_all(&mut *tx).await?;
-    delete_reviews(&mut tx, account_id, &ids).await?;
-    sqlx::query("DELETE FROM review_photos WHERE request_id IN (SELECT id FROM review_requests WHERE profile_id = $1)").bind(profile_id).execute(&mut *tx).await?;
-    let gone: Option<DeletedProfile> =
-        sqlx::query_as("DELETE FROM profiles WHERE id = $1 AND account_id = $2 RETURNING email, phone_number, external_id").bind(profile_id).bind(account_id).fetch_optional(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(gone)
+    sqlx::query("SELECT id FROM review_requests WHERE profile_id = ANY($1) ORDER BY id FOR UPDATE").bind(profile_ids).execute(&mut *conn).await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM reviews WHERE account_id = $1 AND profile_id = ANY($2)").bind(account_id).bind(profile_ids).fetch_all(&mut *conn).await?;
+    let n = delete_reviews(conn, account_id, &ids).await?;
+    sqlx::query("DELETE FROM review_photos WHERE request_id IN (SELECT id FROM review_requests WHERE profile_id = ANY($1))").bind(profile_ids).execute(&mut *conn).await?;
+    Ok(n)
 }
 
 /// Recompute the published summaries of an account's subjects from their reviews. Each subject

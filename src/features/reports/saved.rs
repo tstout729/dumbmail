@@ -454,6 +454,8 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid, occurrence: DateT
         fail("No one gets this report: it's grouped by people's own details, and none of its recipients may see profiles.".into()).await?;
         return Ok(());
     }
+    // When its data is read: if anyone in the account is erased after this, the file isn't kept.
+    let started = Utc::now();
     let result = match custom::run(state, account_id, spec, Mode::Job).await {
         Ok(r) => r,
         // Another report is running for the account, or the server is busy: try again shortly.
@@ -476,7 +478,7 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid, occurrence: DateT
         .await?;
     let export_id = match existing {
         Some(id) => id,
-        None => super::exports::store_file(state, account_id, "report", params, &format!("{}-{today}.csv", slug.trim_matches('-')), csv.as_bytes()).await?,
+        None => super::exports::store_file(state, account_id, "report", params, &format!("{}-{today}.csv", slug.trim_matches('-')), csv.as_bytes(), started).await?,
     };
 
     let account_name: String = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;

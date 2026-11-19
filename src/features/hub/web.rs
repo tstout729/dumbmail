@@ -553,26 +553,20 @@ pub mod prefs {
 
     pub async fn subscribe_email(state: &AppState, s: &Shopper) -> AppResult<&'static str> {
         // Only the address the session proved, and only while it's still the person's and isn't
-        // suppressed.
-        let before: Option<String> = sqlx::query_scalar(
-            "UPDATE profiles p SET email_consent = 'subscribed', updated_at = now()
-             FROM (SELECT id, email_consent AS before FROM profiles WHERE id = $1 AND account_id = $2 AND email = $3 AND email_suppressed_reason IS NULL FOR UPDATE) old
-             WHERE p.id = old.id AND old.before <> 'subscribed' RETURNING old.before",
-        )
-        .bind(s.profile_id)
-        .bind(s.account.id)
-        .bind(&s.email)
-        .fetch_optional(&state.db)
-        .await?;
-        let Some(before) = before else {
-            let suppressed: bool = sqlx::query_scalar("SELECT email_suppressed_reason IS NOT NULL FROM profiles WHERE id = $1 AND account_id = $2")
-                .bind(s.profile_id)
-                .bind(s.account.id)
-                .fetch_optional(&state.db)
-                .await?
-                .unwrap_or(false);
-            return Ok(if suppressed { "suppressed" } else { "nochange" });
-        };
+        // suppressed. Proving the address by an emailed code makes this the person's own verified
+        // opt-in for it (features::people), recorded with its history in one transaction.
+        use crate::features::people::{consent, Channel, ConsentSource};
+        let mut tx = state.db.begin().await?;
+        let Some(cur) = consent::lock(&mut tx, s.account.id, s.profile_id).await? else { return Ok("nochange") };
+        if cur.email.as_deref() != Some(s.email.as_str()) {
+            return Ok("nochange");
+        }
+        if cur.email_suppressed_reason.is_some() {
+            return Ok("suppressed");
+        }
+        let src = ConsentSource::new("hub", "public").with_detail("hub_session", json!(true));
+        let Some(before) = consent::opt_in_verified_in(&mut tx, s.account.id, s.profile_id, Channel::Email, &src).await? else { return Ok("nochange") };
+        tx.commit().await?;
         audience::record_event(
             &state.db,
             NewEvent {

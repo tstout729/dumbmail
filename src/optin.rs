@@ -324,7 +324,7 @@ pub enum Confirmed {
 /// Whether confirmation `id` is still waiting, without changing anything (for the confirm page).
 pub async fn status(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
     let row: Option<(Uuid, bool, bool)> = sqlx::query_as(
-        "SELECT account_id, confirmed_at IS NOT NULL, created_at < now() - make_interval(days => $2) FROM optin_confirmations WHERE id = $1",
+        "SELECT account_id, confirmed_at IS NOT NULL, voided_at IS NOT NULL OR created_at < now() - make_interval(days => $2) FROM optin_confirmations WHERE id = $1",
     )
     .bind(id)
     .bind(LINK_DAYS)
@@ -338,34 +338,73 @@ pub async fn status(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
     })
 }
 
-/// The person confirmed: subscribe them to email, record the sign-up and add them to the list.
+/// The person confirmed: subscribe them to email, record the sign-up and add them to the list. The
+/// link is used up in the same transaction that subscribes them, so a failure leaves it usable.
 pub async fn confirm(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
-    let row: Option<(Uuid, Uuid, Uuid, Value)> = sqlx::query_as(
+    let mut tx = state.db.begin().await?;
+    // The one lock order (features::people): the profile first, then its confirmation.
+    let owner: Option<(Uuid, Uuid)> = sqlx::query_as("SELECT account_id, profile_id FROM optin_confirmations WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?;
+    if let Some((account_id, profile_id)) = owner {
+        sqlx::query("SELECT id FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).execute(&mut *tx).await?;
+    }
+    let row: Option<(Uuid, Uuid, Uuid, Value, String)> = sqlx::query_as(
         "UPDATE optin_confirmations SET confirmed_at = now()
-         WHERE id = $1 AND confirmed_at IS NULL AND created_at >= now() - make_interval(days => $2)
-         RETURNING account_id, profile_id, list_id, properties",
+         WHERE id = $1 AND confirmed_at IS NULL AND voided_at IS NULL AND created_at >= now() - make_interval(days => $2)
+         RETURNING account_id, profile_id, list_id, properties, email_key",
     )
     .bind(id)
     .bind(LINK_DAYS)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((account_id, profile_id, list_id, mut props)) = row else { return status(state, id).await };
-    let before: Option<String> = sqlx::query_scalar(
-        "UPDATE profiles p SET email_consent = 'subscribed', updated_at = now() FROM (SELECT id, email_consent FROM profiles WHERE id = $1 FOR UPDATE) old
-         WHERE p.id = old.id RETURNING old.email_consent",
-    )
-    .bind(profile_id)
-    .fetch_optional(&state.db)
-    .await?;
-    if let Some(before) = before {
-        crate::features::webhooks::consent_changed(&state.db, account_id, profile_id, "email", &before, "subscribed", "double_opt_in", None).await;
+    let Some((account_id, profile_id, list_id, props, key)) = row else {
+        drop(tx);
+        // Confirmed before: finish anything a failure after that left undone (both steps are idempotent).
+        let done: Option<(Uuid, Uuid, Uuid, Value)> =
+            sqlx::query_as("SELECT account_id, profile_id, list_id, properties FROM optin_confirmations WHERE id = $1 AND confirmed_at IS NOT NULL AND voided_at IS NULL")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await?;
+        if let Some((account_id, profile_id, list_id, props)) = done {
+            if profile_belongs(state, account_id, profile_id).await? {
+                record_joined(state, id, account_id, profile_id, list_id, props).await?;
+            }
+        }
+        return status(state, id).await;
+    };
+    // The confirmation is for the address it was sent to. If that address has left the profile (an
+    // edit or a merge), it can't subscribe whatever address the profile has now.
+    let current: Option<Option<String>> = sqlx::query_scalar("SELECT email FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).fetch_optional(&mut *tx).await?;
+    if current.flatten().map(|e| email_key(&e)).as_deref() != Some(key.as_str()) {
+        sqlx::query("UPDATE optin_confirmations SET confirmed_at = NULL, voided_at = now() WHERE id = $1").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(Confirmed::Expired(account_id));
+    }
+    let src = crate::features::people::ConsentSource::new("double_opt_in", "public").with_detail("list_id", json!(list_id)).with_detail("confirmation_id", json!(id));
+    let src = match props.get("form_id").and_then(|f| f.as_str()).and_then(|f| f.parse().ok()) {
+        Some(form) => src.with_form(form),
+        None => src,
+    };
+    if let Some(before) = crate::features::people::consent::opt_in_verified_in(&mut tx, account_id, profile_id, crate::features::people::Channel::Email, &src).await? {
+        crate::features::webhooks::consent_changed_in(&mut tx, &state.db, account_id, &[(profile_id, before)], "email", "subscribed", "double_opt_in").await;
     }
     // Waiting confirmations for the same address are done too.
-    sqlx::query("UPDATE optin_confirmations SET confirmed_at = now() WHERE profile_id = $1 AND list_id = $2 AND confirmed_at IS NULL")
+    sqlx::query("UPDATE optin_confirmations SET confirmed_at = now() WHERE profile_id = $1 AND list_id = $2 AND confirmed_at IS NULL AND voided_at IS NULL AND email_key = $3")
         .bind(profile_id)
         .bind(list_id)
-        .execute(&state.db)
+        .bind(&key)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
+    record_joined(state, id, account_id, profile_id, list_id, props).await?;
+    Ok(Confirmed::Joined(account_id))
+}
+
+async fn profile_belongs(state: &AppState, account_id: Uuid, profile_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE id = $1 AND account_id = $2)").bind(profile_id).bind(account_id).fetch_one(&state.db).await?)
+}
+
+/// The sign-up event and the list join for a confirmation (each happens once however often it runs).
+async fn record_joined(state: &AppState, id: Uuid, account_id: Uuid, profile_id: Uuid, list_id: Uuid, mut props: Value) -> AppResult<()> {
     if let Some(o) = props.as_object_mut() {
         o.insert("double_opt_in".into(), json!(true));
     }
@@ -375,7 +414,7 @@ pub async fn confirm(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
     )
     .await?;
     audience::add_to_list(&state.db, account_id, list_id, &[profile_id]).await?;
-    Ok(Confirmed::Joined(account_id))
+    Ok(())
 }
 
 #[cfg(test)]

@@ -344,11 +344,22 @@ async fn resolve_in(conn: &mut PgConnection, w: &Writer, who: &LinkWho) -> AppRe
                 }
                 let created: Option<Profile> = match &w.creator {
                     Creator::Plain => {
+                        // Never subscribed to anything (the column defaults).
                         let q = format!(
-                            "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, email_consent, sms_consent)
-                             VALUES ($1, $2, $3, $4, $5, 'never_subscribed', 'never_subscribed') ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
+                            "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id)
+                             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
                         );
-                        sqlx::query_as(&q).bind(Uuid::now_v7()).bind(account_id).bind(email).bind(phone_number).bind(external_id).fetch_optional(&mut *conn).await?
+                        let made: Option<Profile> = sqlx::query_as(&q).bind(Uuid::now_v7()).bind(account_id).bind(email).bind(phone_number).bind(external_id).fetch_optional(&mut *conn).await?;
+                        match made {
+                            // A deleted person's suppression record for these addresses applies, in this transaction (features::people).
+                            Some(p) => {
+                                let src = crate::features::people::consent::current_source();
+                                crate::features::people::consent::record_written_in(&mut *conn, account_id, &Default::default(), &[p.id], &src).await?;
+                                let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
+                                Some(sqlx::query_as(&q).bind(p.id).fetch_one(&mut *conn).await?)
+                            }
+                            None => None,
+                        }
                     }
                     Creator::Integration { tag, opted_in } => {
                         let input = ProfileInput { email: email.clone(), phone_number: phone_number.clone(), external_id: external_id.clone(), ..Default::default() };

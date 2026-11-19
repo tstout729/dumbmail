@@ -6,7 +6,9 @@ import { useDeleteProfile, useProfile, useSession, useUpdateProfile } from "../.
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Notice, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
 import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { ConsentTimeline, ProfileSidePanels } from "../../features/people/ProfilePanels";
 import { ProfileObjects } from "../../features/objects/ProfileObjects";
+import { useCan } from "../../features/team/api";
 
 export function ProfileDetailPage() {
   const { id = "" } = useParams();
@@ -47,6 +49,8 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const remove = useDeleteProfile();
+  // Deleting a profile erases it fully (and the account's stored exports): admins and the owner.
+  const canDelete = useCan("privacy.manage");
   const navigate = useNavigate();
   const tz = account.timezone;
   const title = fullName(profile) || profile.email || profile.phone_number || "Anonymous profile";
@@ -77,9 +81,11 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
         }
         actions={
           <>
-            <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
-              Delete
-            </Button>
+            {canDelete ? (
+              <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
+                Delete
+              </Button>
+            ) : null}
             {!editing ? (
               <Button icon={<Pencil className="size-3.5" />} onClick={() => setEditing(true)}>
                 Edit
@@ -143,9 +149,11 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
               </ul>
             )}
           </Card>
+          <ProfileSidePanels profileId={profile.id} email={profile.email} phone={profile.phone_number} tz={tz} />
           <ProfileObjects profileId={profile.id} />
         </div>
         <div className="space-y-4">
+          <ConsentTimeline profileId={profile.id} tz={tz} />
           <Card title="Activity" padded={false}>
             {events.length === 0 ? (
               <EmptyState icon={<Activity className="size-5" />} title="No activity yet" description="Events like Viewed Product and Placed Order appear here." />
@@ -219,7 +227,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
       {confirmDelete ? (
         <ConfirmDialog
           title="Delete this profile?"
-          body="Their events and message history are deleted too. This can't be undone."
+          body="Their events, messages, reviews and consent history are deleted too, and your stored export files (they may include this person). This can't be undone. If they had unsubscribed or were suppressed, they stay that way if they're imported again."
           confirmLabel="Delete profile"
           danger
           loading={remove.isPending}

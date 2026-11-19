@@ -53,13 +53,19 @@ pub struct Upserted {
 }
 
 pub async fn find_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Option<Profile>> {
+    find_profile_in(&mut *db.acquire().await?, account_id, input, false).await
+}
+
+/// [`find_profile`] on a connection; with `lock`, the row found is locked for update.
+async fn find_profile_in(conn: &mut sqlx::PgConnection, account_id: Uuid, input: &ProfileInput, lock: bool) -> AppResult<Option<Profile>> {
     let email = input.email.as_deref().and_then(normalize_email);
     let phone = input.phone_number.as_deref().and_then(normalize_phone);
     let q = format!(
         "SELECT {PROFILE_COLS} FROM profiles p WHERE p.account_id = $1 AND (
             p.id = $2 OR p.external_id = $3 OR p.email = $4 OR p.phone_number = $5)
          ORDER BY (p.id = $2) DESC NULLS LAST, (p.external_id = $3) DESC NULLS LAST, (p.email = $4) DESC NULLS LAST
-         LIMIT 1"
+         LIMIT 1{}",
+        if lock { " FOR UPDATE" } else { "" }
     );
     Ok(sqlx::query_as::<_, Profile>(&q)
         .bind(account_id)
@@ -67,29 +73,35 @@ pub async fn find_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -
         .bind(&input.external_id)
         .bind(&email)
         .bind(&phone)
-        .fetch_optional(db)
+        .fetch_optional(conn)
         .await?)
 }
 
 /// Create or update a profile, merging properties. Identity priority: id, external_id, email, phone.
 pub async fn upsert_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
-    upsert_inner(db, account_id, input, false, true).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
+    upsert_inner(db, account_id, input, false, true, None).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
 }
 
 /// [`upsert_profile`] that only updates the profile these identifiers match, and returns None when
 /// nobody matches (it never creates one). For callers that create profiles through their own single
 /// insert (an integration's, which also holds them from marketing).
 pub async fn update_matching_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Option<Upserted>> {
-    upsert_inner(db, account_id, input, false, false).await
+    upsert_inner(db, account_id, input, false, false, None).await
 }
 
 /// For unauthenticated callers (browser snippet, forms): an existing profile's identity and
 /// names are only filled in where blank, never overwritten, so nobody can take over a profile.
 pub async fn upsert_profile_public(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
-    upsert_inner(db, account_id, input, true, true).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
+    upsert_inner(db, account_id, input, true, true, None).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
 }
 
-async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool, may_create: bool) -> AppResult<Option<Upserted>> {
+/// [`upsert_profile_public`] for a double opt-in sign-up: a profile it creates starts out waiting to
+/// confirm (`pending`), in the statement that creates it, so it's never emailable before confirming.
+pub async fn upsert_profile_public_double_opt_in(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
+    upsert_inner(db, account_id, input, true, true, Some("pending")).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
+}
+
+async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool, may_create: bool, new_email_consent: Option<&str>) -> AppResult<Option<Upserted>> {
     let email = match input.email.as_deref().filter(|e| !e.trim().is_empty()) {
         Some(e) => Some(normalize_email(e).ok_or_else(|| AppError::bad(format!("{e:?} is not a valid email")))?),
         None => None,
@@ -106,15 +118,26 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
     if input.id.is_none() && email.is_none() && phone.is_none() && input.external_id.is_none() {
         return Err(AppError::bad("a profile needs an email, phone_number or external_id"));
     }
-    let props = Value::Object(input.merged_properties());
+    let props = input.merged_properties();
+    crate::features::people::consent::check_property_keys(props.keys())?;
+    let props = Value::Object(props);
     let locale = crate::features::translations::input_locale(&input.extra, fill_only)?;
 
     for attempt in 0..2 {
-        let existing = find_profile(db, account_id, input).await?;
+        // One transaction with the row locked: the consent history sees the exact before and after,
+        // and a deleted person's retained suppression applies before anything else can read the row.
+        let mut tx = db.begin().await?;
+        let existing = find_profile_in(&mut tx, account_id, input, true).await?;
+        let consent_before = match &existing {
+            Some(p) => crate::features::people::consent::lock(&mut tx, account_id, p.id).await?,
+            None => None,
+        };
         if fill_only {
             if let Some(p) = &existing {
                 if let Some(narrowed) = protect_from_public(db, p, input, email.as_deref(), phone.as_deref()).await? {
-                    return Box::pin(upsert_inner(db, account_id, &narrowed, true, may_create)).await;
+                    // Let go of the row first: the narrowed save may lock it again.
+                    drop(tx);
+                    return Box::pin(upsert_inner(db, account_id, &narrowed, true, may_create, new_email_consent)).await;
                 }
             }
         }
@@ -158,10 +181,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                          WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 };
-                // A new address for this person ends their customer hub access first (sessions,
-                // sign-in links and codes made for the old one), so a failed write only signs them out.
+                // A new address for this person ends their customer hub access (sessions, sign-in
+                // links and codes made for the old one), in the transaction that holds their row.
                 if !fill_only && email_changes(p, email.as_deref()) {
-                    crate::features::hub::session::end_sessions(db, p.id).await?;
+                    crate::features::hub::session::end_sessions(&mut *tx, p.id).await?;
                 }
                 // The consent the update replaced, read by the update itself (the row is locked):
                 // a webhook reports a transition only if this write made it.
@@ -175,7 +198,7 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&props)
                     .bind(&input.email_consent)
                     .bind(&input.sms_consent)
-                    .fetch_one(db)
+                    .fetch_one(&mut *tx)
                     .await
                     .map(|r| {
                         old_consent = Some((r.old_email_consent, r.old_sms_consent));
@@ -185,7 +208,7 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             None => {
                 let q = format!(
                     "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_source)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'never_subscribed'), COALESCE($10, 'never_subscribed'), CASE WHEN $3::text IS NOT NULL AND $11 THEN '{TRUSTED_EMAIL_SOURCE}' END)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, $11, 'never_subscribed'), COALESCE($10, 'never_subscribed'), CASE WHEN $3::text IS NOT NULL AND $12 THEN '{TRUSTED_EMAIL_SOURCE}' END)
                      RETURNING {PROFILE_COLS}"
                 );
                 sqlx::query_as::<_, Profile>(&q)
@@ -199,14 +222,21 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&props)
                     .bind(&input.email_consent)
                     .bind(&input.sms_consent)
+                    .bind(new_email_consent)
                     .bind(!fill_only)
-                    .fetch_one(db)
+                    .fetch_one(&mut *tx)
                     .await
                     .map(|profile| Upserted { profile, created: true })
             }
         };
         match res {
-            Ok(mut u) => {
+            // Consent history and a deleted person's suppression record, in this transaction; then
+            // the language, the webhook and linked-identifier conflicts once it's committed.
+            Ok(u) => {
+                // An ad opt-out a property said is only lifted by someone allowed to (features::people).
+                if let Some(e) = &existing {
+                    crate::features::people::consent::check_ad_properties(&e.properties, &u.profile.properties)?;
+                }
                 // A changed address whose source was already ours: the database cleared the source
                 // with the change (it can't tell the same source writing a new address); mark it again.
                 if let (false, Some(p), Some(e)) = (fill_only, &existing, email.as_deref()) {
@@ -214,16 +244,19 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                         sqlx::query(&format!("UPDATE profiles SET email_source = '{TRUSTED_EMAIL_SOURCE}' WHERE id = $1 AND email = $2 AND email_source IS NULL"))
                             .bind(p.id)
                             .bind(e)
-                            .execute(db)
+                            .execute(&mut *tx)
                             .await?;
                     }
                 }
+                let mut u = crate::features::people::consent::after_upsert(&mut tx, account_id, consent_before.as_ref(), u).await?;
+                tx.commit().await?;
                 if let Some(l) = &locale {
                     u.profile.locale = crate::features::translations::save_locale(db, u.profile.id, l.as_deref(), fill_only).await?;
                 }
                 let source = if fill_only { EventSource::Browser } else { EventSource::Api };
                 let consent_before = old_consent.as_ref().map(|(e, s)| (e.as_str(), s.as_str()));
                 crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), consent_before, &u.profile, source).await;
+                crate::features::people::consent::note_identity_conflict(db, account_id, input).await;
                 return Ok(Some(u));
             }
             // The matched profile was deleted before the update: an update-only caller creates nothing.
@@ -231,6 +264,7 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                crate::features::people::consent::note_identity_conflict(db, account_id, input).await;
                 return Err(AppError::Conflict("another profile already uses that email, phone number or external id".into()))
             }
             Err(e) => return Err(e.into()),
@@ -673,6 +707,9 @@ pub async fn import_csv(
     };
     let roles: Vec<Option<&str>> = headers.iter().map(|h| role(h)).collect();
     let mut out = ImportResult { created: 0, updated: 0, skipped: 0, errors: Vec::new() };
+    for (h, _) in headers.iter().zip(&roles).filter(|(h, r)| r.is_none() && crate::features::people::consent::is_reserved_profile_property(h)) {
+        out.errors.push(format!("column {h:?} was left out: consent, suppression and identity fields can't be set as custom properties"));
+    }
     let mut ids = Vec::new();
     let (mut roles_skipped, mut disposable_skipped) = (0u64, 0u64);
     for (i, rec) in rdr.records().enumerate() {
@@ -705,7 +742,7 @@ pub async fn import_csv(
                     input.extra.insert(k.to_string(), json!(val));
                 }
                 _ => {
-                    if let Some(h) = headers.get(j) {
+                    if let Some(h) = headers.get(j).filter(|h| !crate::features::people::consent::is_reserved_profile_property(h)) {
                         let v = match val {
                             "true" | "TRUE" => json!(true),
                             "false" | "FALSE" => json!(false),

@@ -2,12 +2,13 @@ import { useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Search, Upload, UserPlus } from "lucide-react";
 import type { Consent } from "../../api";
-import { useLists, useProfiles, useUpsertProfile } from "../../api";
+import { useLists, useProfiles, useSegments, useUpsertProfile } from "../../api";
 import { ImportDialog } from "../../components/audience/ImportDialog";
 import { ProfilesTable } from "../../components/audience/ProfilesTable";
 import { Button, Field, Input, Modal, Page, PageHeader, Select } from "../../components/ui";
 import { formatNumber } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
+import { BulkActionsBar } from "../../features/people/BulkActions";
 
 const limit = 50;
 
@@ -16,9 +17,24 @@ export function ProfilesPage() {
   const [search, setSearch] = useState("");
   const q = useDebouncedValue(search.trim(), 250);
   // Paging belongs to one query; a new search starts at the first page.
+  const listId = params.get("list_id") || undefined;
+  const segmentId = params.get("segment_id") || undefined;
+  const lists = useLists();
+  const segments = useSegments();
+  const filterKey = `${q}|${listId ?? ""}|${segmentId ?? ""}`;
   const [paging, setPaging] = useState({ q: "", offset: 0 });
-  const offset = paging.q === q ? paging.offset : 0;
-  const profiles = useProfiles({ q: q || undefined, limit, offset });
+  const offset = paging.q === filterKey ? paging.offset : 0;
+  const profiles = useProfiles({ q: q || undefined, list_id: listId, segment_id: segmentId, limit, offset });
+  // Picked rows belong to one search and filter; changing them starts a new selection.
+  const [selection, setSelection] = useState<{ key: string; ids: Set<string> }>({ key: "", ids: new Set() });
+  const selected = selection.key === filterKey ? selection.ids : new Set<string>();
+  const toggle = (id: string) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelection({ key: filterKey, ids: next });
+  };
+  const pageIds = (profiles.data?.data ?? []).map((p) => p.id);
   const dialog = params.get("import") === "1" ? "import" : params.get("add") === "1" ? "add" : null;
 
   const setParam = (updates: Record<string, string | null>) => {
@@ -46,8 +62,8 @@ export function ProfilesPage() {
           </>
         }
       />
-      <div className="mb-3">
-        <div className="relative max-w-sm">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="relative w-full max-w-sm">
           <Search className="pointer-events-none absolute left-2.5 top-2.5 size-3.5 text-zinc-400" />
           <Input
             value={search}
@@ -57,17 +73,43 @@ export function ProfilesPage() {
             autoFocus
           />
         </div>
+        <Select value={listId ?? ""} onChange={(e) => setParam({ list_id: e.target.value, segment_id: null })} className="w-full sm:w-44" aria-label="List">
+          <option value="">Any list</option>
+          {(lists.data ?? []).map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.name}
+            </option>
+          ))}
+        </Select>
+        <Select value={segmentId ?? ""} onChange={(e) => setParam({ segment_id: e.target.value, list_id: null })} className="w-full sm:w-44" aria-label="Segment">
+          <option value="">Any segment</option>
+          {(segments.data ?? []).map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </Select>
       </div>
+      <BulkActionsBar
+        selected={selected}
+        onClearSelection={() => setSelection({ key: filterKey, ids: new Set() })}
+        filters={{ q: q || undefined, list_id: listId, segment_id: segmentId }}
+        total={profiles.data?.total ?? 0}
+        pageIds={pageIds}
+        onSelectPage={() => setSelection({ key: filterKey, ids: new Set([...selected, ...pageIds]) })}
+      />
       <ProfilesTable
         profiles={profiles.data?.data}
         total={profiles.data?.total ?? 0}
         loading={profiles.isPending}
         offset={offset}
         limit={limit}
-        onPage={(o) => setPaging({ q, offset: o })}
+        onPage={(o) => setPaging({ q: filterKey, offset: o })}
+        selected={selected}
+        onToggle={toggle}
         empty={
-          q
-            ? { title: "No matches", description: `Nobody matches “${q}”.` }
+          q || listId || segmentId
+            ? { title: "No matches", description: q ? `Nobody matches “${q}”.` : "Nobody in this list or segment yet." }
             : {
                 title: "No profiles yet",
                 description: "Import a CSV, add a sign-up form, or send events from your site.",

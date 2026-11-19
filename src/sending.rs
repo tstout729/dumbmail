@@ -287,6 +287,15 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         _ => return Err(AppError::bad("channel must be email, sms, push or whatsapp")),
     };
     let Some(to) = to else { return Ok(Outcome::Skipped("no address")) };
+    // A test goes nowhere an address or number is blocked: suppressed or unsubscribed on any profile
+    // here, or retained for an erased person or an address that left a profile (features::people),
+    // whether or not a profile has it now. Checked before anything is rendered or sent.
+    if spec.is_test && conversational.is_none() {
+        let ch = if spec.channel == "sms" { crate::features::people::Channel::Sms } else { crate::features::people::Channel::Email };
+        if let Some(why) = crate::features::people::privacy::test_blocked(&state.db, spec.account.id, ch, &to).await? {
+            return Ok(Outcome::Skipped(why));
+        }
+    }
 
     // A paused account sends no email (see `deliverability`). Tests say why; real sends keep a
     // skipped message row with the reason instead of disappearing.
@@ -444,13 +453,17 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // (features::short_links); the text is written with the one it got. Another text taking the same
     // one at the same moment makes the write fail on the unique index: the next try takes the next.
     let mut clashes = 0;
-    // None: a campaign message's row is gone (its person was deleted while the batch ran).
-    let written_row: Option<Option<String>> = loop {
-        let written: sqlx::Result<Option<Option<String>>> = if spec.message_id.is_none() {
+    // None: a campaign message's row is gone (its person was deleted while the batch ran). The flag:
+    // a queued message named another address than the profile has now (an edit or a merge moved it).
+    // Its row keeps the address it was meant for, and the last check skips it.
+    let written_row: Option<(Option<String>, bool)> = loop {
+        let written: sqlx::Result<Option<(Option<String>, bool)>> = if spec.message_id.is_none() {
             sqlx::query_scalar(
-                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language, short_ref)
+                // Written as claimed ('sending'): it's being sent right now, by this call (a merge
+                // waits for it; see features::people::merge).
+                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language, short_ref, status, claimed_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (SELECT c.r FROM unnest($13::text[]) WITH ORDINALITY AS c(r, i)
-                     WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1))
+                     WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1), 'sending', now())
                  RETURNING short_ref",
             )
             .bind(message_id)
@@ -468,13 +481,14 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(short_links.as_ref().map(|s| s.ref_candidates()))
             .fetch_one(&state.db)
             .await
-            .map(Some)
+            .map(|r: Option<String>| Some((r, false)))
         } else {
-            sqlx::query_scalar(
-                "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language),
+            sqlx::query_as(
+                "UPDATE messages u SET subject = $2, to_address = CASE WHEN u.to_address IS NULL OR $7 THEN $3 ELSE u.to_address END,
+                    send_note = COALESCE($4, send_note), language = COALESCE($5, language),
                     short_ref = (SELECT c.r FROM unnest($6::text[]) WITH ORDINALITY AS c(r, i)
                         WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = u.account_id AND m.short_ref = c.r AND m.id <> u.id) ORDER BY c.i LIMIT 1)
-                 WHERE u.id = $1 RETURNING u.short_ref",
+                 WHERE u.id = $1 RETURNING u.short_ref, u.to_address IS DISTINCT FROM $3",
             )
             .bind(message_id)
             .bind(&subject)
@@ -482,6 +496,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(&send_note)
             .bind(&language)
             .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+            .bind(spec.is_test)
             .fetch_optional(&state.db)
             .await
         };
@@ -490,7 +505,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             written => break written?,
         }
     };
-    let Some(short_ref) = written_row else {
+    let Some((short_ref, moved)) = written_row else {
         if limited {
             crate::deliverability::return_daily_slot(state, spec.account.id);
         }
@@ -514,8 +529,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // that opted out), so an opt-out that committed first always wins and nothing can mark it
     // skipped after it's handed over.
     let stop = match &rendered {
-        Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational, strict).await?,
-        Rendered::Email(_) if !spec.is_test => last_check(state, &spec, p.id, message_id, &to, strict).await?,
+        Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational, strict, moved).await?,
+        Rendered::Email(_) if !spec.is_test => last_check(state, &spec, p.id, message_id, &to, strict, moved).await?,
         Rendered::Email(_) => None,
     };
     if let Some(stop) = stop {
@@ -645,7 +660,8 @@ enum Stop {
 /// The last check before the provider call, in one query against the current state: the person's
 /// consent and suppression for the channel, the account's email pause, the campaign's status, and for
 /// texts the whole quiet-hours decision. None: send it.
-async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, message_id: Uuid, to: &str, strict: bool) -> AppResult<Option<Stop>> {
+#[allow(clippy::too_many_arguments)]
+async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, message_id: Uuid, to: &str, strict: bool, moved: bool) -> AppResult<Option<Stop>> {
     type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, bool, Option<String>, bool);
     let (account, channel, campaign_id) = (spec.account, spec.channel, spec.campaign_id);
     let row: Option<Row> = sqlx::query_as(&format!(
@@ -699,6 +715,11 @@ async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, mes
         if let Some(why) = crate::features::campaigns_plus::resend::handoff_stop(resend, &email_consent, email.as_deref(), original_to.as_deref(), to) {
             return Ok(Some(Stop::Skip(why, None)));
         }
+        // Last, after every other reason: the address it's going to must still be the profile's, and
+        // a queued message the one it was meant for (an edit or a merge may have moved it).
+        if moved || (spec.to_override.is_none() && email.as_deref() != Some(to)) {
+            return Ok(Some(Stop::Skip("address changed", None)));
+        }
         return Ok(None);
     }
     Ok(marketing_text_stop(account, &sms_consent, phone.as_deref(), props.as_ref(), start, end, conflict.as_deref()))
@@ -724,22 +745,23 @@ fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>
 /// hours; not for tests) or the inbox's reply rules. If it may go, the message is claimed
 /// (`queued`/`sending` → `sending`); if not, it's marked skipped unless something else already
 /// settled it. None: claimed, send it.
-async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>, strict: bool) -> AppResult<Option<Stop>> {
-    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool, bool, bool);
+#[allow(clippy::too_many_arguments)]
+async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>, strict: bool, moved: bool) -> AppResult<Option<Stop>> {
+    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool, bool, bool, bool);
     let account = spec.account;
     let mut tx = state.db.begin().await?;
     crate::features::inbox::store::lock_number(&mut tx, account.id, to).await?;
     let ours = conversational.map(|_| from);
     // The account row is held (shared) until the claim commits, so an account closing right now
     // either finishes first (and this sees it) or waits for this claim.
-    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed, held, answered): Row = sqlx::query_as(&format!(
+    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed, held, answered, suppressed): Row = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = a.id AND o.phone_number = $3),
                 p.sms_consent, p.phone_number, p.properties, (SELECT c.status FROM campaigns c WHERE c.id = $4),
                 ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict,
                 $5::text IS NOT NULL AND (a.sms_from = $5 OR EXISTS (SELECT 1 FROM phone_numbers n WHERE n.account_id = a.id AND n.phone_number = $5 AND n.status IN ('verified', 'active'))),
                 (SELECT max(i.provider_received_at) FROM sms_inbound i
                   WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {}),
-                a.closed_at IS NOT NULL, $6 AND COALESCE(p.marketing_hold, false), {}
+                a.closed_at IS NOT NULL, $6 AND COALESCE(p.marketing_hold, false), {}, p.sms_suppressed_reason IS NOT NULL
          FROM accounts a LEFT JOIN profiles p ON p.id = $2 AND p.account_id = a.id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE a.id = $1 FOR SHARE OF a",
         crate::features::inbox::store::NO_WINDOW_KINDS,
@@ -773,6 +795,16 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
         None
     } else {
         marketing_text_stop(account, consent.as_deref().unwrap_or_default(), phone.as_deref(), props.as_ref(), start, end, conflict.as_deref())
+    };
+    // After every other reason (so none of them changes), for a text that would go or wait: a number
+    // on the suppression list (features::people) gets no texts, tests included; a HELP reply still
+    // goes (the fixed compliance answer, as for a number that texted STOP). And the number must
+    // still be the profile's, and a queued text's the one it was meant for.
+    let stop = match stop {
+        Some(Stop::Skip(..)) => stop,
+        _ if suppressed && !help => Some(Stop::Skip("suppressed", None)),
+        _ if moved || (conversational.is_none() && spec.to_override.is_none() && phone.as_deref().and_then(normalize_phone).as_deref() != Some(to)) => Some(Stop::Skip("address changed", None)),
+        other => other,
     };
     match &stop {
         Some(Stop::Skip(why, note)) => {

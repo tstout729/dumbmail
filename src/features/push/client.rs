@@ -203,6 +203,8 @@ async fn grant_profile(tx: &mut sqlx::PgConnection, account_id: Uuid, g: &Grant)
             .fetch_optional(&mut *tx)
             .await?;
         if let Some(id) = made {
+            // A deleted person's suppression record for this email applies (features::people).
+            crate::features::people::consent::record_written_in(&mut *tx, account_id, &Default::default(), &[id], &crate::features::people::consent::current_source()).await?;
             return Ok((id, true));
         }
     }

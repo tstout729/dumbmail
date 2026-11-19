@@ -107,6 +107,11 @@ function SegmentEditor({ segment }: { segment: Segment | null }) {
                 Delete
               </Button>
             ) : null}
+            {segment && !dirty ? (
+              <ButtonLink to={`/audience/profiles?segment_id=${segment.id}`} variant="secondary">
+                Bulk actions
+              </ButtonLink>
+            ) : null}
             {segment && canSyncAds ? (
               <ButtonLink to={`/settings/ad-audiences?new=segment:${segment.id}`} icon={<Megaphone className="size-3.5" />}>
                 Sync to ads

@@ -252,7 +252,7 @@ async fn mark(conn: &mut sqlx::PgConnection, account_id: Uuid, shop: &str, kind:
 /// nothing else on them: no events left, no list membership, no other store's link, and no link to
 /// another customer of this store (other than `except`, the one being erased) still kept. Links of
 /// installs up to `upto` (a shop redaction for old installs) don't count as kept.
-async fn clean_profiles(db: &PgPool, account_id: Uuid, shop: &str, ids: &[Uuid], except: Option<i64>, upto: Option<i32>) -> sqlx::Result<()> {
+async fn clean_profiles(db: &PgPool, account_id: Uuid, shop: &str, ids: &[Uuid], except: Option<i64>, upto: Option<i32>) -> anyhow::Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -263,22 +263,33 @@ async fn clean_profiles(db: &PgPool, account_id: Uuid, shop: &str, ids: &[Uuid],
         .bind(&keys)
         .execute(db)
         .await?;
-    sqlx::query(
-        "DELETE FROM profiles p WHERE p.account_id = $1 AND p.id = ANY($2)
+    // Deleted through the one erasure (features::people::privacy), so reviews, push devices, object
+    // links and stored exports go with them and an unsubscribe is kept as a one-way code.
+    let mut tx = db.begin().await?;
+    // The one lock order: the erasure marker before any profile.
+    crate::features::people::privacy::begin_erasure_in(&mut tx, account_id).await?;
+    let doomed: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT p.id FROM profiles p WHERE p.account_id = $1 AND p.id = ANY($2)
            AND EXISTS (SELECT 1 FROM shopify_created_profiles c WHERE c.account_id = $1 AND c.profile_id = p.id AND c.shop_domain = $3)
            AND NOT EXISTS (SELECT 1 FROM events e WHERE e.account_id = $1 AND e.profile_id = p.id)
            AND NOT EXISTS (SELECT 1 FROM list_members l WHERE l.profile_id = p.id)
            AND NOT EXISTS (SELECT 1 FROM shopify_customer_profiles o WHERE o.account_id = $1 AND o.profile_id = p.id AND o.shop_domain <> $3)
            AND NOT EXISTS (SELECT 1 FROM shopify_customer_profiles o WHERE o.account_id = $1 AND o.profile_id = p.id AND o.shop_domain = $3
-                             AND o.customer_id <> 0 AND o.customer_id IS DISTINCT FROM $4 AND COALESCE(o.generation, 0) > COALESCE($5, -1))",
+                             AND o.customer_id <> 0 AND o.customer_id IS DISTINCT FROM $4 AND COALESCE(o.generation, 0) > COALESCE($5, -1))
+         ORDER BY p.id FOR UPDATE",
     )
     .bind(account_id)
     .bind(ids)
     .bind(shop)
     .bind(except)
     .bind(upto)
-    .execute(db)
+    .fetch_all(&mut *tx)
     .await?;
+    // A test can hold the erasure here, with the profiles locked (see tests/people.rs).
+    crate::features::reviews::hooks::point("shopify_erase", account_id).await?;
+    let (_, people) = crate::features::people::privacy::erase_people_in(&mut tx, account_id, &doomed).await?;
+    tx.commit().await?;
+    crate::features::people::privacy::tell_deleted(db, account_id, &people).await;
     Ok(())
 }
 

@@ -11,6 +11,7 @@ use super::{page, ApiJson, Page};
 use crate::audience::{self as core, NewEvent, ProfileInput};
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::people::{with_source, ConsentSource};
 use crate::models::{EventRow, List, Profile, Segment, PROFILE_COLS};
 use crate::segments;
 use crate::state::AppState;
@@ -101,7 +102,7 @@ pub async fn create_profile(state: &AppState, account_id: Uuid, body: Value) -> 
 }
 
 async fn create_profile_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Profile>> {
-    Ok(Json(create_profile(&state, ctx.account_id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), create_profile(&state, ctx.account_id, b)).await?))
 }
 
 pub async fn load_profile(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Profile> {
@@ -212,21 +213,20 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
         if used {
             return Err(taken());
         }
-        // A new address ends the person's customer hub access first (sessions, sign-in links and
-        // codes made for the old one), so a failed write only signs them out.
         let new_email = email.clone().flatten();
         let email_changes = email.is_some() && before.email.is_some() && before.email != new_email;
-        if email_changes {
-            crate::features::hub::end_sessions(&state.db, id).await?;
-        }
-        // The identity, and the SMS consent that goes with the number, in one statement: a
-        // different number (or a first one) hasn't agreed to texts, so a subscription doesn't carry
-        // over to it unless this request sets the SMS consent itself.
+        // The identity, and the consent that goes with the address, in one statement: a different
+        // number or email (or a first one) hasn't agreed to anything, so a subscription doesn't carry
+        // over to it unless this request sets that consent itself (unsubscribed and pending stay).
+        // A hard bounce belonged to the old email address; a complaint stays (as in the upsert).
+        let new_email_sql = "($2 AND p.email IS NOT NULL AND p.email IS DISTINCT FROM $3)";
         let q = format!(
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
                sms_consent = CASE WHEN $7::text IS NOT NULL THEN $7
                                   WHEN $4 AND p.phone_number IS DISTINCT FROM $5 AND p.sms_consent = 'subscribed' THEN 'never_subscribed'
                                   ELSE p.sms_consent END,
+               email_consent = CASE WHEN $9::text IS NULL AND {new_email_sql} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END,
+               email_suppressed_reason = CASE WHEN {new_email_sql} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
                external_id = COALESCE($6, p.external_id),
                email_source = CASE WHEN $2 AND $3::text IS NOT NULL AND (p.email IS DISTINCT FROM $3::text OR p.email_source IS NULL) THEN '{source}' ELSE p.email_source END,
                updated_at = now()
@@ -234,6 +234,15 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
              WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent",
             source = core::TRUSTED_EMAIL_SOURCE
         );
+        // In one transaction with the address change, the row locked first: the consent history sees
+        // the exact before and after, and a deleted person's suppression record for the new address applies.
+        let mut tx = state.db.begin().await?;
+        let consent_before = crate::features::people::consent::lock(&mut tx, account_id, id).await?.ok_or_else(|| AppError::not_found("profile"))?;
+        // A new address ends the person's customer hub access (sessions, sign-in links and codes made
+        // for the old one), in this transaction.
+        if email_changes {
+            crate::features::hub::end_sessions(&mut *tx, id).await?;
+        }
         let saved = sqlx::query_as::<_, IdentitySaved>(&q)
             .bind(id)
             .bind(email.is_some())
@@ -243,7 +252,8 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             .bind(&input.external_id)
             .bind(&input.sms_consent)
             .bind(account_id)
-            .fetch_one(&state.db)
+            .bind(&input.email_consent)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| match AppError::from(e) {
                 AppError::Conflict(_) => taken(),
@@ -255,12 +265,14 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             sqlx::query(&format!("UPDATE profiles SET email_source = '{}' WHERE id = $1 AND email = $2 AND email_source IS NULL", core::TRUSTED_EMAIL_SOURCE))
                 .bind(id)
                 .bind(e)
-                .execute(&state.db)
+                .execute(&mut *tx)
                 .await?;
         }
+        let p = crate::features::people::consent::after_address_change(&mut tx, account_id, &consent_before, saved.profile).await?;
+        tx.commit().await?;
         // The consent this write replaced, as the write itself read it.
         let consent = (saved.old_email_consent.as_str(), saved.old_sms_consent.as_str());
-        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&before), Some(consent), &saved.profile, core::EventSource::Api).await;
+        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&before), Some(consent), &p, core::EventSource::Api).await;
     }
     // The rest (names, properties, email consent, and the SMS consent when no identity changed).
     // Updating by id: identity fields in the body change this profile rather than selecting another.
@@ -269,12 +281,14 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
 }
 
 async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Profile>> {
-    Ok(Json(patch_profile(&state, ctx.account_id, id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), patch_profile(&state, ctx.account_id, id, b)).await?))
 }
 
 async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    // One transaction: the profile, its reviews and photos, and the star summaries those counted in (see features::reviews).
-    let gone = crate::features::reviews::store::delete_person(&state.db, ctx.account_id, id).await?;
+    // One erasure for every delete path (features::people::privacy): every profile-keyed row, reviews
+    // and photos with the star summaries they counted in, push devices, stored exports; someone who
+    // had unsubscribed stays suppressed if re-imported.
+    let gone = crate::features::people::privacy::delete_profile_fully(&state.db, ctx.account_id, id).await?;
     let Some((email, phone_number, external_id)) = gone else { return Err(AppError::not_found("profile")) };
     crate::features::webhooks::profile_deleted(&state.db, ctx.account_id, json!({"id": id, "email": email, "phone_number": phone_number, "external_id": external_id})).await;
     crate::features::team::audit(&state, &ctx, "profile.delete", Some(&id.to_string()), json!({})).await;
@@ -320,7 +334,7 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
         return Err(AppError::bad("CSV is larger than 50 MB; split it into smaller files"));
     }
     // Role and throwaway addresses are left out of marketing imports; an unsubscribe file keeps them.
-    let r = core::import_csv(&state.db, account_id, &b.csv, b.list_id, b.email_consent, b.sms_consent, !as_unsubscribed).await?;
+    let r = crate::features::people::consent::with_method("import", core::import_csv(&state.db, account_id, &b.csv, b.list_id, b.email_consent, b.sms_consent, !as_unsubscribed)).await?;
     if r.created + r.updated > 0 {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"contacts\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
@@ -329,7 +343,7 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
 }
 
 async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ImportBody>) -> AppResult<Json<Value>> {
-    let v = import(&state, ctx.account_id, b).await?;
+    let v = with_source(ConsentSource::from_ctx(&ctx), import(&state, ctx.account_id, b)).await?;
     crate::features::team::audit(&state, &ctx, "profiles.import", None, json!({"created": v["created"], "updated": v["updated"], "skipped": v["skipped"]})).await;
     Ok(Json(v))
 }
@@ -441,7 +455,7 @@ pub async fn add_members(state: &AppState, account_id: Uuid, list_id: Uuid, b: M
 }
 
 async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
-    Ok(Json(json!({"added": add_members(&state, ctx.account_id, id, b).await?})))
+    Ok(Json(json!({"added": with_source(ConsentSource::from_ctx(&ctx), add_members(&state, ctx.account_id, id, b)).await?})))
 }
 
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
@@ -624,7 +638,7 @@ pub async fn track(state: &AppState, account_id: Uuid, b: TrackBody) -> AppResul
 }
 
 async fn track_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<TrackBody>) -> AppResult<Json<Value>> {
-    Ok(Json(track(&state, ctx.account_id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), track(&state, ctx.account_id, b)).await?))
 }
 
 #[derive(Deserialize)]

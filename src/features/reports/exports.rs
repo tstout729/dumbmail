@@ -250,12 +250,17 @@ pub async fn chunk(state: &AppState, id: Uuid, seq: i32) -> anyhow::Result<Vec<u
 }
 
 /// Store a finished file in one go (scheduled report CSVs, which are small). Returns the export id.
-pub async fn store_file(state: &AppState, account_id: Uuid, kind: &str, params: Value, filename: &str, bytes: &[u8]) -> anyhow::Result<Uuid> {
+/// `started`: when its data was read. If anyone in the account was erased since
+/// (features::people::privacy), nothing is stored and it fails, so the job builds it again.
+pub async fn store_file(state: &AppState, account_id: Uuid, kind: &str, params: Value, filename: &str, bytes: &[u8], started: DateTime<Utc>) -> anyhow::Result<Uuid> {
     if bytes.len() > CHUNK_BYTES {
         anyhow::bail!("report file is {} bytes, over the {CHUNK_BYTES}-byte limit", bytes.len());
     }
     let id = Uuid::now_v7();
     let mut tx = state.db.begin().await?;
+    if crate::features::people::privacy::erased_since(&mut tx, account_id, started).await? {
+        anyhow::bail!("someone in this account was erased while this report was built; it will be built again");
+    }
     sqlx::query("INSERT INTO exports (id, account_id, kind, params, filename, status, row_count, size_bytes, chunks, finished_at) VALUES ($1, $2, $3, $4, $5, 'done', 0, $6, 1, now())")
         .bind(id)
         .bind(account_id)
@@ -318,12 +323,12 @@ pub async fn run_batch(state: &AppState, export_id: Uuid) -> anyhow::Result<()> 
 
 /// [`run_batch`] with other size limits (tests use small ones).
 pub async fn run_batch_with(state: &AppState, export_id: Uuid, limits: Limits) -> anyhow::Result<()> {
-    let row: Option<(Uuid, String, Value, String, i32, i64, Option<Value>)> =
-        sqlx::query_as("SELECT account_id, kind, params, status, chunks, size_bytes, cursor FROM exports WHERE id = $1")
+    let row: Option<(Uuid, String, Value, String, i32, i64, Option<Value>, DateTime<Utc>)> =
+        sqlx::query_as("SELECT account_id, kind, params, status, chunks, size_bytes, cursor, created_at FROM exports WHERE id = $1")
             .bind(export_id)
             .fetch_optional(&state.db)
             .await?;
-    let Some((account_id, kind, params, status, chunks, size, cursor)) = row else { return Ok(()) };
+    let Some((account_id, kind, params, status, chunks, size, cursor, started)) = row else { return Ok(()) };
     if status != "queued" && status != "running" {
         return Ok(());
     }
@@ -338,6 +343,14 @@ pub async fn run_batch_with(state: &AppState, export_id: Uuid, limits: Limits) -
             let bytes = chunk.into_bytes()?;
             let new_size = size + bytes.len() as i64;
             let mut tx = state.db.begin().await?;
+            // Someone in the account was erased since the export started (features::people::privacy):
+            // what's written may hold them, so the file is thrown away, in the statement order that
+            // waits for an erasure running right now.
+            if crate::features::people::privacy::erased_since(&mut tx, account_id, started).await? {
+                drop(tx);
+                fail(state, export_id, ERASED).await?;
+                return Ok(());
+            }
             if !bytes.is_empty() {
                 sqlx::query("INSERT INTO export_chunks (export_id, seq, bytes) VALUES ($1, $2, $3) ON CONFLICT (export_id, seq) DO UPDATE SET bytes = $3")
                     .bind(export_id)
@@ -389,6 +402,9 @@ pub async fn run_batch_with(state: &AppState, export_id: Uuid, limits: Limits) -
         }
     }
 }
+
+/// Why an export was thrown away after an erasure.
+pub const ERASED: &str = "Someone in this account was deleted while this export was being made, so it was thrown away. Start it again.";
 
 async fn fail(state: &AppState, export_id: Uuid, msg: &str) -> anyhow::Result<()> {
     let mut tx = state.db.begin().await?;

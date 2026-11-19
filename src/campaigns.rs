@@ -167,7 +167,7 @@ pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
     } else if channel == "whatsapp" {
         qb.push(" AND ").push(crate::features::whatsapp::consent::REACHABLE_SQL);
     } else if channel == "sms" {
-        qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed'");
+        qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND p.sms_suppressed_reason IS NULL");
     } else {
         qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
     }
@@ -1000,6 +1000,8 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
         match out {
             Outcome::Sent(_) => sent += 1,
             Outcome::Failed(e) => return Err(AppError::bad(format!("test to {addr} failed: {e}"))),
+            // A number on the suppression list (features::people) is refused with the reason.
+            Outcome::Skipped("suppressed") => return Err(AppError::bad(format!("{addr} is suppressed or unsubscribed, so it can't get this test; pick another test address"))),
             _ => {}
         }
     }

@@ -648,6 +648,11 @@ impl Source {
     fn tag(&self) -> String {
         format!("integration:{}", self.integration_id)
     }
+
+    /// How this integration's consent changes appear in consent history (features::people).
+    fn consent_source(&self) -> crate::features::people::ConsentSource {
+        crate::features::people::ConsentSource::new("integration", "system").with_detail("integration", json!(self.name)).with_detail("integration_id", json!(self.integration_id))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -893,14 +898,9 @@ async fn after_write(state: &AppState, src: &Source, id: Uuid, created: bool, em
         _ => None,
     };
     if let Some(r) = reason {
-        let changed = sqlx::query("UPDATE profiles SET email_suppressed_reason = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND email_suppressed_reason IS NULL")
-            .bind(id)
-            .bind(r)
-            .bind(src.account_id)
-            .execute(&state.db)
-            .await?
-            .rows_affected();
-        if changed > 0 {
+        // Only where nothing suppresses the address yet (never replaces a bounce or complaint).
+        let changed = crate::features::people::consent::suppress(&state.db, src.account_id, id, crate::features::people::Channel::Email, r, false, false, &src.consent_source()).await?;
+        if changed.is_some_and(|before| before.email_suppressed_reason.is_none()) {
             return Ok(Some(r));
         }
     }
@@ -996,6 +996,7 @@ pub async fn insert_profile_in(
         _ => None,
     };
     let keys = Value::Object(merge_keys(&trusted_keys(props), extra_keys));
+    let consent_src = crate::features::people::ConsentSource::new("integration", "system").with_detail("source", json!(tag));
     let q = format!(
         "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent,
                                     source, marketing_hold, integration_keys, email_suppressed_reason, email_source, phone_source)
@@ -1003,7 +1004,7 @@ pub async fn insert_profile_in(
                  CASE WHEN $3::text IS NULL THEN NULL ELSE $9 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $9 END)
          ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
     );
-    Ok(sqlx::query_as(&q)
+    let created: Option<Profile> = sqlx::query_as(&q)
         .bind(Uuid::now_v7())
         .bind(account_id)
         .bind(&email)
@@ -1016,8 +1017,14 @@ pub async fn insert_profile_in(
         .bind(!contacts_opted_in)
         .bind(&keys)
         .bind(suppressed)
-        .fetch_optional(conn)
-        .await?)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(created) = created else { return Ok(None) };
+    // Its hold and suppression go in its consent history, and a deleted person's suppression record
+    // for its address applies, in the caller's transaction (features::people).
+    crate::features::people::consent::record_written_in(conn, account_id, &Default::default(), &[created.id], &consent_src).await?;
+    let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
+    Ok(Some(sqlx::query_as(&q).bind(created.id).fetch_one(&mut *conn).await?))
 }
 
 /// Record in the delivery's ledger that action `i` was written. False: another attempt already
@@ -1076,7 +1083,8 @@ async fn resolve_list(state: &AppState, account_id: Uuid, a: &ListAction) -> App
 /// is returned even when an action fails, so the caller can save what was written.
 pub async fn apply(state: &AppState, src: &Source, actions: &[Action], raw: &[Value], skip: &Map<String, Value>, current_state: &Map<String, Value>, dry: bool) -> (Outcome, Option<AppError>) {
     let mut out = Outcome::default();
-    let err = apply_into(state, src, actions, raw, skip, current_state, dry, &mut out).await.err();
+    // Every consent change below (the shared upsert's too) is recorded as this integration's.
+    let err = crate::features::people::with_source(src.consent_source(), apply_into(state, src, actions, raw, skip, current_state, dry, &mut out)).await.err();
     (out, err)
 }
 
@@ -1612,6 +1620,11 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
          FROM next WHERE p.id = next.id
          RETURNING next.c, next.n, next.fresh, next.own"
     );
+    // In one transaction with its consent history (features::people): the row is locked and read
+    // first, then written by the statement, then the change is recorded.
+    let mut tx = state.db.begin().await?;
+    let Some(locked) = crate::features::people::consent::lock(&mut tx, src.account_id, profile_id).await? else { return Ok(String::new()) };
+    let before = std::collections::HashMap::from([(profile_id, locked)]);
     let row: Option<(String, String, bool, bool)> = sqlx::query_as(&q)
         .bind(profile_id)
         .bind(src.account_id)
@@ -1621,9 +1634,20 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
         .bind(vec![unsub_metric, "Subscribed to List"])
         .bind(sub_metric)
         .bind(c.only_own)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await?;
-    let Some((before, after, fresh, own)) = row else { return Ok(String::new()) };
+    let how = src.consent_source().with_detail("consent_source", json!(c.source)).with_detail("as_of", json!(as_of)).with_detail("only_own", json!(c.only_own));
+    let recorded = crate::features::people::consent::record_written_in(&mut tx, src.account_id, &before, &[profile_id], &how).await?;
+    // What committed, not what the statement wrote: a retained block or a held-back opt-in decides.
+    let now: Option<String> = sqlx::query_scalar(&format!("SELECT {col} FROM profiles WHERE id = $1")).bind(profile_id).fetch_optional(&mut *tx).await?;
+    tx.commit().await?;
+    if !recorded.held_back.is_empty() {
+        return Err(AppError::Internal(anyhow::anyhow!("consent history couldn't be written for this opt-in; the delivery will be tried again")));
+    }
+    let Some((before, mut after, fresh, own)) = row else { return Ok(String::new()) };
+    if let Some(n) = now {
+        after = n;
+    }
     if !fresh {
         return Ok(format!("; kept {label} as it is (a newer preference from this app was already applied)"));
     }
@@ -1645,10 +1669,10 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
 }
 
 async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: Channel, as_of: Option<DateTime<Utc>>) -> AppResult<()> {
-    let (col, metric) = if channel == Channel::Email { ("email_consent", "Unsubscribed") } else { ("sms_consent", "Unsubscribed from SMS") };
-    let q = format!("UPDATE profiles SET {col} = 'unsubscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND {col} <> 'unsubscribed'");
-    let n = sqlx::query(&q).bind(profile_id).bind(src.account_id).execute(&state.db).await?.rows_affected();
-    if n > 0 {
+    let (ch, metric) = if channel == Channel::Email { (crate::features::people::Channel::Email, "Unsubscribed") } else { (crate::features::people::Channel::Sms, "Unsubscribed from SMS") };
+    let how = src.consent_source().with_detail("as_of", json!(as_of));
+    let changed = crate::features::people::consent::set_consent(&state.db, src.account_id, profile_id, ch, "unsubscribed", None, &how).await?;
+    if changed.is_some() {
         audience::record_event(
             &state.db,
             NewEvent {

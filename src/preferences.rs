@@ -107,15 +107,18 @@ pub struct OptOutSource {
 /// `Unsubscribed from SMS`; none for a test message's link) and the webhook notice. Returns whether
 /// it changed anything. The unsubscribe page and the customer hub both use it.
 pub async fn opt_out(db: &PgPool, account_id: Uuid, profile_id: Uuid, channel: &str, src: &OptOutSource) -> AppResult<bool> {
-    let (col, metric, channel) = if channel == "sms" { ("sms_consent", "Unsubscribed from SMS", "sms") } else { ("email_consent", "Unsubscribed", "email") };
-    let before: Option<String> = sqlx::query_scalar(&format!(
-        "UPDATE profiles p SET {col} = 'unsubscribed', updated_at = now() FROM (SELECT id, {col} AS before FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE) old
-         WHERE p.id = old.id AND old.before <> 'unsubscribed' RETURNING old.before"
-    ))
-    .bind(profile_id)
-    .bind(account_id)
-    .fetch_optional(db)
-    .await?;
+    let (ch, metric, channel) = if channel == "sms" { (crate::features::people::Channel::Sms, "Unsubscribed from SMS", "sms") } else { (crate::features::people::Channel::Email, "Unsubscribed", "email") };
+    // Through the consent helpers (features::people): the row locked, the change and its history row
+    // together, the opt-out saved even if its history row has to be written later. How it happened
+    // is the caller's consent source, or else this source's own.
+    let mut how = crate::features::people::consent::current_source();
+    if how.method == "other" {
+        how = crate::features::people::ConsentSource::new(if src.method == "hub" { "hub" } else { "unsubscribe_link" }, "public");
+        if let Some((id, ..)) = src.message {
+            how = how.with_message(id);
+        }
+    }
+    let before = crate::features::people::consent::set_consent(db, account_id, profile_id, ch, "unsubscribed", None, &how).await?;
     let Some(before) = before else { return Ok(false) };
     let message_id = src.message.map(|m| m.0);
     if !src.message.is_some_and(|m| m.3) {

@@ -49,6 +49,8 @@
   var TRACKING_KEYS = ["pl_profile", "pl_buffer", "pl_last_product", "pl_cart", "pl_sc", "pl_orders", "pl_active", "pl_page_views", "pl_first_seen"];
   function post(path, body) {
     if (STOPPED && path !== "/client/subscribe") return Promise.resolve({ json: function () { return Promise.resolve({}); } });
+    // Global Privacy Control: the visitor asked not to have their data sold or shared.
+    if (navigator.globalPrivacyControl === true && body && typeof body === "object") body.gpc = true;
     try {
       return fetch(BASE + path + "?k=" + encodeURIComponent(KEY), {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), keepalive: true, credentials: "omit"
