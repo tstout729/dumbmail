@@ -779,7 +779,9 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     let upserted = audience::upsert_profile_public(&state.db, account.id, &input).await?;
     let p = upserted.profile;
     // The form's explicit WhatsApp box (only shown when the form words it).
-    if let (true, Some(phone)) = (b.whatsapp_consent && form.config["whatsapp_consent_text"].as_str().is_some_and(|t| !t.trim().is_empty()), phone.as_deref()) {
+    // Only for the number the sign-up actually gave this profile (a public form can't add consent to
+    // someone else's number).
+    if let (true, Some(phone)) = (b.whatsapp_consent && form.config["whatsapp_consent_text"].as_str().is_some_and(|t| !t.trim().is_empty()), phone.as_deref().filter(|n| p.phone_number.as_deref() == Some(*n))) {
         crate::features::whatsapp::consent::form_opt_in(&state.db, account.id, p.id, phone, form.id).await?;
     }
     if let Some(tz) = &b.timezone {

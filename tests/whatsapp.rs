@@ -808,13 +808,12 @@ async fn templates_created_tracked_clicked_and_billed_once() {
     let button = &s[0].1["template"]["components"][1];
     assert_eq!((button["sub_type"].as_str(), button["index"].as_str()), (Some("url"), Some("0")), "{button}");
     let token = button["parameters"][0]["text"].as_str().unwrap().to_string();
-    // Charged once, when Meta's webhook says it was sent.
+    // Charged once, when Meta accepted it; its statuses don't charge it again.
     let db = h.state.db.clone();
     let charged = || {
         let db = db.clone();
         async move { sqlx::query_scalar::<_, i64>("SELECT COALESCE(sum(quantity), 0)::bigint FROM ledger WHERE kind = 'whatsapp'").fetch_one(&db).await.unwrap() }
     };
-    assert_eq!(charged().await, 0, "accepted isn't sent yet");
     hook(&h, &status("wamid.TEST1", "sent", json!({}))).await;
     hook(&h, &status("wamid.TEST1", "delivered", json!({}))).await;
     hook(&h, &status("wamid.TEST1", "sent", json!({}))).await;
@@ -1110,6 +1109,24 @@ async fn a_new_sender_starts_fresh() {
     assert_eq!(consent_of(&h, &them).await, "never_subscribed");
     let window: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT last_inbound_at FROM whatsapp_contacts WHERE phone_number = $1").bind(&them).fetch_one(&h.state.db).await.unwrap();
     assert!(window.is_none());
+    // A campaign message its batch already claimed, waiting at the hand-off when the number changes
+    // again: prepared for the old sender, it never goes from the new one.
+    subscribe(&mut h, &p).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "L"}))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/lists/{list}/members"), Some(json!({"profile_ids": [p]}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Sale", "channel": "whatsapp", "audience": {"include": [{"type": "list", "id": list}]}, "content": sale(&t)}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let pause = dumbmail::features::whatsapp::send::hook::Pause::hold(acct);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let st = h.state.clone();
+    let task = tokio::spawn(async move { dumbmail::jobs::drain(&st).await.unwrap() });
+    pause.arrived().await;
+    h.ok("PATCH", "/api/whatsapp/settings", Some(json!({"phone_number_id": "2888"}))).await;
+    pause.release(acct);
+    task.await.unwrap();
+    assert!(sends(&m).is_empty());
+    let last: (String, Option<String>) = sqlx::query_as("SELECT status, error FROM messages WHERE campaign_id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(last, ("skipped".into(), Some("WhatsApp sender changed".into())));
     // A disconnect stops sends that were already prepared too.
     subscribe(&mut h, &p).await;
     flow(&mut h, "Joined again", sale(&t), false).await;
@@ -1216,21 +1233,32 @@ async fn credit_is_held_and_charged_only_for_what_went_out() {
     // Meta drops it: the credit comes back.
     hook(&h, &status("wamid.HELD", "failed", json!({"errors": [{"code": 135000, "title": "t", "message": "t"}]}))).await;
     assert_eq!(balance().await, start);
-    // An inbox reply that goes out is charged once, when Meta says it was sent.
+    // A held one Meta later sends is charged then, once.
+    let a2 = daytime_number(1903);
+    let pa2 = person(&mut h, &a2, None).await;
+    subscribe(&mut h, &pa2).await;
+    answer(&m, &a2, (200, json!({"messaging_product": "whatsapp", "contacts": [{"wa_id": "1"}], "messages": [{"id": "wamid.HELD2", "message_status": "held_for_quality_assessment"}]})));
+    trigger(&mut h, "Joined", &a2).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM ledger WHERE kind = 'whatsapp'").await, 0);
+    hook(&h, &status("wamid.HELD2", "sent", json!({}))).await;
+    hook(&h, &status("wamid.HELD2", "delivered", json!({}))).await;
+    assert_eq!(start - balance().await, 50_000);
+    assert_eq!(count(&h, "SELECT COALESCE(sum(quantity), 0)::bigint FROM ledger WHERE kind = 'whatsapp'").await, 1);
+    // An inbox reply Meta accepts is charged once; a failure reported later (the webhook is signed
+    // with the customer's own secret) doesn't give it back.
     let b = daytime_number(1902);
     hook(&h, &inbound(&b, "wamid.R1", "hello")).await;
     let cid: Uuid = sqlx::query_scalar("SELECT id FROM whatsapp_conversations WHERE phone_number = $1").bind(&b).fetch_one(&h.state.db).await.unwrap();
     h.ok("POST", &format!("/api/whatsapp/conversations/{cid}/reply"), Some(json!({"text": "Hi!", "confirm": true}))).await;
     let wamid = format!("wamid.TEST{}", sends(&m).len());
-    assert_eq!(start - balance().await, 50_000);
-    hook(&h, &status(&wamid, "sent", json!({}))).await;
-    hook(&h, &status(&wamid, "read", json!({}))).await;
-    assert_eq!(start - balance().await, 50_000, "charged once");
-    assert_eq!(count(&h, "SELECT COALESCE(sum(quantity), 0)::bigint FROM ledger WHERE kind = 'whatsapp'").await, 1);
+    assert_eq!(start - balance().await, 100_000);
+    hook(&h, &status(&wamid, "failed", json!({"errors": [{"code": 131000, "title": "t", "message": "t"}]}))).await;
+    assert_eq!(start - balance().await, 100_000, "charged once, not refunded by a webhook");
+    assert_eq!(count(&h, "SELECT COALESCE(sum(quantity), 0)::bigint FROM ledger WHERE kind = 'whatsapp'").await, 2);
     // Without enough credit, nothing goes.
     sqlx::query("UPDATE accounts SET balance_micros = 10 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
     h.ok("POST", &format!("/api/whatsapp/conversations/{cid}/reply"), Some(json!({"text": "Again", "confirm": true}))).await;
-    assert_eq!(sends(&m).len(), 2);
+    assert_eq!(sends(&m).len(), 3);
     h.cleanup().await;
 }
 

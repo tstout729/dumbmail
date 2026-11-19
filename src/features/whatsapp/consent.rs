@@ -9,9 +9,9 @@
 //!   number are skipped in the same transaction, and the final claim before every hand-off reads the
 //!   consent under the same lock.
 //! - **Ordered by when it happened.** Each change carries the time of the event behind it (Meta's
-//!   timestamp, or now), compared to the second (Meta's precision). A change older than the one in
-//!   force does nothing, and in the same second an opt-out wins, so a delayed START or sign-up can
-//!   never undo a newer STOP.
+//!   timestamp, which is whole seconds, or now). A change older than the one in force does nothing.
+//!   An opt-out wins anywhere in its second, and a subscribe after an opt-out needs a later second,
+//!   so a delayed START or sign-up can never undo a newer STOP.
 //! - Consent belongs to the number and to the connected sender: a profile whose number changes has
 //!   no WhatsApp consent for the new one, and a new business number starts with nobody subscribed.
 
@@ -83,8 +83,12 @@ pub async fn set(
         "UPDATE whatsapp_contacts c SET consent = $3, consent_source = $4, consent_at = $5, updated_at = now()
          FROM (SELECT consent FROM whatsapp_contacts WHERE account_id = $1 AND phone_number = $2 FOR UPDATE) old
          WHERE c.account_id = $1 AND c.phone_number = $2
-           AND (c.consent_at IS NULL OR date_trunc('second', $5) > date_trunc('second', c.consent_at)
-                OR (date_trunc('second', $5) = date_trunc('second', c.consent_at) AND $3 = 'unsubscribed'))
+           AND (c.consent_at IS NULL
+                -- An opt-out applies unless something happened in a later second.
+                OR ($3 = 'unsubscribed' AND date_trunc('second', $5) >= date_trunc('second', c.consent_at))
+                -- After an opt-out, a subscribe needs a later second (in the same one, the opt-out wins).
+                OR ($3 = 'subscribed' AND c.consent = 'unsubscribed' AND date_trunc('second', $5) > date_trunc('second', c.consent_at))
+                OR ($3 = 'subscribed' AND c.consent <> 'unsubscribed' AND $5 > c.consent_at))
          RETURNING old.consent",
     )
     .bind(account_id)

@@ -20,8 +20,10 @@
 //! 3. **The result**: accepted, or a refusal by class. Rate limits and Meta outages wait (on the
 //!    background lane, backing off per sender, or per sender and person for pair limits); anything
 //!    that may have gone (a time-out, a gateway error, an answer without Meta's error code) is never
-//!    repeated. The credit is charged once, when Meta's status webhook says it was sent, and released
-//!    if it fails.
+//!    repeated. The credit is charged once: when Meta accepts it on DumbMail's own call, or, for a
+//!    message Meta holds for a quality check, when Meta's status says it was sent. It's released when
+//!    Meta refuses it, or drops a held one. (Statuses are signed with the customer's own app secret,
+//!    so they can only ever turn a hold into a charge or release a hold Meta itself kept.)
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -285,6 +287,8 @@ struct ClaimRow {
     message_sender: Option<Uuid>,
     tester: bool,
     backoff_until: Option<DateTime<Utc>>,
+    /// Already charged on an earlier attempt (a message id is charged at most once).
+    charged: bool,
 }
 
 const CLAIM_SQL: &str = "SELECT m.account_id, m.status, m.to_address, m.campaign_id, m.flow_id, m.is_test, a.closed_at IS NOT NULL AS closed,
@@ -296,7 +300,8 @@ const CLAIM_SQL: &str = "SELECT m.account_id, m.status, m.to_address, m.campaign
         w.kind, w.payload->>'type' = 'text' AS free_form, w.attempts, w.sender_id AS message_sender,
         EXISTS (SELECT 1 FROM whatsapp_test_numbers tn JOIN memberships mb ON mb.user_id = tn.user_id AND mb.account_id = tn.account_id
                 WHERE tn.account_id = m.account_id AND tn.phone_number = m.to_address AND tn.verified_at IS NOT NULL) AS tester,
-        (SELECT max(b.until) FROM whatsapp_backoff b WHERE b.account_id = m.account_id AND b.scope IN ('sender', 'pair:' || m.to_address)) AS backoff_until
+        (SELECT max(b.until) FROM whatsapp_backoff b WHERE b.account_id = m.account_id AND b.scope IN ('sender', 'pair:' || m.to_address)) AS backoff_until,
+        w.charged_at IS NOT NULL AS charged
      FROM messages m JOIN accounts a ON a.id = m.account_id JOIN whatsapp_sent w ON w.message_id = m.id
      LEFT JOIN profiles p ON p.id = m.profile_id
      LEFT JOIN whatsapp_templates t ON t.id = w.template_id
@@ -419,7 +424,7 @@ async fn claim(state: &AppState, message_id: Uuid, strict: bool) -> AppResult<Re
     let stop = match stop {
         None => {
             // Hold the credit for it (released if it doesn't go out).
-            let amount = if r.is_test { 0 } else { price(state) };
+            let amount = if r.is_test || r.charged { 0 } else { price(state) };
             let held = amount <= 0
                 || sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1 AND balance_micros >= $2")
                     .bind(account_id)
@@ -542,6 +547,11 @@ async fn sent(state: &AppState, r: &ClaimRow, message_id: Uuid, acc: &graph::Acc
     .fetch_optional(&mut *tx)
     .await?;
     sqlx::query("UPDATE whatsapp_sent SET wamid = $2, pacing = $3 WHERE message_id = $1").bind(message_id).bind(&acc.wamid).bind(&acc.pacing).execute(&mut *tx).await?;
+    // Meta accepted it on DumbMail's own call: that's what's charged. A message Meta holds for a
+    // quality check or pacing waits for Meta's "sent" status (or is released if Meta drops it).
+    if !matches!(acc.pacing.as_deref(), Some("held_for_quality_assessment" | "paused")) {
+        settle(&mut tx, r.account_id, message_id).await?;
+    }
     if let Some(wa_id) = &acc.wa_id {
         sqlx::query("UPDATE whatsapp_contacts SET wa_id = $3 WHERE account_id = $1 AND phone_number = $2").bind(r.account_id).bind(&r.to_address).bind(wa_id).execute(&mut *tx).await?;
     }
@@ -753,16 +763,21 @@ pub async fn run_job(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Upkeep: give back credit held for messages Meta never confirmed within three days.
+/// Upkeep: settle credit still held three days after the hand-off. Meta took a message it
+/// gave an id for, so that's charged; one without an id (no answer) is given back.
 pub async fn release_stale_holds(db: &sqlx::PgPool) -> anyhow::Result<()> {
-    let stale: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT account_id, message_id FROM whatsapp_sent WHERE reserved_micros > 0 AND charged_at IS NULL AND handed_at < now() - interval '3 days' LIMIT 500",
+    let stale: Vec<(Uuid, Uuid, bool)> = sqlx::query_as(
+        "SELECT account_id, message_id, wamid IS NOT NULL FROM whatsapp_sent WHERE reserved_micros > 0 AND charged_at IS NULL AND handed_at < now() - interval '3 days' LIMIT 500",
     )
     .fetch_all(db)
     .await?;
-    for (account_id, message_id) in stale {
+    for (account_id, message_id, accepted) in stale {
         let mut tx = db.begin().await?;
-        release(&mut tx, account_id, message_id).await?;
+        if accepted {
+            settle(&mut tx, account_id, message_id).await?;
+        } else {
+            release(&mut tx, account_id, message_id).await?;
+        }
         tx.commit().await?;
     }
     Ok(())
@@ -800,6 +815,7 @@ mod tests {
             message_sender: Some(Uuid::nil()),
             tester: false,
             backoff_until: None,
+            charged: false,
         }
     }
 

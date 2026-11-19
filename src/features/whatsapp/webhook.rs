@@ -199,8 +199,8 @@ async fn handle(state: &AppState, account_id: Uuid, waba_id: Option<&str>, phone
 }
 
 /// Remember a webhook event once. Returns false when it was already seen.
-async fn first_time(db: &sqlx::PgPool, account_id: Uuid, key: &str) -> sqlx::Result<bool> {
-    Ok(sqlx::query("INSERT INTO whatsapp_seen (account_id, key) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(account_id).bind(key).execute(db).await?.rows_affected() == 1)
+async fn first_time(conn: &mut sqlx::PgConnection, account_id: Uuid, key: &str) -> sqlx::Result<bool> {
+    Ok(sqlx::query("INSERT INTO whatsapp_seen (account_id, key) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(account_id).bind(key).execute(conn).await?.rows_affected() == 1)
 }
 
 /// Meta's "stop marketing messages" (and "resume") choice, applied once and in the order it was
@@ -217,12 +217,13 @@ async fn preference(state: &AppState, account_id: Uuid, p: &Value, contacts: &Va
     let Some(who) = phone.clone().or(user_id.clone()) else { return Ok(()) };
     let at = meta_time(&p["timestamp"]);
     let key = format!("pref:{who}:{}:{value}", p["timestamp"]);
-    if !first_time(&state.db, account_id, &key).await? {
-        return Ok(());
-    }
     // Without Meta's time, a stop still applies now; a resume needs nothing.
     let at = at.unwrap_or_else(Utc::now);
     let mut tx = state.db.begin().await?;
+    // Seen once, recorded with its effect: a failure rolls both back and Meta's retry applies it.
+    if !first_time(&mut tx, account_id, &key).await? {
+        return Ok(());
+    }
     let mut changed_for: Option<(String, Option<Uuid>)> = None;
     match (value, phone) {
         ("stop", Some(phone)) => {
