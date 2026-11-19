@@ -78,13 +78,48 @@ pub async fn list(state: &AppState, account_id: Uuid, q: &ListQuery) -> AppResul
     Ok(json!({"data": rows.into_iter().map(row_json).collect::<Vec<_>>(), "next_cursor": next, "handed_off_count": handed_off}))
 }
 
-pub async fn one(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
+/// Messages per page of a transcript.
+pub const MESSAGES_PAGE: i64 = 50;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagesQuery {
+    /// `older_cursor` from the previous page: the messages before it.
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// One conversation with its newest messages first in paging (shown oldest to newest within the
+/// page), and `older_cursor` for the ones before them.
+pub async fn one(state: &AppState, account_id: Uuid, id: Uuid, q: &MessagesQuery) -> AppResult<Value> {
     let row: Option<Row> = sqlx::query_as(&format!("{ROW_SQL} WHERE c.account_id = $1 AND c.id = $2")).bind(account_id).bind(id).fetch_optional(&state.db).await?;
     let row = row.ok_or_else(|| AppError::not_found("conversation"))?;
-    let msgs: Vec<(String, String, DateTime<Utc>)> =
-        sqlx::query_as("SELECT role, body, created_at FROM agent_messages WHERE conversation_id = $1 AND account_id = $2 ORDER BY created_at, id LIMIT 200").bind(id).bind(account_id).fetch_all(&state.db).await?;
+    let limit = q.limit.unwrap_or(MESSAGES_PAGE).clamp(1, 200);
+    let before = match q.before.as_deref().filter(|c| !c.is_empty()) {
+        Some(c) => Some(decode_cursor(c)?),
+        None => None,
+    };
+    let mut msgs: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, role, body, created_at FROM agent_messages WHERE conversation_id = $1 AND account_id = $2
+           AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4))
+         ORDER BY created_at DESC, id DESC LIMIT $5",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(before.map(|b| b.0))
+    .bind(before.map(|b| b.1))
+    .bind(limit + 1)
+    .fetch_all(&state.db)
+    .await?;
+    let more = msgs.len() as i64 > limit;
+    msgs.truncate(limit as usize);
+    let older = if more { msgs.last().map(|m| encode_cursor(m.3, m.0)) } else { None };
+    msgs.reverse();
     let mut out = row_json(row);
-    out["messages"] = json!(msgs.into_iter().map(|(role, body, at)| json!({"role": role, "body": body, "at": at})).collect::<Vec<_>>());
+    out["messages"] = json!(msgs.into_iter().map(|(_, role, body, at)| json!({"role": role, "body": body, "at": at})).collect::<Vec<_>>());
+    out["older_cursor"] = json!(older);
     Ok(out)
 }
 
@@ -105,7 +140,7 @@ pub async fn test(state: &AppState, ctx: &Ctx, b: TestBody) -> AppResult<Value> 
         return Err(AppError::bad("The shopping agent isn't available on this server (no Anthropic API key is set)"));
     }
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    let st = Start { account: &account, place: "test", who: Who { profile_id: None, orders: Orders::Sample }, token: b.conversation.as_deref(), sms_conversation_id: None, whatsapp_conversation_id: None, ip: None };
+    let st = Start { account: &account, place: "test", who: Who { profile_id: None, orders: Orders::Sample, proof: super::proof::sample() }, token: b.conversation.as_deref(), sms_conversation_id: None, whatsapp_conversation_id: None, ip: None };
     let o = chat::say(state, st, &b.message, |_| {}).await?;
     Ok(json!({"reply": o.reply, "conversation": o.token.or(b.conversation), "conversation_id": o.conversation_id, "handed_off": o.handed_off, "refused": o.refused}))
 }
@@ -114,8 +149,8 @@ async fn list_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<ListQue
     Ok(Json(list(&state, ctx.account_id, &q).await?))
 }
 
-async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(one(&state, ctx.account_id, id).await?))
+async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<MessagesQuery>) -> AppResult<Json<Value>> {
+    Ok(Json(one(&state, ctx.account_id, id, &q).await?))
 }
 
 async fn test_h(State(state): State<AppState>, ctx: Ctx, Json(b): Json<TestBody>) -> AppResult<Json<Value>> {

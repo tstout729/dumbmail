@@ -44,13 +44,23 @@ pub struct Turn {
     pub tokens: i64,
 }
 
-/// What went wrong, short and safe to store.
+/// What went wrong, short and safe to store, and the tokens the attempt used as far as the API
+/// reported them (a stream that broke off still bills what it streamed).
 #[derive(Debug, Clone)]
-pub struct Failure(pub &'static str);
+pub struct Failure {
+    pub msg: &'static str,
+    pub tokens: i64,
+}
+
+impl Failure {
+    pub fn new(msg: &'static str) -> Self {
+        Failure { msg, tokens: 0 }
+    }
+}
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.msg)
     }
 }
 
@@ -69,7 +79,7 @@ fn client() -> Result<reqwest::Client, Failure> {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| Failure("couldn't start the model client"))
+        .map_err(|_| Failure::new("couldn't start the model client"))
 }
 
 pub fn body(r: &Request<'_>) -> Value {
@@ -90,9 +100,9 @@ pub fn body(r: &Request<'_>) -> Value {
 /// Run one model turn. `on_text` gets each piece of visible text as it streams (the caller throws
 /// it away again when the turn doesn't end well).
 pub async fn turn(r: &Request<'_>, mut on_text: impl FnMut(&str)) -> Result<Turn, Failure> {
-    let body = serde_json::to_vec(&body(r)).map_err(|_| Failure("couldn't write the request"))?;
+    let body = serde_json::to_vec(&body(r)).map_err(|_| Failure::new("couldn't write the request"))?;
     if body.len() > MAX_REQUEST_BYTES {
-        return Err(Failure("the conversation is too long"));
+        return Err(Failure::new("the conversation is too long"));
     }
     let base = crate::features::translations::ai::api_base(r.base_url);
     let url = format!("{}/v1/messages", base.trim_end_matches('/'));
@@ -106,10 +116,10 @@ pub async fn turn(r: &Request<'_>, mut on_text: impl FnMut(&str)) -> Result<Turn
             .body(body)
             .send()
             .await
-            .map_err(|_| Failure("couldn't reach the model"))?;
+            .map_err(|_| Failure::new("couldn't reach the model"))?;
         let status = res.status().as_u16();
         if status != 200 {
-            return Err(Failure(match status {
+            return Err(Failure::new(match status {
                 401 | 403 => "the model service refused the key",
                 429 => "the model service is busy",
                 529 => "the model service is overloaded",
@@ -119,17 +129,27 @@ pub async fn turn(r: &Request<'_>, mut on_text: impl FnMut(&str)) -> Result<Turn
         }
         read_stream(res, &mut on_text).await
     };
-    tokio::time::timeout(TIMEOUT, work).await.map_err(|_| Failure("the model didn't answer in time"))?
+    tokio::time::timeout(TIMEOUT, work).await.map_err(|_| Failure::new("the model didn't answer in time"))?
 }
 
-/// Folds the server-sent events of one streamed message into its content blocks.
+/// Folds the server-sent events of one streamed message into its content blocks. Only a complete
+/// stream counts: `message_stop` seen, every block that started also stopped, every tool input
+/// complete JSON. Usage is the API's final counters, not a sum of snapshots.
 #[derive(Default)]
 pub struct Assembler {
     blocks: Vec<Value>,
     /// Partial JSON of a tool_use block's input, by block index.
     partial: std::collections::HashMap<usize, String>,
+    open: std::collections::HashSet<usize>,
+    bad_input: bool,
     stop: Option<String>,
-    tokens: i64,
+    stopped: bool,
+    /// Input tokens from `message_start` (input, cache writes and reads).
+    input: i64,
+    /// Output tokens: the latest cumulative count.
+    output: i64,
+    /// Every attempt's usage when the API lists them (server-side fallback).
+    iterations: Option<i64>,
     error: bool,
 }
 
@@ -138,7 +158,9 @@ impl Assembler {
     pub fn event(&mut self, data: &Value) -> Option<String> {
         match data["type"].as_str()? {
             "message_start" => {
-                self.tokens += usage_tokens(&data["message"]["usage"]);
+                let u = &data["message"]["usage"];
+                self.input = input_tokens(u);
+                self.output = u["output_tokens"].as_i64().unwrap_or(0);
                 None
             }
             "content_block_start" => {
@@ -147,6 +169,7 @@ impl Assembler {
                     self.blocks.push(Value::Null);
                 }
                 self.blocks[i] = data["content_block"].clone();
+                self.open.insert(i);
                 data["content_block"]["text"].as_str().filter(|t| !t.is_empty() && data["content_block"]["type"] == "text").map(str::to_string)
             }
             "content_block_delta" => {
@@ -176,10 +199,16 @@ impl Assembler {
             }
             "content_block_stop" => {
                 let i = data["index"].as_u64()? as usize;
+                self.open.remove(&i);
                 if let Some(raw) = self.partial.remove(&i) {
-                    let input = if raw.trim().is_empty() { json!({}) } else { serde_json::from_str(&raw).unwrap_or(Value::Null) };
-                    if let Some(b) = self.blocks.get_mut(i) {
-                        b["input"] = input;
+                    let input = if raw.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str::<Value>(&raw) };
+                    match input {
+                        Ok(v) if v.is_object() => {
+                            if let Some(b) = self.blocks.get_mut(i) {
+                                b["input"] = v;
+                            }
+                        }
+                        _ => self.bad_input = true,
                     }
                 }
                 None
@@ -188,7 +217,20 @@ impl Assembler {
                 if let Some(s) = data["delta"]["stop_reason"].as_str() {
                     self.stop = Some(s.to_string());
                 }
-                self.tokens += data["usage"]["output_tokens"].as_i64().unwrap_or(0);
+                let u = &data["usage"];
+                if let Some(o) = u["output_tokens"].as_i64() {
+                    self.output = o;
+                }
+                if u["input_tokens"].is_i64() {
+                    self.input = self.input.max(input_tokens(u));
+                }
+                if let Some(it) = u["iterations"].as_array() {
+                    self.iterations = Some(it.iter().map(|x| input_tokens(x) + x["output_tokens"].as_i64().unwrap_or(0)).sum());
+                }
+                None
+            }
+            "message_stop" => {
+                self.stopped = true;
                 None
             }
             "error" => {
@@ -199,9 +241,22 @@ impl Assembler {
         }
     }
 
+    /// The tokens used so far, by the API's own counters.
+    pub fn tokens(&self) -> i64 {
+        self.iterations.unwrap_or(self.input + self.output)
+    }
+
     pub fn finish(self) -> Result<Turn, Failure> {
+        let tokens = self.tokens();
+        let fail = |msg| Err(Failure { msg, tokens });
         if self.error {
-            return Err(Failure("the model service stopped part way"));
+            return fail("the model service stopped part way");
+        }
+        if !self.stopped || !self.open.is_empty() || !self.partial.is_empty() {
+            return fail("the model's answer broke off");
+        }
+        if self.bad_input {
+            return fail("the model sent a broken tool call");
         }
         let stop = match self.stop.as_deref() {
             Some("tool_use") => Stop::ToolUse,
@@ -209,9 +264,9 @@ impl Assembler {
             Some("max_tokens") => Stop::MaxTokens,
             Some("refusal") => Stop::Refusal,
             Some(o) => Stop::Other(o.to_string()),
-            None => return Err(Failure("the model's answer broke off")),
+            None => return fail("the model's answer broke off"),
         };
-        Ok(Turn { stop, content: self.blocks.into_iter().filter(|b| !b.is_null()).collect(), tokens: self.tokens })
+        Ok(Turn { stop, content: self.blocks.into_iter().filter(|b| !b.is_null()).collect(), tokens })
     }
 }
 
@@ -221,18 +276,23 @@ fn append(block: &mut Value, key: &str, more: &str) {
     block[key] = Value::String(s);
 }
 
-fn usage_tokens(u: &Value) -> i64 {
-    ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].iter().map(|k| u[*k].as_i64().unwrap_or(0)).sum()
+fn input_tokens(u: &Value) -> i64 {
+    ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].iter().map(|k| u[*k].as_i64().unwrap_or(0)).sum()
 }
 
 async fn read_stream(mut res: reqwest::Response, on_text: &mut impl FnMut(&str)) -> Result<Turn, Failure> {
     let mut asm = Assembler::default();
     let mut buf: Vec<u8> = Vec::new();
     let mut total = 0usize;
-    while let Some(chunk) = res.chunk().await.map_err(|_| Failure("the model's answer broke off"))? {
+    loop {
+        let chunk = match res.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(_) => return Err(Failure { msg: "the model's answer broke off", tokens: asm.tokens() }),
+        };
         total += chunk.len();
         if total > MAX_RESPONSE_BYTES {
-            return Err(Failure("the model's answer was too long"));
+            return Err(Failure { msg: "the model's answer was too long", tokens: asm.tokens() });
         }
         buf.extend_from_slice(&chunk);
         while let Some(end) = find_event_end(&buf) {
@@ -355,7 +415,7 @@ mod tests {
         assert_eq!(t.stop, Stop::ToolUse);
         assert_eq!(t.content[0]["signature"], "sig");
         assert_eq!(t.content[2]["input"]["query"], "jacket");
-        assert_eq!(t.tokens, 121);
+        assert_eq!(t.tokens, 120, "input from message_start, output from the final count");
         assert_eq!(tool_calls(&t.content), vec![("toolu_1".to_string(), "search_products".to_string(), json!({"query": "jacket"}))]);
     }
 
@@ -364,6 +424,38 @@ mod tests {
         let mut a = Assembler::default();
         a.event(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "Hi"}}));
         assert!(a.finish().is_err());
+    }
+
+    #[test]
+    fn only_a_complete_stream_counts() {
+        let start = json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}});
+        let text = |i: u64| json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": "Hi"}});
+        let stop_block = |i: u64| json!({"type": "content_block_stop", "index": i});
+        let delta = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}});
+        let done = json!({"type": "message_stop"});
+        let run = |evs: Vec<Value>| {
+            let mut a = Assembler::default();
+            for e in &evs {
+                a.event(e);
+            }
+            a.finish()
+        };
+        assert!(run(vec![start.clone(), text(0), stop_block(0), delta.clone(), done.clone()]).is_ok());
+        let e = run(vec![start.clone(), text(0), stop_block(0), delta.clone()]).unwrap_err();
+        assert_eq!(e.tokens, 17, "a broken stream still reports what it used");
+        assert!(run(vec![start.clone(), text(0), delta.clone(), done.clone()]).is_err(), "a block that never stopped");
+        let tool = vec![
+            start.clone(),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t", "name": "search_products", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"query\": \"jack"}}),
+            stop_block(0),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 7}}),
+            done.clone(),
+        ];
+        assert!(run(tool).is_err(), "a tool input that isn't complete JSON");
+        // Server-side fallback: every attempt's usage counts.
+        let fb = vec![start, text(0), stop_block(0), json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7, "iterations": [{"input_tokens": 10, "output_tokens": 3}, {"input_tokens": 12, "output_tokens": 7}]}}), done];
+        assert_eq!(run(fb).unwrap().tokens, 32);
     }
 
     #[test]

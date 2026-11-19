@@ -6,7 +6,10 @@
 //! (`inbox::replies::queue_auto`): the per-person limit, the hourly budgets, the opt-out check at
 //! send time and the per-message billing all apply. A texter is verified for their own profile by
 //! texting from its number, and sees order status and tracking only, and only when the store gave
-//! that number (`phone_source`). A conversation the agent handed off isn't answered again by it.
+//! that number (`phone_source`, set only by the store's own writes). A conversation the agent
+//! handed off isn't answered again by it. Right before the text goes to the provider, the account
+//! and the number's proof are checked again (`delivery::before_send`), and the conversation's fee is
+//! charged only if the provider took it.
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -42,7 +45,7 @@ pub async fn take(state: &AppState, rx: &Received) -> AppResult<bool> {
     }
     let s = settings::load(&state.db, rx.account_id).await?;
     let account = crate::campaigns::load_account(&state.db, rx.account_id).await?;
-    if !chat::available(state, &account, &s, "sms") {
+    if !chat::available(state, &account, &s, "sms").await {
         return Ok(false);
     }
     crate::jobs::enqueue_background(&state.db, JOB, json!({"inbound_id": rx.id}), None).await?;
@@ -117,20 +120,36 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         .await?;
     let Some((number, trusted)) = phone else { return Ok(()) };
     let orders = if trusted && number.as_deref() == Some(rx.from.as_str()) { Orders::StatusOnly } else { Orders::None };
-    let st = Start { account: &account, place: "sms", who: Who { profile_id: Some(rx.profile_id), orders }, token: None, sms_conversation_id: Some(rx.conversation_id), whatsapp_conversation_id: None, ip: None };
+    // The proof behind order access: the number they wrote from (checked again at every lookup and
+    // right before the answer is texted).
+    let proof = if orders == Orders::None { serde_json::Value::Null } else { super::proof::number(&rx.from) };
+    let st = Start { account: &account, place: "sms", who: Who { profile_id: Some(rx.profile_id), orders, proof }, token: None, sms_conversation_id: Some(rx.conversation_id), whatsapp_conversation_id: None, ip: None };
     let out = chat::say(state, st, &rx.text, |_| {}).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     if let Some(c) = out.conversation_id {
         sqlx::query("UPDATE agent_sms_claims SET conversation_id = $2 WHERE inbound_id = $1").bind(rx.id).bind(c).execute(&state.db).await?;
     }
     // Off, the monthly cap or no credit: the inbox's own default or away reply, as without the agent.
-    if out.refused.is_some() {
-        return crate::features::inbox::replies::default_reply(state, &rx).await.map_err(|e| anyhow::anyhow!(e.public_message()));
+    // Busy (another turn of this conversation is answering): nothing more.
+    match out.refused {
+        Some("off" | "monthly_cap" | "no_credit") => return crate::features::inbox::replies::default_reply(state, &rx).await.map_err(|e| anyhow::anyhow!(e.public_message())),
+        Some(_) => return Ok(()),
+        None => {}
     }
-    let Some(reply) = out.reply.filter(|r| !r.trim().is_empty()) else { return Ok(()) };
+    let (Some(reply), Some(conversation)) = (out.reply.filter(|r| !r.trim().is_empty()), out.conversation_id) else { return Ok(()) };
     let reply = plain_text(&reply.chars().take(MAX_REPLY_CHARS).collect::<String>());
-    crate::features::inbox::replies::queue_auto(state, &rx, "agent_reply", &reply, None, json!({"agent_conversation": out.conversation_id}))
-        .await
-        .map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let e = |e: crate::error::AppError| anyhow::anyhow!(e.public_message());
+    match crate::features::inbox::replies::queue_auto(state, &rx, "agent_reply", &reply, None, json!({"agent_conversation": conversation})).await.map_err(e)? {
+        Some(message_id) => {
+            sqlx::query("INSERT INTO agent_deliveries (message_id, conversation_id, account_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                .bind(message_id)
+                .bind(conversation)
+                .bind(rx.account_id)
+                .execute(&state.db)
+                .await?;
+        }
+        // Not queued (a limit or budget): nothing goes out, so nothing is charged.
+        None => super::delivery::after_send(state, conversation, false).await.map_err(e)?,
+    }
     Ok(())
 }
 

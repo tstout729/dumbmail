@@ -185,6 +185,8 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
     let kind = match class {
         Class::Stop => "stop",
         _ if verification => "verification",
+        // HELP and INFO get a fixed answer; never a keyword, a sign-up or the shopping agent.
+        Class::Help if rx.msg_type == "text" => "help",
         _ if rx.timed && rx.msg_type == "text" && optout::START_WORDS.contains(&strict.as_str()) && current == "unsubscribed" => "start",
         _ if signup => "signup",
         _ if keyword.is_some() => "keyword",
@@ -272,6 +274,9 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
             let lead = signup_reply.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| format!("Thanks! You're subscribed to WhatsApp messages from {account_name}."));
             answer = Some(("confirmation", format!("{lead} Reply STOP to unsubscribe.")));
         }
+        "help" => {
+            answer = Some(("help", help_text(db, account_id, &account_name).await?));
+        }
         "keyword" => {
             let k = keyword.as_ref().expect("matched");
             if !k.reply.trim().is_empty() {
@@ -309,6 +314,18 @@ pub async fn receive(state: &AppState, account_id: Uuid, rx: &Inbound) -> AppRes
     let mut rx = rx.clone();
     rx.from = Some(from);
     after(state, account_id, &rx, &stored).await
+}
+
+/// The fixed answer to HELP or INFO on WhatsApp: who's writing and how to reach them.
+async fn help_text(db: &sqlx::PgPool, account_id: Uuid, account_name: &str) -> AppResult<String> {
+    let s = crate::features::inbox::settings::load(db, account_id).await?;
+    let (reply_to, from_email): (Option<String>, Option<String>) = sqlx::query_as("SELECT reply_to, from_email FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
+    let program = if s.program_name.is_empty() { account_name.to_string() } else { s.program_name.clone() };
+    let contact = Some(s.support_contact.clone()).filter(|c| !c.is_empty()).or(reply_to).or(from_email);
+    Ok(match contact {
+        Some(c) => format!("{program}: For help, contact {c}. Reply STOP to stop WhatsApp messages from us."),
+        None => format!("{program}: For help, reply here and a person will get back to you. Reply STOP to stop WhatsApp messages from us."),
+    })
 }
 
 /// A message stored by an earlier delivery whose follow-up didn't finish: run it again (each step is
@@ -351,7 +368,7 @@ async fn after(state: &AppState, account_id: Uuid, rx: &Inbound, s: &Stored) -> 
         "stop" => {
             audience::record_event(&state.db, event("Unsubscribed from WhatsApp", format!("wa-out:{}", s.id), json!({"method": "stop", "inbound_message_id": s.id}))).await?;
         }
-        "verification" => {}
+        "verification" | "help" => {}
         _ => {
             if s.subscribed_now {
                 let method = if s.kind == "start" { "start" } else { "keyword" };

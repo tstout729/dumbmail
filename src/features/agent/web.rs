@@ -169,7 +169,7 @@ fn intro(name: &str, verified: bool) -> String {
 async fn chat_page(State(state): State<AppState>, Path(key): Path<String>, Query(q): Query<PageQuery>, headers: HeaderMap) -> Response {
     let Some(store) = store_for(&state, &key, &headers).await else { return not_found() };
     let embed = q.embed.as_deref() == Some("1");
-    if !store.hub.enabled || !chat::available(&state, &store.account, &store.agent, "hub") {
+    if !store.hub.enabled || !chat::available(&state, &store.account, &store.agent, "hub").await {
         return not_found();
     }
     let shopper = match session::current(&state, &headers, &store.account).await {
@@ -192,7 +192,7 @@ async fn chat_page(State(state): State<AppState>, Path(key): Path<String>, Query
 /// The bubble's chat (anyone; never personal).
 async fn ask_page(State(state): State<AppState>, Path(key): Path<String>, headers: HeaderMap) -> Response {
     let Some(store) = store_for(&state, &key, &headers).await else { return not_found() };
-    if !chat::available(&state, &store.account, &store.agent, "site") {
+    if !chat::available(&state, &store.account, &store.agent, "site").await {
         return not_found();
     }
     let f = Frame::new(&store.account, &store.hub, true);
@@ -243,7 +243,10 @@ async fn chat_send(State(state): State<AppState>, Path(key): Path<String>, heade
     // Orders only where the hub shows them, for an address the store gave (checked again on use).
     let trusted = crate::features::hub::data::trusted_email(&state.db, &shopper).await.unwrap_or(false);
     let orders = if store.hub.sections.orders && trusted { Orders::Full } else { Orders::None };
-    let who = Who { profile_id: Some(shopper.profile_id), orders };
+    // The proof behind order access: this session and the hub generation it was issued with.
+    let generation = super::proof::session_generation(&state, shopper.session_id).await.ok().flatten().unwrap_or(-1);
+    let proof = if orders == Orders::None { Value::Null } else { super::proof::hub(shopper.session_id, generation) };
+    let who = Who { profile_id: Some(shopper.profile_id), orders, proof };
     stream(state, store.account, "hub", who, b, crate::public::client_ip(&headers))
 }
 
@@ -275,7 +278,10 @@ fn stream(state: AppState, account: Account, place: &'static str, who: Who, b: S
         };
         let st = Start { account: &account, place, who, token: b.conversation.as_deref(), sms_conversation_id: None, whatsapp_conversation_id: None, ip: ip.as_deref() };
         let done = match chat::say(&state, st, &b.message, sink).await {
-            Ok(o) => json!({"t": "done", "reply": o.reply, "conversation": o.token.or(b.conversation), "handed_off": o.handed_off, "refused": o.refused}),
+            Ok(o) => {
+                let reply = o.reply.unwrap_or_else(|| "One moment, I'm still answering your last message.".into());
+                json!({"t": "done", "reply": reply, "conversation": o.token.or(b.conversation), "handed_off": o.handed_off, "refused": o.refused})
+            }
             Err(e) => {
                 tracing::error!(error = %e.public_message(), "agent chat failed");
                 json!({"t": "done", "reply": "Sorry, something went wrong. Please try again.", "conversation": b.conversation, "refused": "error"})
@@ -301,7 +307,7 @@ async fn bubble_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> 
         let id: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE public_key = $1 AND closed_at IS NULL").bind(&q.k).fetch_optional(&state.db).await.ok()??;
         let s = agent_settings::load(&state.db, id).await.ok()?;
         let a = crate::campaigns::load_account(&state.db, id).await.ok()?;
-        if !chat::available(&state, &a, &s, "site") {
+        if !chat::available(&state, &a, &s, "site").await {
             return None;
         }
         let hub = hub_settings::load(&state.db, id).await.ok()?;
@@ -326,11 +332,11 @@ struct KeyQuery {
 /// Whether the snippet should load the bubble for this account (its storefront config says so).
 pub async fn bubble_on(state: &AppState, account: &Account) -> bool {
     let Ok(s) = agent_settings::load(&state.db, account.id).await else { return false };
-    chat::available(state, account, &s, "site")
+    chat::available(state, account, &s, "site").await
 }
 
 /// The hub's chat entry, when the hub chat is on: its name, for the hub page's link.
 pub async fn hub_chat_name(state: &AppState, account: &Account) -> Option<String> {
     let s = agent_settings::load(&state.db, account.id).await.ok()?;
-    chat::available(state, account, &s, "hub").then(|| s.display_name(account))
+    if chat::available(state, account, &s, "hub").await { Some(s.display_name(account)) } else { None }
 }

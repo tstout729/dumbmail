@@ -153,7 +153,6 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             sms_consent = COALESCE($9, CASE WHEN {new_phone} AND p.sms_consent = 'subscribed' THEN 'never_subscribed' ELSE p.sms_consent END),
                             email_suppressed_reason = CASE WHEN {changed} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
                             email_source = CASE WHEN $2::text IS NULL THEN p.email_source WHEN p.email IS DISTINCT FROM $2::text OR p.email_source IS NULL THEN '{TRUSTED_EMAIL_SOURCE}' ELSE p.email_source END,
-                            phone_source = CASE WHEN $3::text IS NULL THEN p.phone_source WHEN p.phone_number IS DISTINCT FROM $3::text OR p.phone_source IS NULL THEN '{TRUSTED_EMAIL_SOURCE}' ELSE p.phone_source END,
                             updated_at = now()
                          FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
                          WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
@@ -185,9 +184,8 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
             None => {
                 let q = format!(
-                    "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_source, phone_source)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'never_subscribed'), COALESCE($10, 'never_subscribed'), CASE WHEN $3::text IS NOT NULL AND $11 THEN '{TRUSTED_EMAIL_SOURCE}' END,
-                             CASE WHEN $4::text IS NOT NULL AND $11 THEN '{TRUSTED_EMAIL_SOURCE}' END)
+                    "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_source)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'never_subscribed'), COALESCE($10, 'never_subscribed'), CASE WHEN $3::text IS NOT NULL AND $11 THEN '{TRUSTED_EMAIL_SOURCE}' END)
                      RETURNING {PROFILE_COLS}"
                 );
                 sqlx::query_as::<_, Profile>(&q)
@@ -220,17 +218,6 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             .await?;
                     }
                 }
-                // The same for a phone number (the shopping agent shows a texter their orders only
-                // for a number the store's own systems gave).
-                if let (false, Some(p), Some(n)) = (fill_only, &existing, phone.as_deref()) {
-                    if p.phone_number.as_deref().is_some_and(|old| old != n) {
-                        sqlx::query(&format!("UPDATE profiles SET phone_source = '{TRUSTED_EMAIL_SOURCE}' WHERE id = $1 AND phone_number = $2 AND phone_source IS NULL"))
-                            .bind(p.id)
-                            .bind(n)
-                            .execute(db)
-                            .await?;
-                    }
-                }
                 if let Some(l) = &locale {
                     u.profile.locale = crate::features::translations::save_locale(db, u.profile.id, l.as_deref(), fill_only).await?;
                 }
@@ -255,10 +242,23 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
 /// What a trusted write (the API, MCP, the dashboard, an import) records as `profiles.email_source`
 /// for the address it gives. The public fill-only path (forms, the website script) never sets it.
 /// Integrations and Shopify record their own source. The customer hub opens a person's orders only
-/// for an address with a source (see `features::hub::data::TRUSTED_EMAIL_SQL`). The same value
-/// goes in `profiles.phone_source` for a number such a write gives (the shopping agent shows a
-/// texter their orders only for one).
+/// for an address with a source (see `features::hub::data::TRUSTED_EMAIL_SQL`).
 pub const TRUSTED_EMAIL_SOURCE: &str = "api";
+
+/// The store's own write (a profile created or edited through the API, MCP or the dashboard, or a
+/// CSV import) gave this number: mark it as the store's (`phone_source`), unless an integration
+/// already did. Never called for the generic upsert that inbound texts and WhatsApp use, so a number
+/// that only ever wrote in is never the store's. The shopping agent shows a texter their orders
+/// only for a number marked so.
+pub async fn mark_phone_trusted(db: &PgPool, profile_id: Uuid, phone: Option<&str>) -> AppResult<()> {
+    let Some(phone) = phone.and_then(normalize_phone) else { return Ok(()) };
+    sqlx::query(&format!("UPDATE profiles SET phone_source = '{TRUSTED_EMAIL_SOURCE}' WHERE id = $1 AND phone_number = $2 AND phone_source IS NULL"))
+        .bind(profile_id)
+        .bind(phone)
+        .execute(db)
+        .await?;
+    Ok(())
+}
 
 /// Whether writing `email` replaces a different address the profile already has.
 fn email_changes(p: &Profile, email: Option<&str>) -> bool {
@@ -755,6 +755,7 @@ pub async fn import_csv(
         match upsert_profile(db, account_id, &input).await {
             Ok(u) => {
                 if u.created { out.created += 1 } else { out.updated += 1 }
+                mark_phone_trusted(db, u.profile.id, input.phone_number.as_deref()).await?;
                 ids.push(u.profile.id);
             }
             Err(e) => {

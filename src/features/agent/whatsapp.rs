@@ -4,8 +4,11 @@
 //! window is open) with [`take`]; the agent's job answers it once (a claim on the inbound message)
 //! and the answer goes out through WhatsApp's own conversational path (`whatsapp::send`): its final
 //! claim checks the 24-hour window, opt-outs and the sender at send time, and bills per message.
-//! The text is sent as written (never rendered as a template). A person writing from the number on
-//! their profile sees order status and tracking only, and only when the store gave that number.
+//! The text is sent as written (never rendered as a template), only through the WhatsApp sender
+//! the message came in on, and after the account and the shopper's proof are checked again; its
+//! conversation's fee is charged only when Meta took it. A person writing from the number on their
+//! profile sees order status and tracking only, and only when the store gave that number. HELP never
+//! reaches the agent (the WhatsApp inbox answers it with a fixed message).
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -27,10 +30,13 @@ pub async fn take(state: &AppState, account_id: Uuid, inbound_id: Uuid, msg_type
     }
     let s = settings::load(&state.db, account_id).await?;
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
-    if !chat::available(state, &account, &s, "whatsapp") {
+    if !chat::available(state, &account, &s, "whatsapp").await {
         return Ok(false);
     }
-    crate::jobs::enqueue_background(&state.db, JOB, json!({"inbound_id": inbound_id}), None).await?;
+    // The sender the message came in through: the answer goes out only through the same one.
+    let sender = crate::features::whatsapp::settings::sender_id(&state.db, account_id).await?;
+    let Some(sender) = sender else { return Ok(false) };
+    crate::jobs::enqueue_background(&state.db, JOB, json!({"inbound_id": inbound_id, "sender_id": sender}), None).await?;
     Ok(true)
 }
 
@@ -77,10 +83,11 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         .await?;
     let Some((number, trusted)) = phone else { return Ok(()) };
     let orders = if trusted && number.as_deref() == Some(from.as_str()) { Orders::StatusOnly } else { Orders::None };
+    let proof = if orders == Orders::None { Value::Null } else { super::proof::number(&from) };
     let st = Start {
         account: &account,
         place: "whatsapp",
-        who: Who { profile_id: Some(profile_id), orders },
+        who: Who { profile_id: Some(profile_id), orders, proof },
         token: None,
         sms_conversation_id: None,
         whatsapp_conversation_id: Some(conversation_id),
@@ -93,8 +100,18 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     if out.refused.is_some() {
         return Ok(());
     }
-    let Some(reply) = out.reply.filter(|r| !r.trim().is_empty()) else { return Ok(()) };
+    let (Some(reply), Some(conversation)) = (out.reply.filter(|r| !r.trim().is_empty()), out.conversation_id) else { return Ok(()) };
     let reply: String = reply.chars().take(MAX_REPLY_CHARS).collect();
+    let e = |e: crate::error::AppError| anyhow::anyhow!(e.public_message());
+    // Only through the sender the message came in on, and only while the account and the shopper's
+    // proof still allow it; otherwise nothing goes out and nothing is charged.
+    let sender_now = crate::features::whatsapp::settings::sender_id(&state.db, account_id).await?;
+    let sender_then = payload["sender_id"].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    let blocked = if sender_then.is_none() || sender_now != sender_then { Some("the WhatsApp sender changed") } else { super::delivery::before_send(state, conversation).await.map_err(e)? };
+    if let Some(why) = blocked {
+        tracing::info!(conversation = %conversation_id, why, "agent WhatsApp answer not sent");
+        return super::delivery::after_send(state, conversation, false).await.map_err(e);
+    }
     let mut tx = state.db.begin().await?;
     // The same per-person hourly allowance the inbox's own automatic answers use, taken in the write.
     let allowed: bool = sqlx::query_scalar(
@@ -110,10 +127,12 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     .await?
     .unwrap_or(false);
     if !allowed {
+        drop(tx);
         tracing::info!(conversation = %conversation_id, "automatic WhatsApp answer limit for this person reached; not sending");
-        return Ok(());
+        return super::delivery::after_send(state, conversation, false).await.map_err(e);
     }
-    let mid = crate::features::whatsapp::send::prepare_conversational(&mut tx, account_id, profile_id, &from, "agent_reply", None, &reply, None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let mid = crate::features::whatsapp::send::prepare_conversational(&mut tx, account_id, profile_id, &from, "agent_reply", None, &reply, None).await.map_err(e)?;
+    sqlx::query("INSERT INTO agent_deliveries (message_id, conversation_id, account_id) VALUES ($1, $2, $3)").bind(mid).bind(conversation).bind(account_id).execute(&mut *tx).await?;
     crate::jobs::enqueue(&mut *tx, "whatsapp_send", json!({"message_id": mid}), None).await?;
     tx.commit().await?;
     Ok(())

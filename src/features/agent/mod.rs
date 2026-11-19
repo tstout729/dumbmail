@@ -1,13 +1,16 @@
 //! AI shopping agent: answers shoppers' questions from the store's own information, in the
 //! customer hub (signed-in shoppers), in a chat bubble on the store's website (anyone, never
 //! anything personal) and, when the store turns it on, as the first answer to inbound texts and
-//! WhatsApp messages. It
-//! hands off to a person when it should. See docs/AGENT.md.
+//! WhatsApp messages. It hands off to a person when it should. See docs/AGENT.md.
 //!
 //! - `settings`: what the store turns on and tells it; the settings API and MCP tools.
 //! - `knowledge`: the store's answers, its own website pages (read weekly) and the catalog.
 //! - `claude`: one streamed model turn over raw HTTPS.
-//! - `chat`: conversations, caps, billing, the tools the server runs, hand-offs.
+//! - `chat`: conversations, caps, the tools the server runs, hand-offs.
+//! - `guard`: what crosses to Claude and back (input redaction, links, prices and codes).
+//! - `proof`: what a conversation's order access rests on, and whether it still holds.
+//! - `fee`: the conversation fee, held at admission and charged when an answer goes out.
+//! - `delivery`: the last check before a text or WhatsApp answer goes out.
 //! - `web`: the public chat pages on the hub's host and the bubble script.
 //! - `sms`, `whatsapp`: first answers to inbound texts and WhatsApp messages.
 //! - `api`: the team's view of conversations and the test chat.
@@ -15,7 +18,11 @@
 pub mod api;
 pub mod chat;
 pub mod claude;
+pub mod delivery;
+pub mod fee;
+pub mod guard;
 pub mod knowledge;
+pub mod proof;
 pub mod settings;
 pub mod sms;
 pub mod web;
@@ -24,6 +31,7 @@ pub mod whatsapp;
 use async_trait::async_trait;
 use axum::Router;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use super::team::access::{public, rule, Access, Perm, RouteRule, ToolRule};
 use super::{Feature, McpDoc};
@@ -35,6 +43,64 @@ use crate::state::AppState;
 pub use chat::{CHATTED_METRIC, HANDED_OFF_METRIC};
 
 pub struct Module;
+
+/// When the account's standing is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moment {
+    /// Starting a conversation or a turn (every place).
+    Admission,
+    /// Handing an automatic text or WhatsApp answer to the provider.
+    Delivery,
+}
+
+/// Whether the account's standing lets the agent answer at `place` now. The one place sender
+/// screening (PR #40) plugs in: blocked accounts get no agent anywhere; pending or in-review
+/// accounts keep the hub and bubble chats but get no automatic texts or WhatsApp answers. Sender
+/// screening isn't on `main` yet, so every account is allowed for now.
+pub async fn standing_allows(_state: &AppState, _account_id: Uuid, _place: &str, _moment: Moment) -> bool {
+    true
+}
+
+/// Background job: delete conversations 90 days after their last message (their messages first),
+/// and old visitor counters, in bounded batches; queues itself again while more is left.
+pub const CLEANUP_JOB: &str = "agent_cleanup";
+const CLEANUP_BATCH: i64 = 500;
+
+pub async fn cleanup(state: &AppState) -> anyhow::Result<bool> {
+    let db = &state.db;
+    let old = "SELECT id FROM agent_conversations WHERE last_message_at < now() - interval '90 days' ORDER BY last_message_at LIMIT $1";
+    let msgs = sqlx::query(&format!("DELETE FROM agent_messages WHERE id IN (SELECT m.id FROM agent_messages m WHERE m.conversation_id IN ({old}) LIMIT $1 * 20)"))
+        .bind(CLEANUP_BATCH)
+        .execute(db)
+        .await?
+        .rows_affected();
+    let convs = if msgs < (CLEANUP_BATCH * 20) as u64 {
+        sqlx::query(&format!("DELETE FROM agent_conversations WHERE id IN ({old})")).bind(CLEANUP_BATCH).execute(db).await?.rows_affected()
+    } else {
+        0
+    };
+    let visitors = sqlx::query("DELETE FROM agent_visitor_usage WHERE (ip_hash, hour) IN (SELECT ip_hash, hour FROM agent_visitor_usage WHERE hour < now() - interval '2 days' LIMIT $1)")
+        .bind(CLEANUP_BATCH * 4)
+        .execute(db)
+        .await?
+        .rows_affected();
+    fee::release_stale(db).await?;
+    let more = msgs >= (CLEANUP_BATCH * 20) as u64 || convs >= CLEANUP_BATCH as u64 || visitors >= (CLEANUP_BATCH * 4) as u64;
+    if more {
+        crate::jobs::enqueue_background(db, CLEANUP_JOB, json!({}), None).await?;
+    }
+    Ok(more)
+}
+
+/// A redaction that erased a person's orders but kept the person (Shopify's customer redact): the
+/// agent's copies of those orders go too, with the transcripts that held them.
+pub async fn forget_orders(db: &sqlx::PgPool, account_id: Uuid, profile_ids: &[Uuid]) -> sqlx::Result<()> {
+    if profile_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM agent_conversations WHERE account_id = $1 AND profile_id = ANY($2) AND verified").bind(account_id).bind(profile_ids).execute(db).await?;
+    Ok(())
+}
 
 const DOC: &str = include_str!("../../../docs/AGENT.md");
 
@@ -98,16 +164,16 @@ fn tools() -> Vec<Value> {
         tool(
             "get_agent_conversation",
             "Get a shopping agent conversation",
-            "One shopping agent conversation with everything said in it.",
-            obj(json!({"id": {"type": "string", "format": "uuid"}}), &["id"]),
+            "One shopping agent conversation and what was said in it, newest messages first in pages of 50 (`older_cursor` for the ones before).",
+            obj(json!({"id": {"type": "string", "format": "uuid"}, "before": {"type": "string", "description": "older_cursor from the previous page"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}), &["id"]),
             true,
             false,
         ),
         tool(
             "test_agent_chat",
             "Test the shopping agent",
-            "Ask the shopping agent a question as a made-up shopper with a made-up order, to check its answers. Pass `conversation` from the previous answer to continue. Uses the model (and counts toward the monthly cap); nothing is sent to anyone.",
-            obj(json!({"message": {"type": "string", "maxLength": chat::MAX_MESSAGE_CHARS}, "conversation": {"type": "string"}}), &["message"]),
+            "Ask the shopping agent a question as a made-up shopper with a made-up order, to check its answers. Pass `conversation` from the previous answer to continue. It uses the model (and counts toward the monthly cap), so it runs only with confirm: true; without it you get a dry run. Nothing is sent to anyone.",
+            obj(json!({"message": {"type": "string", "maxLength": chat::MAX_MESSAGE_CHARS}, "conversation": {"type": "string"}, "confirm": {"type": "boolean", "description": "true to run it; otherwise a dry run"}}), &["message"]),
             false,
             false,
         ),
@@ -121,9 +187,25 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
         "list_agent_conversations" => api::list(state, ctx.account_id, &crate::mcp::from(a.clone())?).await,
         "get_agent_conversation" => {
             let id = a["id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| AppError::bad("id must be a conversation id"))?;
-            api::one(state, ctx.account_id, id).await
+            let q = api::MessagesQuery { before: a["before"].as_str().map(String::from), limit: a["limit"].as_i64() };
+            api::one(state, ctx.account_id, id, &q).await
         }
-        "test_agent_chat" => api::test(state, ctx, crate::mcp::from(a.clone())?).await,
+        "test_agent_chat" => {
+            if a["confirm"].as_bool() != Some(true) {
+                let s = settings::settings_json(state, ctx.account_id).await?;
+                return Ok(json!({
+                    "dry_run": true,
+                    "would": "ask the shopping agent this question as a made-up shopper with a made-up order, using the model once or a few times",
+                    "available": s["available"], "conversations_this_month": s["conversations_this_month"], "monthly_cap": s["monthly_cap"],
+                    "next": "call again with confirm: true to run it",
+                }));
+            }
+            let mut b = a.clone();
+            if let Some(o) = b.as_object_mut() {
+                o.remove("confirm");
+            }
+            api::test(state, ctx, crate::mcp::from(b)?).await
+        }
         _ => Err(AppError::not_found("tool")),
     }
 }
@@ -167,15 +249,17 @@ impl Feature for Module {
             knowledge::FETCH_JOB => Some(knowledge::run_fetch(state, payload).await),
             sms::JOB => Some(sms::run(state, payload).await),
             whatsapp::JOB => Some(whatsapp::run(state, payload).await),
+            CLEANUP_JOB => Some(cleanup(state).await.map(|_| ())),
             _ => None,
         }
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
-        // About hourly: pages due for their weekly read, and conversations past 90 days.
+        // About hourly: pages due for their weekly read, and the cleanup job (on the background
+        // lane, in batches) for conversations past 90 days.
         if tick.is_multiple_of(180) {
             knowledge::queue_due(&state.db).await?;
-            chat::purge_old(&state.db).await?;
+            crate::jobs::enqueue_background(&state.db, CLEANUP_JOB, json!({}), None).await?;
         }
         Ok(())
     }

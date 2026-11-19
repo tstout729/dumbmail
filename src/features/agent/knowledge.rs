@@ -61,18 +61,21 @@ pub async fn run_fetch(state: &AppState, payload: &Value) -> anyhow::Result<()> 
     let row: Option<(Uuid, String)> = sqlx::query_as("SELECT account_id, url FROM agent_pages WHERE id = $1").bind(id).fetch_optional(&state.db).await?;
     let Some((account_id, url)) = row else { return Ok(()) };
     let account = crate::campaigns::load_account(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let outcome: Result<(Option<String>, String), String> = match settings::page_url(&account, &url) {
-        Err(_) => Err("isn't on your website any more".into()),
+    let outcome: Result<(Option<String>, String), (String, bool)> = match settings::page_url(&account, &url) {
+        Err(_) => Err(("isn't on your website any more".into(), false)),
         Ok(u) => match net::request(reqwest::Method::GET, &u, MAX_PAGE_BYTES, FETCH_TIMEOUT).await {
-            Err(e) => Err(e.describe().to_string()),
-            Ok(r) if (300..400).contains(&r.status) => Err("redirects to another address; add that address instead".into()),
-            Ok(r) if r.status != 200 => Err(format!("answered with status {}", r.status)),
-            Ok(r) if !(r.content_type.starts_with("text/html") || r.content_type.starts_with("text/plain") || r.content_type.is_empty()) => Err("isn't a web page".into()),
+            Err(e) => {
+                let t = transient_error(&e);
+                Err((e.describe().to_string(), t))
+            }
+            Ok(r) if (300..400).contains(&r.status) => Err(("redirects to another address; add that address instead".into(), false)),
+            Ok(r) if r.status != 200 => Err((format!("answered with status {}", r.status), transient_status(r.status))),
+            Ok(r) if !(r.content_type.starts_with("text/html") || r.content_type.starts_with("text/plain") || r.content_type.is_empty()) => Err(("isn't a web page".into(), false)),
             Ok(r) => {
                 let raw = String::from_utf8_lossy(&r.body).into_owned();
                 let (title, text) = if r.content_type.starts_with("text/plain") { (None, raw.chars().take(MAX_PAGE_CHARS).collect()) } else { html_to_text(&raw) };
                 if text.trim().is_empty() {
-                    Err("has no readable text".into())
+                    Err(("has no readable text".into(), false))
                 } else {
                     Ok((title, text))
                 }
@@ -91,19 +94,33 @@ pub async fn run_fetch(state: &AppState, payload: &Value) -> anyhow::Result<()> 
             .execute(&state.db)
             .await?;
         }
-        Err(why) => {
-            // A page that was read before keeps its last good text until it reads again.
+        Err((why, transient)) => {
+            // A passing problem (a timeout, the site briefly down) keeps the last good text until it
+            // reads again; anything else (gone, moved, off the website) drops it.
             sqlx::query(
-                "UPDATE agent_pages SET status = CASE WHEN fetched_at IS NULL THEN 'failed' ELSE status END, error = $2, next_fetch_at = now() + make_interval(hours => $3) WHERE id = $1",
+                "UPDATE agent_pages SET status = CASE WHEN $4 AND fetched_at IS NOT NULL THEN status ELSE 'failed' END,
+                        body = CASE WHEN $4 THEN body ELSE '' END, error = $2, next_fetch_at = now() + make_interval(hours => $3) WHERE id = $1",
             )
             .bind(id)
             .bind(format!("This page {why}."))
             .bind(RETRY_HOURS as i32)
+            .bind(transient)
             .execute(&state.db)
             .await?;
         }
     }
     Ok(())
+}
+
+/// A fetch problem that may pass on its own (keep the last good text): a timeout or a failed
+/// connection. A bad address, a private one or a domain that doesn't exist won't.
+pub fn transient_error(e: &net::NetError) -> bool {
+    matches!(e, net::NetError::Timeout | net::NetError::Failed(_))
+}
+
+/// A status that may pass on its own: rate limited or a server error.
+pub fn transient_status(status: u16) -> bool {
+    status == 429 || status >= 500
 }
 
 /// Queue the pages that are due (claimed by moving their next read on first, so two schedulers
@@ -169,13 +186,15 @@ fn chunks(body: &str) -> Vec<String> {
 
 /// `search_answers`: the store's questions and answers, and passages from its website pages, that
 /// match the query best.
-pub async fn search_answers(db: &PgPool, account_id: Uuid, s: &Settings, query: &str) -> anyhow::Result<Value> {
+pub async fn search_answers(db: &PgPool, account: &crate::models::Account, s: &Settings, query: &str) -> anyhow::Result<Value> {
+    let account_id = account.id;
     let terms = terms(query);
     let mut answers: Vec<(usize, &settings::Answer)> = s.answers.iter().map(|a| (score(&format!("{} {}", a.question, a.answer), &terms) + 2 * score(&a.question, &terms), a)).filter(|(n, _)| *n > 0).collect();
     answers.sort_by_key(|a| std::cmp::Reverse(a.0));
     let pages: Vec<(String, Option<String>, String)> = sqlx::query_as("SELECT url, title, body FROM agent_pages WHERE account_id = $1 AND body <> '' ORDER BY created_at LIMIT 20").bind(account_id).fetch_all(db).await?;
     let mut passages: Vec<(usize, &str, Option<&str>, String)> = Vec::new();
-    for (url, title, body) in &pages {
+    // Only pages on the account's current website count (a page from a former site doesn't).
+    for (url, title, body) in pages.iter().filter(|p| settings::page_url(account, &p.0).is_ok()) {
         for c in chunks(body) {
             let n = score(&c, &terms) + title.as_deref().map(|t| score(t, &terms)).unwrap_or(0);
             if n > 0 {
@@ -260,6 +279,16 @@ mod tests {
         assert_eq!(t.as_deref(), Some("Shipping & returns"));
         assert!(s.contains("We ship to Canada.\nFree over $50."), "{s}");
         assert!(!s.contains("evil") && !s.contains("hidden") && !s.contains("p{}"));
+    }
+
+    #[test]
+    fn only_passing_problems_keep_the_last_good_text() {
+        assert!(transient_error(&net::NetError::Timeout));
+        assert!(transient_error(&net::NetError::Failed("couldn't connect")));
+        assert!(!transient_error(&net::NetError::NoSuchDomain));
+        assert!(!transient_error(&net::NetError::NotPublic));
+        assert!(transient_status(503) && transient_status(429));
+        assert!(!transient_status(404) && !transient_status(410) && !transient_status(403));
     }
 
     #[test]

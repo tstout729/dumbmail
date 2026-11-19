@@ -256,6 +256,8 @@ async fn clean_profiles(db: &PgPool, account_id: Uuid, shop: &str, ids: &[Uuid],
     if ids.is_empty() {
         return Ok(());
     }
+    // The shopping agent's copies of their orders (and the transcripts that held them) go too.
+    crate::features::agent::forget_orders(db, account_id, ids).await?;
     let keys: Vec<String> = PROPERTY_KEYS.iter().map(|k| k.to_string()).collect();
     sqlx::query("UPDATE profiles SET properties = properties - $3::text[], updated_at = now() WHERE account_id = $1 AND id = ANY($2)")
         .bind(account_id)
